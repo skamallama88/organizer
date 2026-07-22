@@ -17,11 +17,11 @@ class ItemProcessor(Protocol):
         """Apply or report a plan without exposing filesystem details."""
 ```
 
-`PlanRequest`, `Plan`, `PlannedAction`, `ExecutionMode`, `ExecutionReport`, and `ActionResult` are immutable values at the module's interface. Callers do not parse YAML, construct actions, call filesystem adapters, or write the Tracking DB.
+`PlanRequest`, `Plan`, `PlannedAction`, `ExecutionMode`, `ExecutionReport`, and `ActionResult` are immutable values at the module's interface. A `Plan` is the primary dry-run and preview artifact: it contains the matched rule, ordered intended actions, resolved destinations, and source fingerprint. Applying a plan revalidates the source and destinations immediately before mutation; a stale plan cannot silently apply. Callers do not parse YAML, construct actions, call filesystem adapters, or write the Tracking DB.
 
 The module's implementation uses internal seams for the YAML rule source, filesystem, archive formats, Tracking DB, and structured event sink. These adapters translate infrastructure failures into stable processing results. The public interface remains the same for watcher, scanner, CLI, and web UI callers.
 
-The planner does not mutate the filesystem or Tracking DB. The executor revalidates the source and destinations immediately before mutation, executes actions in order, stops after the first failure, and records a durable processing attempt before execution. Dry-run execution reports the same plan without filesystem mutation or Tracking DB completion.
+The planner does not mutate the filesystem or Tracking DB. The executor creates a durable processing attempt before execution, performs internal preflight checks, executes actions in order, records each action outcome, and stops after the first failure. Dry-run execution reports the same plan without filesystem mutation or Tracking DB completion.
 
 ## Rule schema
 
@@ -118,6 +118,24 @@ Organizer never overwrites an existing item. If a move, copy, rename, unarchive,
 
 The web UI exposes failed items for review, including the source item, intended destination, rule, action, and failure detail. Collision failures are not retried automatically by watcher or scan events. After the user resolves the collision, an explicit retry creates a new processing attempt; the original attempt remains in history.
 
+## Execution and recovery
+
+Actions execute one at a time in declared order. Each action is revalidated immediately before mutation, and its outcome is recorded against the processing attempt. A failure stops later actions; earlier successful actions remain successful and are not blindly repeated.
+
+The executor does not promise filesystem transactions or rollback. For actions where the result can be verified, the implementation records evidence such as the resulting path and fingerprint. When the outcome is uncertain, the attempt becomes `needs-reconciliation` and is not automatically retried.
+
+Collision failures are ordinary `failed` attempts and suppress automatic watcher and scan retries. An explicit user retry creates a new processing attempt. Reconciliation cases expose the evidence and allow an operator to accept resulting paths, mark an action applied, retry remaining actions, retry from the start, or abandon the attempt. `retry from the start` always creates a new attempt.
+
+The attempt state transitions are:
+
+```text
+started -> completed
+        -> failed
+        -> needs-reconciliation
+```
+
+`completed` means every planned action succeeded and resulting paths were recorded. `failed` means the attempt requires explicit retry or review. `needs-reconciliation` means filesystem effects may exist but completion cannot be established safely.
+
 ## Dry run
 
 Rule evaluation is split into two stages:
@@ -125,7 +143,7 @@ Rule evaluation is split into two stages:
 1. **Planning** — evaluates an item against ordered rules and produces an execution plan containing the matched rule and intended actions.
 2. **Execution** — validates and applies an execution plan, or reports it without mutation when running in dry-run mode.
 
-In dry run mode, the planner runs normally and the executor reports the execution plan, but no filesystem mutations or Tracking DB updates occur. Each action logs what it *would* have done:
+In dry run mode, the planner produces the immutable preview plan and the executor reports its intended action sequence, but no filesystem mutations or Tracking DB updates occur. Each action logs what it *would* have done:
 
 ```
 [Dry Run] Watch: Downloads | Rule: Cosplay folders | Action: move | Item: /data/Downloads/[cosplay] armor | Target: /media/cosplay/[cosplay] armor
@@ -141,8 +159,9 @@ Web UI: each watch folder has a "Dry run" button that shows results in-app.
 3. **Planning** — rules for the watch folder are evaluated in order. The first matching rule produces an execution plan; no later rules are considered for that item.
 4. **Match** — the item's field (folder_name, file_name, full_path) is tested against the rule's regex pattern.
 5. **Attempt creation** — a durable processing attempt is recorded as `started` before filesystem mutation.
-6. **Execution** — the executor applies all actions in the plan in sequence. If any action fails, remaining actions are skipped and the failure is logged.
-7. **Completion** — after every action succeeds, the attempt records `completed` and all resulting paths. Failures record `failed` or `needs-reconciliation` with their details. Collision failures are `failed` and require explicit user retry.
+6. **Preflight** — source state, action parameters, destinations, collisions, and known archive requirements are checked without promising transactional execution.
+7. **Execution** — the executor applies actions in sequence, records action outcomes, and stops after the first failure.
+8. **Completion** — after every action succeeds, the attempt records `completed` and all resulting paths. Failures record `failed` or `needs-reconciliation` with their details. Collision failures are `failed` and require explicit user retry.
 
 Filesystem mutation and Tracking DB writes are not one transaction. If filesystem mutation succeeds but completion recording fails, the attempt becomes `needs-reconciliation`; Organizer does not automatically repeat the filesystem actions. Reconciliation records the existing result before the item can be considered complete.
 
@@ -178,6 +197,8 @@ CREATE TABLE processing_attempts (
     rule_name           TEXT,
     planned_actions     TEXT NOT NULL,
     status              TEXT NOT NULL,
+    action_results      TEXT,
+    retry_of_attempt_id TEXT,
     resulting_paths     TEXT,
     failure_detail      TEXT,
     started_at          TEXT NOT NULL,
@@ -186,6 +207,8 @@ CREATE TABLE processing_attempts (
 ```
 
 An attempt is the unit of processing history. It can reference one source item and multiple resulting paths, so moves, renames, archives, and unarchives do not require a permanent source-path identity. `status` is one of `started`, `completed`, `failed`, or `needs-reconciliation`.
+
+For actions with reliable outcome evidence, the attempt records the action result and resulting fingerprint. Archive and unarchive operations may produce multiple paths or uncertain outcomes and can require reconciliation rather than automatic retry.
 
 ## Directory layout
 

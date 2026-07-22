@@ -1,6 +1,6 @@
 # Organizer
 
-A file organization daemon inspired by Hazel for macOS, designed for Unraid. Watches folders, matches files against configurable rules, and performs actions (move, copy, unarchive, etc.).
+A file organization daemon inspired by Hazel for macOS, designed for Unraid. Watches folders, matches files and folders against configurable rules, and performs actions such as move, copy, rename, archive, and unarchive.
 
 ## Language
 

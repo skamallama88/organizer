@@ -1,5 +1,28 @@
 # Architecture
 
+## ItemProcessor module
+
+The ItemProcessor module is the shared seam for watcher events, periodic scans, CLI commands, and web UI operations. Its interface separates planning from execution while keeping rule interpretation, action sequencing, collision handling, retry policy, logging, and Tracking DB timing inside the module.
+
+```python
+class ItemProcessor(Protocol):
+    def plan(self, request: PlanRequest) -> Plan:
+        """Evaluate ordered rules and produce an execution plan."""
+
+    def execute(
+        self,
+        plan: Plan,
+        mode: ExecutionMode = ExecutionMode.APPLY,
+    ) -> ExecutionReport:
+        """Apply or report a plan without exposing filesystem details."""
+```
+
+`PlanRequest`, `Plan`, `PlannedAction`, `ExecutionMode`, `ExecutionReport`, and `ActionResult` are immutable values at the module's interface. Callers do not parse YAML, construct actions, call filesystem adapters, or write the Tracking DB.
+
+The module's implementation uses internal seams for the YAML rule source, filesystem, archive formats, Tracking DB, and structured event sink. These adapters translate infrastructure failures into stable processing results. The public interface remains the same for watcher, scanner, CLI, and web UI callers.
+
+The planner does not mutate the filesystem or Tracking DB. The executor revalidates the source and destinations immediately before mutation, executes actions in order, stops after the first failure, and records a durable processing attempt before execution. Dry-run execution reports the same plan without filesystem mutation or Tracking DB completion.
+
 ## Rule schema
 
 ```yaml
@@ -26,7 +49,7 @@ Rules are loaded from the watch folder's `rules.yaml` file. Invalid YAML, invali
     destination: <path>       # required, absolute or relative to watch folder
 ```
 
-Moves the matched file or folder to `destination`. If the destination doesn't exist, it is created.
+Moves the matched file or folder to `destination`. If the destination directory doesn't exist, it is created. An existing destination item is a collision and is never overwritten.
 
 ### Copy
 
@@ -35,7 +58,7 @@ Moves the matched file or folder to `destination`. If the destination doesn't ex
     destination: <path>       # required
 ```
 
-Copies the matched item, leaving the original in place.
+Copies the matched item, leaving the original in place. An existing destination item is a collision and is never overwritten.
 
 ### Delete
 
@@ -91,13 +114,18 @@ Matches files or folders and bundles them into a single archive file in `destina
 
 ## Destination collisions
 
-Organizer never overwrites an existing item. If a move, copy, rename, unarchive, or archive action would create an item at a path that already exists, the action fails. Remaining actions in the rule are skipped, the item remains eligible for retry, and the collision is logged as an ERROR result.
+Organizer never overwrites an existing item. If a move, copy, rename, unarchive, or archive action would create an item at a path that already exists, the action fails. Remaining actions in the rule are skipped, automatic watcher and scan retries are suppressed, and the collision is logged as an ERROR result.
 
-The web UI exposes failed items for review, including the source item, intended destination, rule, action, and failure detail. A user can use this review list to resolve the collision outside Organizer before retrying the item.
+The web UI exposes failed items for review, including the source item, intended destination, rule, action, and failure detail. Collision failures are not retried automatically by watcher or scan events. After the user resolves the collision, an explicit retry creates a new processing attempt; the original attempt remains in history.
 
 ## Dry run
 
-In dry run mode, the rule engine evaluates matches and determines which actions would fire, but no filesystem mutations or Tracking DB updates occur. Each action logs what it *would* have done:
+Rule evaluation is split into two stages:
+
+1. **Planning** — evaluates an item against ordered rules and produces an execution plan containing the matched rule and intended actions.
+2. **Execution** — validates and applies an execution plan, or reports it without mutation when running in dry-run mode.
+
+In dry run mode, the planner runs normally and the executor reports the execution plan, but no filesystem mutations or Tracking DB updates occur. Each action logs what it *would* have done:
 
 ```
 [Dry Run] Watch: Downloads | Rule: Cosplay folders | Action: move | Item: /data/Downloads/[cosplay] armor | Target: /media/cosplay/[cosplay] armor
@@ -109,11 +137,14 @@ Web UI: each watch folder has a "Dry run" button that shows results in-app.
 ## Evaluation flow
 
 1. **Item discovered** — via filesystem watcher event or periodic scan.
-2. **Tracking DB check** — if the item's fingerprint (path + mtime + size) is already recorded and unchanged, skip.
-3. **Rule iteration** — rules for the watch folder are evaluated in order.
+2. **Tracking DB check** — if a completed processing attempt exists for the item's unchanged source fingerprint (path + mtime + size), skip. Items with failed or needs-reconciliation attempts are not treated as completed.
+3. **Planning** — rules for the watch folder are evaluated in order. The first matching rule produces an execution plan; no later rules are considered for that item.
 4. **Match** — the item's field (folder_name, file_name, full_path) is tested against the rule's regex pattern.
-5. **Action execution** — all actions in the first matching rule are executed in sequence. If any action fails, remaining actions are skipped and the failure is logged.
-6. **Tracking DB update** — after every action succeeds, the item's path, size, and modification time are recorded so it won't be re-processed. Failures remain eligible for later watcher or scan retries.
+5. **Attempt creation** — a durable processing attempt is recorded as `started` before filesystem mutation.
+6. **Execution** — the executor applies all actions in the plan in sequence. If any action fails, remaining actions are skipped and the failure is logged.
+7. **Completion** — after every action succeeds, the attempt records `completed` and all resulting paths. Failures record `failed` or `needs-reconciliation` with their details. Collision failures are `failed` and require explicit user retry.
+
+Filesystem mutation and Tracking DB writes are not one transaction. If filesystem mutation succeeds but completion recording fails, the attempt becomes `needs-reconciliation`; Organizer does not automatically repeat the filesystem actions. Reconciliation records the existing result before the item can be considered complete.
 
 ## Logging
 
@@ -138,17 +169,23 @@ A page under each watch folder showing recent log entries for that watch. Suppor
 SQLite database at `/config/organizer.db`. Schema:
 
 ```sql
-CREATE TABLE processed_files (
-    watch_id    TEXT NOT NULL,
-    file_path   TEXT NOT NULL,
-    file_size   INTEGER NOT NULL,
-    mtime       REAL NOT NULL,
-    processed_at TEXT NOT NULL,
-    rule_name   TEXT,
-    action      TEXT,
-    PRIMARY KEY (watch_id, file_path)
+CREATE TABLE processing_attempts (
+    attempt_id          TEXT PRIMARY KEY,
+    watch_id            TEXT NOT NULL,
+    source_path         TEXT NOT NULL,
+    source_size         INTEGER NOT NULL,
+    source_mtime        REAL NOT NULL,
+    rule_name           TEXT,
+    planned_actions     TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    resulting_paths     TEXT,
+    failure_detail      TEXT,
+    started_at          TEXT NOT NULL,
+    completed_at        TEXT
 );
 ```
+
+An attempt is the unit of processing history. It can reference one source item and multiple resulting paths, so moves, renames, archives, and unarchives do not require a permanent source-path identity. `status` is one of `started`, `completed`, `failed`, or `needs-reconciliation`.
 
 ## Directory layout
 

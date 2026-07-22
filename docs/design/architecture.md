@@ -185,6 +185,23 @@ Filesystem mutation and Tracking DB writes are not one transaction. If filesyste
 
 A page under each watch folder showing recent log entries for that watch. Supports filtering by level and date range. The in-memory entry limit is configurable; the initial limit is 1000 entries. Full history lives in the log file.
 
+## Reconciliation UI
+
+The initial reconciliation UI is server-rendered and uses HTMX actions. An attempt list shows failed and `needs-reconciliation` attempts with their watch folder, source item, rule, action, status, failure category, and created time. An attempt detail view shows the source fingerprint, planned actions, per-action results, intended destinations, resulting paths, filesystem evidence, failure detail, and related retry attempts.
+
+The UI supports explicit commands for retry, accepting resulting paths, marking an action applied, retrying remaining actions, retrying from the start, and abandoning an attempt. Command handlers delegate to an attempt-review application module; they do not manipulate files or Tracking DB records directly. Every command and result is recorded. Ambiguous evidence requires explicit confirmation, and retrying from the start always creates a new processing attempt.
+
+The attempt-review module has one application-facing interface:
+
+```python
+class AttemptReview:
+    def list(self, filters) -> list[AttemptSummary]: ...
+    def inspect(self, attempt_id) -> AttemptReviewDetails: ...
+    def command(self, attempt_id, command) -> CommandResult: ...
+```
+
+Bulk actions, live updates, dashboards, and rich archive-content previews are outside the initial UI scope.
+
 ## Tracking DB
 
 SQLite database at `/config/organizer.db`. Schema:

@@ -90,6 +90,7 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - The initial web UI rule editor is a raw YAML editor. It validates the complete document, reports line-specific errors where available, shows a dry-run preview, and saves atomically only after validation succeeds.
 - A structured form editor is a future enhancement and is not required for the initial implementation.
 - The web UI uses server-rendered resource routes with HTMX actions. Route handlers remain thin and delegate planning, execution, review, and recovery behavior to application modules.
+- The initial reconciliation UI provides a server-rendered attempt list and detail view. It supports explicit retry, accepting resulting paths, marking an action applied, retrying remaining actions, retrying from the start, and abandoning an attempt through HTMX actions. Handlers delegate to an attempt-review application module and never manipulate files or Tracking DB records directly.
 - Match conditions use regular expressions against `folder_name`, `file_name`, or `full_path`.
 - Supported actions are move, copy, delete, rename, archive, and unarchive.
 - Delete actions must explicitly choose exactly one mode: direct deletion with explicit opt-in, or quarantine to a configured quarantine destination. There is no implicit delete mode.
@@ -111,6 +112,7 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - Filesystem mutation and Tracking DB writes are not one transaction. If the filesystem result or completion recording is uncertain, the attempt enters `needs-reconciliation` and is not automatically repeated.
 - Reconciliation supports accepting resulting paths, marking an action applied, retrying remaining actions, retrying from the start with a new attempt, or abandoning the attempt. Commands and outcomes must be auditable.
 - Reconciliation performs basic filesystem evidence checks using paths and fingerprints. Clearly matching evidence can be accepted automatically; ambiguous evidence requires explicit user confirmation. Every reconciliation command and result is recorded.
+- The attempt-review module exposes a small interface for listing attempts, inspecting one attempt, and issuing an explicit command. The UI renders attempt summaries, action results, evidence, failure details, and related retry attempts.
 - Dry-run execution reports intended actions using the same immutable plan but performs no filesystem mutation and no Tracking DB completion.
 - The watcher and periodic scanner converge on `ItemProcessor`; both use the same unchanged-item and attempt-state policies.
 - Organizer waits for a configurable stability interval during which an item's size and modification time remain unchanged before processing it. Items that are still changing are deferred to a later watcher or periodic scan evaluation.
@@ -138,6 +140,7 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - Watcher and periodic scan processing produce equivalent `ItemProcessor` plans and execution reports for the same unchanged item and rules.
 - CLI dry run, immediate run, and status operations, and their web UI counterparts, render the same plans and execution reports from `ItemProcessor`.
 - Structured logs contain the watch folder, rule, action, item, result, and failure detail for each executed or dry-run action.
+- Initial reconciliation routes are resource-oriented: an attempt list, an attempt detail view, and explicit command actions. Bulk actions, live updates, dashboards, and rich archive-content previews are deferred.
 
 ## Testing Decisions
 
@@ -175,4 +178,4 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - The repository currently contains documentation only; implementation modules and tests must be created.
 - `CONTEXT.md` is the canonical source for domain vocabulary. `docs/adr/` records durable architectural outcomes, and `docs/design/architecture.md` contains detailed behavior and interfaces.
 - The first implementation milestone should be a vertical slice through YAML loading, `ItemProcessor` planning, dry run, one safe filesystem action, durable attempts, and structured logging.
-- Remaining uncertainty: exact CLI command names beyond the already discussed `check`, `run`, and `status`, and the detailed reconciliation UI.
+- Remaining uncertainty: exact CLI command names beyond the already discussed `check`, `run`, and `status`.

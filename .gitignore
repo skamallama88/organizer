@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.local
+.DS_Store
+*.log
+dist/
+build/
+.next/
+*.pyc
+__pycache__/
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

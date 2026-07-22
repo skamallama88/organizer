@@ -9,39 +9,46 @@ The application itself. Runs as a daemon with a web UI and CLI.
 _Avoid_: Sorter, FileBot, Hazel
 
 **Watch folder**:
-A directory monitored by Organizer, with its own independent set of rules. Each watch folder has a `rules.yaml` file defining its behavior.
+A directory monitored by Organizer, with its own independent set of rules.
 _Avoid_: Watched folder, monitored path
 
 **Rule**:
-A named set of match conditions and actions. Rules are evaluated in order against files in a watch folder; first match wins.
+A named set of match conditions and actions that determines how Organizer handles an item.
 _Avoid_: Pattern, filter, workflow
 
 **Match condition**:
-A regex pattern applied to a specific field of a file or folder (folder_name, file_name, full_path). Determines whether a rule applies.
+A condition that determines whether a rule applies to an item.
 _Avoid_: Filter, matcher
 
+**Item**:
+A file or folder considered by a rule.
+
 **Action**:
-An operation performed on a matched item. Examples: move, copy, delete, unarchive.
+An operation performed on a matched item. Examples: move, copy, delete, rename, archive, unarchive.
+
+**Rename**:
+The action of changing the name of a matched file or folder while keeping it in its current parent directory.
+_Avoid_: Move, relabel
 
 **Unarchive**:
-The action of extracting compressed archives (.zip, .7z, .rar). The original archive is deleted by default after successful extraction (configurable via `preserve_archive` flag). Extracted files land in the same directory as the archive by default.
+The action of extracting a compressed archive into files or folders.
 _Avoid_: Extract, decompress
 
 **Archive**:
-The action of compressing matched files or folders into an archive (.zip, .7z). The original items are deleted by default after successful archiving (configurable via `preserve_originals` flag).
+The action of compressing matched files or folders into an archive.
 _Avoid_: Compress, bundle, zip up
 
 **Dry run**:
-A mode where rules are evaluated and actions are determined but not executed. Results are reported as if they happened. Available via `organizer check <watch>` (CLI) and a per-watch toggle in the web UI.
+A mode where rules are evaluated and actions are reported without modifying items or processing state.
 
 **Tracking DB**:
-A SQLite database that records file fingerprints (path, modified time, size) so Organizer can skip already-processed files across restarts.
+A record of items Organizer has processed so it can skip unchanged items across restarts.
 _Avoid_: State file, index
 
 **Config volume**:
-Persistent storage mounted at `/config/` containing watch folder rule files and the tracking database.
+Persistent storage for Organizer configuration and processing state.
 _Avoid_: Config dir, settings
 
 **Data volume**:
-The actual file storage being watched and organized. Mounted separately from the config volume.
+The file storage being watched and organized.
 _Avoid_: Media dir, storage

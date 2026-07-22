@@ -15,6 +15,8 @@ rules:
 
 Rules are evaluated in order within a watch folder; **first match wins** — the first rule whose match condition fires has its actions executed, and evaluation stops for that item.
 
+Rules are loaded from the watch folder's `rules.yaml` file. Invalid YAML, invalid regex patterns, unknown fields or actions, and missing required action parameters prevent that rule from running and are logged as errors. Other valid rules continue to run.
+
 ## Actions
 
 ### Move
@@ -43,6 +45,27 @@ Copies the matched item, leaving the original in place.
 
 Permanently deletes the matched item. No confirmation.
 
+### Rename
+
+```yaml
+- rename:
+    name: <string>            # required; complete new item name
+```
+
+Renames the matched file or folder within its current parent directory. `name` can be a literal name or use `\1`, `\2`, and later capture references from the rule's match regex.
+
+```yaml
+- name: Remove cosplay tag
+  match:
+    field: file_name
+    pattern: '^(.*) \[cosplay\](\.[^.]+)$'
+  actions:
+    - rename:
+        name: '\1\2'
+```
+
+This renames `Alice Costume [cosplay].zip` to `Alice Costume.zip`. An invalid capture reference or a name that is invalid for the host filesystem fails the action and is logged.
+
 ### Unarchive
 
 ```yaml
@@ -53,7 +76,7 @@ Permanently deletes the matched item. No confirmation.
 
 Extracts .zip, .7z, .rar archives. Extracted contents are placed in `destination` (or alongside the archive). On `preserve_archive: false`, the original archive is deleted after successful extraction.
 
-Supports nested archives up to a configurable depth (default: 1 level). Exceeding the depth limit logs a warning and skips.
+Supports nested archives up to a configurable depth (default: 1 level). Exceeding the depth limit logs a warning and skips. Corrupted, password-protected, and unsupported archives are not extracted; the failure is logged and the original archive remains in place.
 
 ### Archive
 
@@ -64,11 +87,17 @@ Supports nested archives up to a configurable depth (default: 1 level). Exceedin
     preserve_originals: false # default: false — delete originals after archiving
 ```
 
-Matches files or folders and bundles them into a single archive file at `destination`. The archive is named after the matched item with the appropriate extension appended.
+Matches files or folders and bundles them into a single archive file in `destination`, which is an output directory. The archive is named after the matched item with the appropriate extension appended.
+
+## Destination collisions
+
+Organizer never overwrites an existing item. If a move, copy, rename, unarchive, or archive action would create an item at a path that already exists, the action fails. Remaining actions in the rule are skipped, the item remains eligible for retry, and the collision is logged as an ERROR result.
+
+The web UI exposes failed items for review, including the source item, intended destination, rule, action, and failure detail. A user can use this review list to resolve the collision outside Organizer before retrying the item.
 
 ## Dry run
 
-In dry run mode, the rule engine evaluates matches and determines which actions would fire, but no filesystem mutations occur. Each action logs what it *would* have done:
+In dry run mode, the rule engine evaluates matches and determines which actions would fire, but no filesystem mutations or Tracking DB updates occur. Each action logs what it *would* have done:
 
 ```
 [Dry Run] Watch: Downloads | Rule: Cosplay folders | Action: move | Item: /data/Downloads/[cosplay] armor | Target: /media/cosplay/[cosplay] armor
@@ -84,12 +113,12 @@ Web UI: each watch folder has a "Dry run" button that shows results in-app.
 3. **Rule iteration** — rules for the watch folder are evaluated in order.
 4. **Match** — the item's field (folder_name, file_name, full_path) is tested against the rule's regex pattern.
 5. **Action execution** — all actions in the first matching rule are executed in sequence. If any action fails, remaining actions are skipped and the failure is logged.
-6. **Tracking DB update** — the item's fingerprint is recorded (or updated) so it won't be re-processed.
+6. **Tracking DB update** — after every action succeeds, the item's path, size, and modification time are recorded so it won't be re-processed. Failures remain eligible for later watcher or scan retries.
 
 ## Logging
 
 - **Output**: structured text to stdout (for `docker logs`) and a rotating log file at `/config/logs/organizer.log`.
-- **Rotation**: logrotate-style — keep 7 days of logs, rotate at 10MB.
+- **Rotation**: configurable retention and size limits. Initial values are 7 days and 10MB per log file.
 - **Format** per line:
 
 ```
@@ -102,7 +131,7 @@ Web UI: each watch folder has a "Dry run" button that shows results in-app.
 
 ## Web UI log viewer
 
-A page under each watch folder showing recent log entries for that watch. Supports filtering by level and date range. The last 1000 entries are kept in memory for the viewer; full history lives in the log file.
+A page under each watch folder showing recent log entries for that watch. Supports filtering by level and date range. The in-memory entry limit is configurable; the initial limit is 1000 entries. Full history lives in the log file.
 
 ## Tracking DB
 

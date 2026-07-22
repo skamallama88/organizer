@@ -19,7 +19,7 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 5. As an administrator, I want multiple independent watch folders, so that different shares can have different organization rules.
 6. As an administrator, I want each watch folder to have its own ordered rules, so that organization behavior is local and understandable.
 7. As an administrator, I want rules stored in YAML, so that they are portable, reviewable, and version-controllable.
-8. As an administrator, I want the web UI to edit or manage YAML-backed rules, so that I do not need to edit files manually for routine changes.
+8. As an administrator, I want the web UI to edit YAML-backed rules with validation and preview, so that I do not need to edit files manually for routine changes.
 9. As a rule author, I want to match a file name, folder name, or full path, so that rules can target the relevant part of an item.
 10. As a rule author, I want match conditions to use regular expressions, so that I can express precise naming patterns.
 11. As a rule author, I want rules evaluated in declaration order with first-match-wins semantics, so that rule precedence is predictable.
@@ -28,52 +28,53 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 14. As a user, I want to move a matched item to a destination, so that items are sorted into their intended folders.
 15. As a user, I want to copy a matched item without removing the original, so that I can retain the source while creating an organized copy.
 16. As a user, I want to delete a matched item, so that disposable files can be removed automatically.
-17. As a user, I want to rename a matched item, so that unwanted tags or naming fragments can be removed.
-18. As a rule author, I want rename names to support regex capture references, so that meaningful portions of an original name can be preserved.
-19. As a user, I want to archive matched files or folders into ZIP or 7z archives, so that completed or infrequently used content can be compressed.
-20. As a user, I want archive actions to optionally preserve the originals, so that I can choose between compression and cleanup.
-21. As a user, I want to unarchive ZIP, 7z, and RAR files, so that incoming archives are automatically expanded.
-22. As a user, I want unarchive actions to default to the archive's directory, so that extracted content can participate in subsequent organization.
-23. As a user, I want to override the unarchive destination, so that extracted content can go directly to a chosen location.
-24. As a user, I want successful unarchive operations to remove the original archive by default, so that watch folders do not retain redundant archives.
-25. As a user, I want to preserve the original archive when configured, so that I can retain it for backup or audit purposes.
-26. As a user, I want nested archives handled up to a configurable depth, so that common archive-within-archive cases are supported without unbounded recursion.
-27. As a user, I want a dry run from the CLI, so that I can see what a watch folder would do before changing files.
-28. As a user, I want a dry run from the web UI, so that I can review intended actions without using the CLI.
-29. As a user, I want dry runs to perform no filesystem mutations, so that previews are safe.
-30. As a user, I want dry runs to avoid updating processing state, so that previews do not make real work appear complete.
-31. As a user, I want dry-run output to show the matched rule, action, source item, and intended target, so that I can understand the result before applying it.
-32. As a user, I want filesystem events to trigger processing promptly, so that items are organized soon after arrival.
-33. As a user, I want periodic scans as a safety net, so that missed filesystem events do not leave items permanently unprocessed.
-34. As an administrator, I want the watcher and scanner to use the same processing module, so that behavior does not vary by trigger.
-35. As a user, I want unchanged completed items skipped across restarts, so that periodic scans do not repeat successful work.
-36. As a user, I want every processing attempt recorded durably, so that I can understand what Organizer tried and what resulted.
-37. As a user, I want action outcomes recorded as execution proceeds, so that partial progress is visible after a failure.
-38. As a user, I want successful attempts to record resulting paths, so that moves, renames, archives, and unarchives are traceable.
-39. As a user, I want failures to stop subsequent actions in the same rule, so that later actions do not operate on an unexpected state.
-40. As a user, I want failed items to remain visible for review, so that I can resolve problems rather than lose track of them.
-41. As a user, I want destination collisions to fail without overwriting existing items, so that existing data is protected.
-42. As a user, I want collision failures suppressed from automatic retries, so that the same warning is not generated indefinitely.
-43. As a user, I want to explicitly retry a collision after resolving it, so that recovery is deliberate and safe.
-44. As a user, I want explicit retries to create new processing attempts, so that the original failure history remains intact.
-45. As a user, I want uncertain filesystem outcomes to enter reconciliation, so that Organizer does not blindly repeat possibly completed destructive work.
-46. As an administrator, I want reconciliation cases to show evidence and resulting paths, so that I can make an informed recovery decision.
-47. As an administrator, I want to accept resulting paths during reconciliation, so that successfully completed filesystem work can be recorded without repeating it.
-48. As an administrator, I want to mark an action applied during reconciliation, so that known partial progress can be acknowledged.
-49. As an administrator, I want to retry remaining actions during reconciliation, so that recovery can continue without repeating known-successful actions.
-50. As an administrator, I want to abandon an unrecoverable attempt, so that it no longer blocks review while remaining in history.
-51. As a user, I want logs written to stdout, so that Docker logs show Organizer activity.
-52. As a user, I want logs written to a rotating persistent file, so that historical activity remains available after container restarts.
-53. As a user, I want structured log fields for watch folder, rule, action, item, result, and detail, so that activity can be traced and filtered.
-54. As a user, I want a web log viewer, so that I can inspect recent activity without accessing the container.
-55. As an administrator, I want invalid YAML and invalid rules reported as errors while valid rules remain usable, so that one configuration mistake does not disable every watch rule.
-56. As an administrator, I want invalid regular expressions and missing action parameters reported clearly, so that configuration errors can be corrected.
-57. As a user, I want corrupted, password-protected, and unsupported archives to remain in place when unarchive fails, so that failed inputs are not silently destroyed.
-58. As a user, I want password-protected archives recorded as failed items for review, so that I know which archives need a password or manual handling.
-59. As a user, I want a password-protected archive to be skipped without stopping processing of other items, so that one blocked archive does not halt the watch folder.
-60. As an administrator, I want the CLI to support an immediate run, so that I can trigger processing without waiting for the next scan.
-61. As an administrator, I want the CLI to show watch status, so that I can inspect last activity and processing outcomes.
-62. As an administrator, I want the CLI and web UI to consume the same plans and execution reports, so that interfaces present consistent behavior.
+17. As a user, I want each delete rule to explicitly choose direct deletion or quarantine, so that destructive behavior is deliberate and recoverable behavior is available.
+18. As a user, I want to rename a matched item, so that unwanted tags or naming fragments can be removed.
+19. As a rule author, I want rename names to support regex capture references, so that meaningful portions of an original name can be preserved.
+20. As a user, I want to archive matched files or folders into ZIP or 7z archives, so that completed or infrequently used content can be compressed.
+21. As a user, I want archive actions to optionally preserve the originals, so that I can choose between compression and cleanup.
+22. As a user, I want to unarchive ZIP, 7z, and RAR files, so that incoming archives are automatically expanded.
+23. As a user, I want unarchive actions to default to the archive's directory, so that extracted content can participate in subsequent organization.
+24. As a user, I want to override the unarchive destination, so that extracted content can go directly to a chosen location.
+25. As a user, I want successful unarchive operations to remove the original archive by default, so that watch folders do not retain redundant archives.
+26. As a user, I want to preserve the original archive when configured, so that I can retain it for backup or audit purposes.
+27. As a user, I want nested archives handled up to a configurable depth, so that common archive-within-archive cases are supported without unbounded recursion.
+28. As a user, I want a dry run from the CLI, so that I can see what a watch folder would do before changing files.
+29. As a user, I want a dry run from the web UI, so that I can review intended actions without using the CLI.
+30. As a user, I want dry runs to perform no filesystem mutations, so that previews are safe.
+31. As a user, I want dry runs to avoid updating processing state, so that previews do not make real work appear complete.
+32. As a user, I want dry-run output to show the matched rule, action, source item, and intended target, so that I can understand the result before applying it.
+33. As a user, I want filesystem events to trigger processing promptly, so that items are organized soon after arrival.
+34. As a user, I want periodic scans as a safety net, so that missed filesystem events do not leave items permanently unprocessed.
+35. As an administrator, I want the watcher and scanner to use the same processing module, so that behavior does not vary by trigger.
+36. As a user, I want unchanged completed items skipped across restarts, so that periodic scans do not repeat successful work.
+37. As a user, I want every processing attempt recorded durably, so that I can understand what Organizer tried and what resulted.
+38. As a user, I want action outcomes recorded as execution proceeds, so that partial progress is visible after a failure.
+39. As a user, I want successful attempts to record resulting paths, so that moves, renames, archives, and unarchives are traceable.
+40. As a user, I want failures to stop subsequent actions in the same rule, so that later actions do not operate on an unexpected state.
+41. As a user, I want failed items to remain visible for review, so that I can resolve problems rather than lose track of them.
+42. As a user, I want destination collisions to fail without overwriting existing items, so that existing data is protected.
+43. As a user, I want collision failures suppressed from automatic retries, so that the same warning is not generated indefinitely.
+44. As a user, I want to explicitly retry a collision after resolving it, so that recovery is deliberate and safe.
+45. As a user, I want explicit retries to create new processing attempts, so that the original failure history remains intact.
+46. As a user, I want uncertain filesystem outcomes to enter reconciliation, so that Organizer does not blindly repeat possibly completed destructive work.
+47. As an administrator, I want reconciliation cases to show evidence and resulting paths, so that I can make an informed recovery decision.
+48. As an administrator, I want to accept resulting paths during reconciliation, so that successfully completed filesystem work can be recorded without repeating it.
+49. As an administrator, I want to mark an action applied during reconciliation, so that known partial progress can be acknowledged.
+50. As an administrator, I want to retry remaining actions during reconciliation, so that recovery can continue without repeating known-successful actions.
+51. As an administrator, I want to abandon an unrecoverable attempt, so that it no longer blocks review while remaining in history.
+52. As a user, I want logs written to stdout, so that Docker logs show Organizer activity.
+53. As a user, I want logs written to a rotating persistent file, so that historical activity remains available after container restarts.
+54. As a user, I want structured log fields for watch folder, rule, action, item, result, and detail, so that activity can be traced and filtered.
+55. As a user, I want a web log viewer, so that I can inspect recent activity without accessing the container.
+56. As an administrator, I want invalid YAML and invalid rules reported as errors while valid rules remain usable, so that one configuration mistake does not disable every watch rule.
+57. As an administrator, I want invalid regular expressions and missing action parameters reported clearly, so that configuration errors can be corrected.
+58. As a user, I want corrupted, password-protected, and unsupported archives to remain in place when unarchive fails, so that failed inputs are not silently destroyed.
+59. As a user, I want password-protected archives recorded as failed items for review, so that I know which archives need a password or manual handling.
+60. As a user, I want a password-protected archive to be skipped without stopping processing of other items, so that one blocked archive does not halt the watch folder.
+61. As an administrator, I want the CLI to support an immediate run, so that I can trigger processing without waiting for the next scan.
+62. As an administrator, I want the CLI to show watch status, so that I can inspect last activity and processing outcomes.
+63. As an administrator, I want the CLI and web UI to consume the same plans and execution reports, so that interfaces present consistent behavior.
 
 ## Implementation Decisions
 
@@ -85,12 +86,18 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - Planning performs no filesystem mutation or Tracking DB update.
 - Execution performs internal preflight validation, revalidates source and destination state immediately before each mutation, executes actions sequentially, records action outcomes, and stops after the first failure.
 - Rules are loaded from YAML and evaluated in declaration order. The first matching rule wins; later rules are not considered for that item.
+- The initial web UI rule editor is a raw YAML editor. It validates the complete document, reports line-specific errors where available, shows a dry-run preview, and saves atomically only after validation succeeds.
+- A structured form editor is a future enhancement and is not required for the initial implementation.
 - Match conditions use regular expressions against `folder_name`, `file_name`, or `full_path`.
 - Supported actions are move, copy, delete, rename, archive, and unarchive.
+- Delete actions must explicitly choose exactly one mode: direct deletion with explicit opt-in, or quarantine to a configured quarantine destination. There is no implicit delete mode.
 - Rename keeps the item in its current parent directory. Its complete replacement name may contain regular-expression capture references from the match condition.
 - Archive operates on files or folders and supports ZIP and 7z output. The destination is an output directory, and originals are removed only after successful archiving unless `preserve_originals` is enabled.
+- Archive output names strip one recognized input archive extension before appending the requested output extension. For example, `project.zip` becomes `project.zip` for ZIP output and `project.7z` for 7z output; no-overwrite collision handling still applies.
 - Unarchive supports ZIP, 7z, and RAR input. Extraction defaults to the archive directory and may specify a destination. Originals are removed only after successful extraction unless `preserve_archive` is enabled. Nested extraction has a configurable depth with an initial default of one level.
+- Unarchive rejects an archive entirely if any entry would escape the configured destination. The original archive remains in place, the failure is recorded for review, and no partial extraction is accepted.
 - Password-protected archives are classified as `password_protected_archive` failures. They remain in place, create failed processing attempts with review details, suppress automatic retries, and do not stop processing other discovered items.
+- Failures are classified as transient, permanent, uncertain, or collision. Only clearly transient failures use bounded automatic retry with backoff. Permanent failures remain available for review, uncertain failures enter reconciliation, and collisions plus known archive-input failures require explicit retry.
 - Invalid YAML, regexes, fields, actions, or required parameters produce diagnostics and do not prevent valid rules from being used.
 - Organizer never overwrites an existing item. A collision fails the attempt, stops later actions, suppresses automatic watcher and scan retries, and is surfaced for explicit review and retry.
 - A durable processing attempt is recorded before filesystem mutation. It stores the original source path and fingerprint, rule, planned actions, status, action results, resulting paths, and failure detail.
@@ -99,8 +106,10 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - Explicit retry creates a new processing attempt and preserves the original attempt history.
 - Filesystem mutation and Tracking DB writes are not one transaction. If the filesystem result or completion recording is uncertain, the attempt enters `needs-reconciliation` and is not automatically repeated.
 - Reconciliation supports accepting resulting paths, marking an action applied, retrying remaining actions, retrying from the start with a new attempt, or abandoning the attempt. Commands and outcomes must be auditable.
+- Reconciliation performs basic filesystem evidence checks using paths and fingerprints. Clearly matching evidence can be accepted automatically; ambiguous evidence requires explicit user confirmation. Every reconciliation command and result is recorded.
 - Dry-run execution reports intended actions using the same immutable plan but performs no filesystem mutation and no Tracking DB completion.
 - The watcher and periodic scanner converge on `ItemProcessor`; both use the same unchanged-item and attempt-state policies.
+- Organizer waits for a configurable stability interval during which an item's size and modification time remain unchanged before processing it. Items that are still changing are deferred to a later watcher or periodic scan evaluation.
 - Structured logs are emitted to stdout and a rotating persistent log. The initial retention defaults are seven days and 10 MB per log file; the in-memory web viewer limit initially defaults to 1,000 entries. These values are configurable.
 - The Tracking DB is SQLite in the persistent configuration volume. Configuration, rules, processing state, and logs are separate from the data volume.
 - Internal seams may be injected for YAML rule source, filesystem operations, archive formats, Tracking DB persistence, and structured event sinks. They are implementation seams, not application-facing contracts.
@@ -161,4 +170,4 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - The repository currently contains documentation only; implementation modules and tests must be created.
 - `CONTEXT.md` is the canonical source for domain vocabulary. `docs/adr/` records durable architectural outcomes, and `docs/design/architecture.md` contains detailed behavior and interfaces.
 - The first implementation milestone should be a vertical slice through YAML loading, `ItemProcessor` planning, dry run, one safe filesystem action, durable attempts, and structured logging.
-- Remaining uncertainty: exact YAML schema validation library, exact CLI command names beyond the already discussed `check`, `run`, and `status`, web route names, archive library choices, the detailed reconciliation UI, web rule-editing model, delete safeguard, retry policy for non-collision failures, reconciliation validation, watch-folder stability detection, archive naming edge cases, archive path-traversal protections, and atomic YAML-save behavior.
+- Remaining uncertainty: exact YAML schema validation library, exact CLI command names beyond the already discussed `check`, `run`, and `status`, web route names, archive library choices, the detailed reconciliation UI, archive naming edge cases, and archive path-traversal protections.

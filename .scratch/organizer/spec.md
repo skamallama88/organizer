@@ -86,16 +86,20 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - Planning performs no filesystem mutation or Tracking DB update.
 - Execution performs internal preflight validation, revalidates source and destination state immediately before each mutation, executes actions sequentially, records action outcomes, and stops after the first failure.
 - Rules are loaded from YAML and evaluated in declaration order. The first matching rule wins; later rules are not considered for that item.
+- YAML configuration is parsed and validated with Pydantic models. Validation errors are converted into diagnostics for callers rather than leaking parser exceptions through the `ItemProcessor` interface.
 - The initial web UI rule editor is a raw YAML editor. It validates the complete document, reports line-specific errors where available, shows a dry-run preview, and saves atomically only after validation succeeds.
 - A structured form editor is a future enhancement and is not required for the initial implementation.
+- The web UI uses server-rendered resource routes with HTMX actions. Route handlers remain thin and delegate planning, execution, review, and recovery behavior to application modules.
 - Match conditions use regular expressions against `folder_name`, `file_name`, or `full_path`.
 - Supported actions are move, copy, delete, rename, archive, and unarchive.
 - Delete actions must explicitly choose exactly one mode: direct deletion with explicit opt-in, or quarantine to a configured quarantine destination. There is no implicit delete mode.
 - Rename keeps the item in its current parent directory. Its complete replacement name may contain regular-expression capture references from the match condition.
 - Archive operates on files or folders and supports ZIP and 7z output. The destination is an output directory, and originals are removed only after successful archiving unless `preserve_originals` is enabled.
 - Archive output names strip one recognized input archive extension before appending the requested output extension. For example, `project.zip` becomes `project.zip` for ZIP output and `project.7z` for 7z output; no-overwrite collision handling still applies.
+- Recognized input archive extensions are `.zip`, `.7z`, and `.rar`, matched case-insensitively. At most one recognized suffix is stripped; other suffixes remain part of the generated archive name.
 - Unarchive supports ZIP, 7z, and RAR input. Extraction defaults to the archive directory and may specify a destination. Originals are removed only after successful extraction unless `preserve_archive` is enabled. Nested extraction has a configurable depth with an initial default of one level.
 - Unarchive rejects an archive entirely if any entry would escape the configured destination. The original archive remains in place, the failure is recorded for review, and no partial extraction is accepted.
+- Unarchive also rejects an archive entirely if an archive entry creates a symlink that would escape the configured destination. Symlinks are not followed outside the destination.
 - Password-protected archives are classified as `password_protected_archive` failures. They remain in place, create failed processing attempts with review details, suppress automatic retries, and do not stop processing other discovered items.
 - Failures are classified as transient, permanent, uncertain, or collision. Only clearly transient failures use bounded automatic retry with backoff. Permanent failures remain available for review, uncertain failures enter reconciliation, and collisions plus known archive-input failures require explicit retry.
 - Invalid YAML, regexes, fields, actions, or required parameters produce diagnostics and do not prevent valid rules from being used.
@@ -113,6 +117,7 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - Structured logs are emitted to stdout and a rotating persistent log. The initial retention defaults are seven days and 10 MB per log file; the in-memory web viewer limit initially defaults to 1,000 entries. These values are configurable.
 - The Tracking DB is SQLite in the persistent configuration volume. Configuration, rules, processing state, and logs are separate from the data volume.
 - Internal seams may be injected for YAML rule source, filesystem operations, archive formats, Tracking DB persistence, and structured event sinks. They are implementation seams, not application-facing contracts.
+- Archive adapters use `zipfile` for ZIP, `py7zr` for 7z, and `rarfile` backed by a container-provided `unrar` or `bsdtar` executable for RAR. These choices remain behind the archive adapter seam.
 - The primary testing seam is the `ItemProcessor` interface. Tests should use local adapters or in-memory substitutes behind its internal seams rather than testing callers through filesystem or Tracking DB details.
 
 ### Acceptance Criteria
@@ -170,4 +175,4 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - The repository currently contains documentation only; implementation modules and tests must be created.
 - `CONTEXT.md` is the canonical source for domain vocabulary. `docs/adr/` records durable architectural outcomes, and `docs/design/architecture.md` contains detailed behavior and interfaces.
 - The first implementation milestone should be a vertical slice through YAML loading, `ItemProcessor` planning, dry run, one safe filesystem action, durable attempts, and structured logging.
-- Remaining uncertainty: exact YAML schema validation library, exact CLI command names beyond the already discussed `check`, `run`, and `status`, web route names, archive library choices, the detailed reconciliation UI, archive naming edge cases, and archive path-traversal protections.
+- Remaining uncertainty: exact CLI command names beyond the already discussed `check`, `run`, and `status`, and the detailed reconciliation UI.

@@ -27,6 +27,13 @@ An operation performed on a matched item. Examples: move, copy, delete, unarchiv
 The action of extracting compressed archives (.zip, .7z, .rar). The original archive is deleted by default after successful extraction (configurable via `preserve_archive` flag). Extracted files land in the same directory as the archive by default.
 _Avoid_: Extract, decompress
 
+**Archive**:
+The action of compressing matched files or folders into an archive (.zip, .7z). The original items are deleted by default after successful archiving (configurable via `preserve_originals` flag).
+_Avoid_: Compress, bundle, zip up
+
+**Dry run**:
+A mode where rules are evaluated and actions are determined but not executed. Results are reported as if they happened. Available via `organizer check <watch>` (CLI) and a per-watch toggle in the web UI.
+
 **Tracking DB**:
 A SQLite database that records file fingerprints (path, modified time, size) so Organizer can skip already-processed files across restarts.
 _Avoid_: State file, index

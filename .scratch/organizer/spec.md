@@ -77,7 +77,7 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 
 ## Implementation Decisions
 
-- Organizer is a Python application using FastAPI for the backend, HTMX and Alpine.js for the web UI, Click or Typer for the CLI, and watchdog for filesystem events.
+- Organizer is a Python application using FastAPI for the backend, HTMX and Alpine.js for the web UI, Typer for the CLI, and watchdog for filesystem events.
 - Organizer is packaged as a Docker image for deployment on Unraid.
 - The system has one shared `ItemProcessor` module. Watcher, periodic scanner, CLI, and web UI callers use its interface rather than implementing rule or action behavior themselves.
 - The primary module interface separates planning from execution. Planning accepts a watch context, item snapshot, and validated rules, and returns an immutable `Plan`. Execution accepts a `Plan` and an execution mode and returns an `ExecutionReport`.
@@ -104,32 +104,31 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - Structured logs are emitted to stdout and a rotating persistent log. The initial retention defaults are seven days and 10 MB per log file; the in-memory web viewer limit initially defaults to 1,000 entries. These values are configurable.
 - The Tracking DB is SQLite in the persistent configuration volume. Configuration, rules, processing state, and logs are separate from the data volume.
 - Internal seams may be injected for YAML rule source, filesystem operations, archive formats, Tracking DB persistence, and structured event sinks. They are implementation seams, not application-facing contracts.
-- The primary testing seam is the `ItemProcessor` interface. Tests should use local adapters or in-memory substitutes behind its internal seams rather than testing callers through filesystem or database details.
+- The primary testing seam is the `ItemProcessor` interface. Tests should use local adapters or in-memory substitutes behind its internal seams rather than testing callers through filesystem or Tracking DB details.
 
 ### Acceptance Criteria
 
 - A watch folder can load valid YAML rules and report invalid rules without disabling valid rules.
 - A matching item produces an immutable plan with the first matching rule and ordered actions.
 - A dry run produces action reports and logs without changing files or processing state.
-- A real execution applies actions in order and records a completed attempt only after all actions succeed.
-- A failed action stops later actions and records a failed attempt with useful detail.
-- A destination collision never overwrites the existing item and is not retried automatically.
-- A password-protected archive is logged and tracked for review without terminating the watch processing loop.
-- An explicit retry creates a new attempt and preserves the prior attempt.
-- A move, rename, archive, or unarchive records resulting paths when successful.
-- An uncertain filesystem or Tracking DB outcome produces a reconciliation case rather than automatic repeated mutation.
-- ZIP, 7z, and RAR unarchive behavior handles successful extraction and preserves failed inputs.
-- Password-protected unarchive behavior records the archive as failed, identifies it for review, and continues with later items.
-- ZIP and 7z archive behavior handles files and folders and honors original-preservation configuration.
-- Rename supports literal names and regex capture references.
-- Watcher and periodic scan processing produce the same ItemProcessor outcomes.
-- CLI dry run, immediate run, and status operations use the same plans and reports as the web UI.
-- Structured logs contain enough information to identify the watch folder, rule, action, item, result, and failure detail.
+- A real execution applies actions in order and records a `completed` attempt only after all actions succeed.
+- A failed action stops later actions for its item and records a `failed` attempt with the failed action and failure detail; processing continues with other discovered items.
+- A destination collision leaves the existing item unchanged, records a `failed` attempt, and is not retried automatically.
+- A password-protected archive remains in place, records a `password_protected_archive` failure for review, and does not terminate the watch processing loop.
+- An explicit retry creates a new attempt linked to the prior attempt and preserves the prior attempt history.
+- A successful move, rename, archive, or unarchive records all resulting paths on its attempt.
+- An uncertain filesystem or Tracking DB outcome produces a `needs-reconciliation` attempt rather than automatic repeated mutation.
+- ZIP, 7z, and RAR unarchive behavior extracts supported unprotected archives and leaves corrupted, password-protected, or unsupported archives in place with a failure detail.
+- ZIP and 7z archive behavior handles files and folders and removes originals only after a successful archive unless original preservation is enabled.
+- Rename supports literal complete names and regex capture references; invalid capture references or host-invalid names fail the action.
+- Watcher and periodic scan processing produce equivalent `ItemProcessor` plans and execution reports for the same unchanged item and rules.
+- CLI dry run, immediate run, and status operations, and their web UI counterparts, render the same plans and execution reports from `ItemProcessor`.
+- Structured logs contain the watch folder, rule, action, item, result, and failure detail for each executed or dry-run action.
 
 ## Testing Decisions
 
-- Tests assert externally observable behavior through the `ItemProcessor` interface. They should not assert private planner classes, adapter call order beyond observable action outcomes, SQL implementation details, or framework internals.
-- The primary test seam is `ItemProcessor.plan` and `ItemProcessor.execute`. This is the highest existing seam and should remain the main contract for watcher, scanner, CLI, web UI, and recovery behavior.
+- Tests assert externally observable behavior through the `ItemProcessor` interface. They should not assert private planner classes, internal adapter interactions, SQL implementation details, or framework internals.
+- The primary test seam is the `ItemProcessor` interface, through its planning and execution operations. This is the highest existing seam and should remain the main contract for watcher, scanner, CLI, web UI, and recovery behavior.
 - Tests use local-substitutable filesystem and Tracking DB adapters so scenarios can run without modifying real server data.
 - Rule tests cover declaration order, first-match-wins, file and folder items, regex matching, capture-based rename, invalid rules, and missing action parameters.
 - Plan tests cover resolved destinations, source fingerprints, ordered actions, immutable preview data, and stale-plan rejection.
@@ -138,14 +137,13 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - Recovery tests cover action failure, skipped later actions, explicit retry creating a new attempt, collision review, reconciliation, accepted resulting paths, retrying remaining actions, and abandon behavior.
 - Archive failure tests cover password-protected archives, failed-attempt recording, review visibility, suppressed automatic retry, and continuation with other items.
 - Tracking tests cover completed-attempt skipping, failed-attempt eligibility, resulting paths after mutation, and completion-recording failure.
-- Trigger integration tests verify that filesystem events and periodic scans converge on identical `ItemProcessor` results. The two triggers should not duplicate processing of an unchanged completed item.
+- Trigger integration tests verify that filesystem events and periodic scans converge on equivalent `ItemProcessor` results. The two triggers should not duplicate processing of an unchanged completed item.
 - Logging tests assert structured event content and dry-run distinction through the event-sink seam, not through exact logger implementation details.
 - CLI and web tests should verify that they render plans, reports, failures, and reconciliation states from the shared module results. They should not duplicate action semantics.
 - No prior application test suite exists. New tests establish the initial behavior contract at the `ItemProcessor` seam.
 
 ## Out of Scope
 
-- Implementing code, Docker files, or Unraid templates in this specification.
 - Authentication, authorization, multi-user accounts, or remote tenancy.
 - Cloud storage integrations or remote issue trackers.
 - Automatic collision renaming, overwriting, deletion of conflicting destinations, or silent conflict resolution.
@@ -163,4 +161,4 @@ Organizer first produces an immutable execution plan. The plan can be previewed 
 - The repository currently contains documentation only; implementation modules and tests must be created.
 - `CONTEXT.md` is the canonical source for domain vocabulary. `docs/adr/` records durable architectural outcomes, and `docs/design/architecture.md` contains detailed behavior and interfaces.
 - The first implementation milestone should be a vertical slice through YAML loading, `ItemProcessor` planning, dry run, one safe filesystem action, durable attempts, and structured logging.
-- Remaining uncertainty: exact YAML schema validation library, exact CLI command names beyond the already discussed `check`, `run`, and `status`, web route names, archive library choices, and the detailed reconciliation UI are implementation choices unless separately decided.
+- Remaining uncertainty: exact YAML schema validation library, exact CLI command names beyond the already discussed `check`, `run`, and `status`, web route names, archive library choices, the detailed reconciliation UI, web rule-editing model, delete safeguard, retry policy for non-collision failures, reconciliation validation, watch-folder stability detection, archive naming edge cases, archive path-traversal protections, and atomic YAML-save behavior.

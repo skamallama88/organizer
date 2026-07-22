@@ -99,7 +99,7 @@ This renames `Alice Costume [cosplay].zip` to `Alice Costume.zip`. An invalid ca
 
 Extracts .zip, .7z, .rar archives. Extracted contents are placed in `destination` (or alongside the archive). On `preserve_archive: false`, the original archive is deleted after successful extraction.
 
-Supports nested archives up to a configurable depth (default: 1 level). Exceeding the depth limit logs a warning and skips. Corrupted, password-protected, and unsupported archives are not extracted; the failure is logged and the original archive remains in place.
+Supports nested archives up to a configurable depth (default: 1 level). Exceeding the depth limit logs a warning and skips. Corrupted, password-protected, and unsupported archives are not extracted; the failure is logged, recorded on the processing attempt, and the original archive remains in place.
 
 ### Archive
 
@@ -116,7 +116,7 @@ Matches files or folders and bundles them into a single archive file in `destina
 
 Organizer never overwrites an existing item. If a move, copy, rename, unarchive, or archive action would create an item at a path that already exists, the action fails. Remaining actions in the rule are skipped, automatic watcher and scan retries are suppressed, and the collision is logged as an ERROR result.
 
-The web UI exposes failed items for review, including the source item, intended destination, rule, action, and failure detail. Collision failures are not retried automatically by watcher or scan events. After the user resolves the collision, an explicit retry creates a new processing attempt; the original attempt remains in history.
+The web UI exposes failed items for review, including the source item, intended destination, rule, action, and failure detail. Collision and archive-input failures, including password-protected archives, are not retried automatically by watcher or scan events. After the user resolves the problem, an explicit retry creates a new processing attempt; the original attempt remains in history.
 
 ## Execution and recovery
 
@@ -124,7 +124,7 @@ Actions execute one at a time in declared order. Each action is revalidated imme
 
 The executor does not promise filesystem transactions or rollback. For actions where the result can be verified, the implementation records evidence such as the resulting path and fingerprint. When the outcome is uncertain, the attempt becomes `needs-reconciliation` and is not automatically retried.
 
-Collision failures are ordinary `failed` attempts and suppress automatic watcher and scan retries. An explicit user retry creates a new processing attempt. Reconciliation cases expose the evidence and allow an operator to accept resulting paths, mark an action applied, retry remaining actions, retry from the start, or abandon the attempt. `retry from the start` always creates a new attempt.
+Collision and known archive-input failures are ordinary `failed` attempts and suppress automatic watcher and scan retries. An explicit user retry creates a new processing attempt. Reconciliation cases expose the evidence and allow an operator to accept resulting paths, mark an action applied, retry remaining actions, retry from the start, or abandon the attempt. `retry from the start` always creates a new attempt.
 
 The attempt state transitions are:
 
@@ -135,6 +135,8 @@ started -> completed
 ```
 
 `completed` means every planned action succeeded and resulting paths were recorded. `failed` means the attempt requires explicit retry or review. `needs-reconciliation` means filesystem effects may exist but completion cannot be established safely.
+
+A password-protected archive is a known input failure, not a process-wide failure. Organizer records a `password_protected_archive` failure for that item, leaves the archive in place, exposes it for review, and continues processing other discovered items.
 
 ## Dry run
 
@@ -160,7 +162,7 @@ Web UI: each watch folder has a "Dry run" button that shows results in-app.
 4. **Match** — the item's field (folder_name, file_name, full_path) is tested against the rule's regex pattern.
 5. **Attempt creation** — a durable processing attempt is recorded as `started` before filesystem mutation.
 6. **Preflight** — source state, action parameters, destinations, collisions, and known archive requirements are checked without promising transactional execution.
-7. **Execution** — the executor applies actions in sequence, records action outcomes, and stops after the first failure.
+7. **Execution** — the executor applies actions in sequence, records action outcomes, and stops processing the current item's remaining actions after the first failure. The watch processing loop continues with other discovered items.
 8. **Completion** — after every action succeeds, the attempt records `completed` and all resulting paths. Failures record `failed` or `needs-reconciliation` with their details. Collision failures are `failed` and require explicit user retry.
 
 Filesystem mutation and Tracking DB writes are not one transaction. If filesystem mutation succeeds but completion recording fails, the attempt becomes `needs-reconciliation`; Organizer does not automatically repeat the filesystem actions. Reconciliation records the existing result before the item can be considered complete.
@@ -177,7 +179,7 @@ Filesystem mutation and Tracking DB writes are not one transaction. If filesyste
 
 - **Levels**: INFO, WARN, ERROR, DRYRUN
 - **Result**: OK, SKIPPED, FAILED, DRY_RUN
-- **Detail**: free-text explanation (e.g., "Destination already exists", "Nested archive depth exceeded")
+- **Detail**: free-text explanation (e.g., "Destination already exists", "Nested archive depth exceeded", "Archive is password protected")
 
 ## Web UI log viewer
 

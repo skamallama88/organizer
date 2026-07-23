@@ -25,6 +25,10 @@ Implemented:
 - Discovery-batch processing with executed, skipped, deferred, and
   outside-snapshot outcomes.
 - Restart recovery of nonterminal leased attempts to needs-reconciliation.
+- Collision suppression: durable suppression of automatic processing after a destination collision.
+- Explicit retry: `retry_attempt` creates a fresh linked plan for a failed or suppressed attempt.
+- Explicit reprocess: `reprocess_item` permits a completed source identity to be processed again under current rules.
+- Suppression visibility: `has_suppressed_attempt` and `suppressed_attempts` expose suppressed source identities.
 
 Not implemented yet:
 

@@ -6,6 +6,6 @@
 
 **Status:** ready-for-agent
 
-- [ ] A collision leaves existing data unchanged, stops later actions, records a failed execution attempt, and suppresses automatic processing of that source identity.
-- [ ] Explicit retry and reprocess commands create fresh plans and linked history rather than reusing historical actions.
-- [ ] A changed or absent source is visible to the administrator and cannot receive stale rule captures or destinations.
+- [x] A collision leaves existing data unchanged, stops later actions, records a failed execution attempt, and suppresses automatic processing of that source identity.
+- [x] Explicit retry and reprocess commands create fresh plans and linked history rather than reusing historical actions.
+- [x] A changed or absent source is visible to the administrator and cannot receive stale rule captures or destinations.

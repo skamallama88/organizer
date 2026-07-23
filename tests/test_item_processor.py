@@ -1058,3 +1058,223 @@ def test_process_batch_reports_failed_status_for_planning_error(tmp_path: Path) 
 
     assert batch.items[0].status == "failed"
     assert "no valid rule" in batch.items[0].detail
+
+
+def test_collision_suppresses_automatic_retry(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    (destination / "movie.mkv").write_text("existing")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    snapshot = ItemSnapshot(path=item, size=item.stat().st_size, mtime=item.stat().st_mtime)
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, [snapshot], stability_interval=0.0, now=1000.0,
+    )
+
+    assert batch.items[0].status == "failed"
+    assert "collision" in batch.items[0].detail.lower()
+    fingerprint = processor._fingerprint(item)
+    assert processor.has_suppressed_attempt("downloads", item, fingerprint) is True
+
+    batch2 = processor.process_batch(
+        "downloads", watch_root, rules, [snapshot], stability_interval=0.0, now=2000.0,
+    )
+    assert batch2.items[0].status == "failed"
+    assert "suppressed" in batch2.items[0].detail.lower()
+
+
+def test_has_suppressed_attempt_false_when_no_history(tmp_path: Path) -> None:
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    source = tmp_path / "movie.mkv"
+    source.write_text("movie")
+
+    assert processor.has_suppressed_attempt("downloads", source, "fp1") is False
+
+
+def test_has_suppressed_attempt_false_for_completed(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    processor.execute(plan)
+
+    assert processor.has_suppressed_attempt("downloads", item, plan.source_fingerprint) is False
+
+
+def test_execute_collision_creates_suppression(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+
+    (destination / "movie.mkv").write_text("existing")
+
+    report = processor.execute(plan)
+
+    assert report.status == "failed"
+    assert "exists" in report.actions[-1].detail
+    assert processor.has_suppressed_attempt("downloads", item, plan.source_fingerprint) is True
+
+
+def test_retry_attempt_creates_linked_fresh_plan(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    (destination / "movie.mkv").write_text("existing")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshot = ItemSnapshot(path=item, size=item.stat().st_size, mtime=item.stat().st_mtime)
+    processor.process_batch(
+        "downloads", watch_root, rules, [snapshot], stability_interval=0.0, now=1000.0,
+    )
+    import sqlite3
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        row = conn.execute("SELECT attempt_id FROM processing_attempts WHERE status = ?", ("failed",)).fetchone()
+    original_attempt_id = row[0]
+
+    (destination / "movie.mkv").unlink()
+    report = processor.retry_attempt(original_attempt_id, watch_root, rules)
+
+    assert report.status == "completed"
+    assert (destination / "movie.mkv").read_text() == "movie"
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        latest = conn.execute("SELECT attempt_id, status, retry_of_attempt_id FROM processing_attempts ORDER BY rowid DESC LIMIT 1").fetchone()
+    assert latest[1] == "completed"
+    assert latest[2] == original_attempt_id
+
+
+def test_retry_attempt_clears_suppression(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    (destination / "movie.mkv").write_text("existing")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshot = ItemSnapshot(path=item, size=item.stat().st_size, mtime=item.stat().st_mtime)
+    processor.process_batch(
+        "downloads", watch_root, rules, [snapshot], stability_interval=0.0, now=1000.0,
+    )
+    import sqlite3
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        row = conn.execute("SELECT attempt_id FROM processing_attempts WHERE status = ?", ("failed",)).fetchone()
+    original_attempt_id = row[0]
+    fingerprint = processor._fingerprint(item)
+    assert processor.has_suppressed_attempt("downloads", item, fingerprint) is True
+
+    (destination / "movie.mkv").unlink()
+    processor.retry_attempt(original_attempt_id, watch_root, rules)
+
+    assert processor.has_suppressed_attempt("downloads", item, fingerprint) is False
+
+
+def test_retry_attempt_rejects_nonexistent_attempt(tmp_path: Path) -> None:
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    with pytest.raises(ValueError, match="attempt not found"):
+        processor.retry_attempt("nonexistent", tmp_path, tmp_path / "rules.yaml")
+
+
+def test_retry_attempt_rejects_completed_attempt(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    processor.execute(plan)
+    import sqlite3
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        row = conn.execute("SELECT attempt_id FROM processing_attempts WHERE status = ?", ("completed",)).fetchone()
+
+    with pytest.raises(ValueError, match="not retryable"):
+        processor.retry_attempt(row[0], watch_root, rules)
+
+
+def test_retry_attempt_reports_missing_source(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    (destination / "movie.mkv").write_text("existing")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshot = ItemSnapshot(path=item, size=item.stat().st_size, mtime=item.stat().st_mtime)
+    processor.process_batch(
+        "downloads", watch_root, rules, [snapshot], stability_interval=0.0, now=1000.0,
+    )
+    import sqlite3
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        row = conn.execute("SELECT attempt_id FROM processing_attempts WHERE status = ?", ("failed",)).fetchone()
+    original_attempt_id = row[0]
+    item.unlink()
+    (destination / "movie.mkv").unlink()
+
+    with pytest.raises((ValueError, OSError)):
+        processor.retry_attempt(original_attempt_id, watch_root, rules)
+
+
+def test_reprocess_item_creates_fresh_plan(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_copy_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    processor.execute(plan)
+    first_fingerprint = plan.source_fingerprint
+    assert processor.has_completed_attempt("downloads", item, first_fingerprint) is True
+    assert (destination / "movie.mkv").read_text() == "movie"
+
+    (destination / "movie.mkv").unlink()
+    report = processor.reprocess_item("downloads", watch_root, item, rules)
+
+    assert report.status == "completed"
+    assert (destination / "movie.mkv").read_text() == "movie"
+
+
+def test_suppressed_attempts_lists_suppressed_identities(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    (destination / "movie.mkv").write_text("existing")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshot = ItemSnapshot(path=item, size=item.stat().st_size, mtime=item.stat().st_mtime)
+    processor.process_batch(
+        "downloads", watch_root, rules, [snapshot], stability_interval=0.0, now=1000.0,
+    )
+
+    suppressions = processor.suppressed_attempts()
+
+    assert len(suppressions) == 1
+    assert suppressions[0]["watch_id"] == "downloads"
+    assert suppressions[0]["reason"] == "collision"
+    assert suppressions[0]["source_path"] == str(item.resolve())

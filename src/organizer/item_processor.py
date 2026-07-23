@@ -214,7 +214,7 @@ class ItemProcessor:
             rules_path=request.rules_path,
         )
 
-    def execute(self, plan: Plan, mode: ExecutionMode = ExecutionMode.APPLY) -> ExecutionReport:
+    def execute(self, plan: Plan, mode: ExecutionMode = ExecutionMode.APPLY, retry_of_attempt_id: str | None = None) -> ExecutionReport:
         if mode is ExecutionMode.DRY_RUN:
             self._validate_source(plan)
             if plan.rules_path is not None and self._ruleset_revision(plan.rules_path) != plan.ruleset_revision:
@@ -234,7 +234,7 @@ class ItemProcessor:
             raise ValueError("processing lease unavailable")
         attempt_id = str(uuid.uuid4())
         try:
-            self._start_attempt(attempt_id, plan)
+            self._start_attempt(attempt_id, plan, retry_of_attempt_id=retry_of_attempt_id)
             results: list[ActionResult] = []
             source = plan.source
             try:
@@ -269,6 +269,8 @@ class ItemProcessor:
             except OSError as error:
                 result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", str(error), source=source)
                 results.append(result)
+                if isinstance(error, FileExistsError):
+                    self._create_suppression(plan.watch_id, plan.source, plan.source_fingerprint, attempt_id, "collision")
                 self._finish_attempt(attempt_id, "failed", results)
                 self._emit(plan, result)
                 return ExecutionReport(status="failed", dry_run=False, actions=tuple(results))
@@ -281,9 +283,20 @@ class ItemProcessor:
     def attempts(self) -> list[dict[str, object]]:
         with sqlite3.connect(self._attempts_path) as connection:
             rows = connection.execute(
-                "SELECT status, resulting_paths, copy_provenance FROM processing_attempts ORDER BY rowid"
+                "SELECT status, resulting_paths, copy_provenance, failure_detail, retry_of_attempt_id FROM processing_attempts ORDER BY rowid"
             ).fetchall()
-        return [{"status": status, "resulting_paths": json.loads(paths), **({"copy_provenance": json.loads(provenance)} if provenance else {})} for status, paths, provenance in rows]
+        result: list[dict[str, object]] = []
+        for row in rows:
+            status, paths, provenance, failure_detail, retry_of = row
+            entry: dict[str, object] = {"status": status, "resulting_paths": json.loads(paths)}
+            if provenance:
+                entry["copy_provenance"] = json.loads(provenance)
+            if failure_detail:
+                entry["failure_detail"] = failure_detail
+            if retry_of:
+                entry["retry_of_attempt_id"] = retry_of
+            result.append(entry)
+        return result
 
     def _initialize_attempts(self) -> None:
         self._attempts_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,6 +314,11 @@ class ItemProcessor:
                 source_fingerprint TEXT NOT NULL DEFAULT ''
                 )"""
             )
+            for col in ("retry_of_attempt_id", "failure_detail"):
+                try:
+                    connection.execute(f"ALTER TABLE processing_attempts ADD COLUMN {col} TEXT")
+                except sqlite3.OperationalError:
+                    pass
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS processing_leases (
                 watch_id TEXT NOT NULL,
@@ -321,22 +339,34 @@ class ItemProcessor:
                 PRIMARY KEY (watch_id, source_path)
                 )"""
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS processing_suppressions (
+                watch_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                suppressed_at TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                PRIMARY KEY (watch_id, source_path, source_fingerprint)
+                )"""
+            )
 
-    def _start_attempt(self, attempt_id: str, plan: Plan) -> None:
+    def _start_attempt(self, attempt_id: str, plan: Plan, retry_of_attempt_id: str | None = None) -> None:
         with sqlite3.connect(self._attempts_path) as connection:
             connection.execute(
-                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None, plan.source_fingerprint),
+                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance, source_fingerprint, retry_of_attempt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None, plan.source_fingerprint, retry_of_attempt_id),
             )
 
     def _finish_attempt(self, attempt_id: str, status: str, results: list[ActionResult]) -> None:
         paths = [str(result.resulting_path or result.target) for result in results if result.result == "OK"]
         provenance = next((json.dumps({"source": str(result.source), "result": str(result.resulting_path)}) for result in results if result.kind == "copy" and result.result == "OK"), None)
         action_results = json.dumps([{"kind": result.kind, "target": str(result.target), "result": result.result, "detail": result.detail, "source": str(result.source) if result.source else None, "resulting_path": str(result.resulting_path) if result.resulting_path else None} for result in results])
+        failure_detail = results[-1].detail if status == "failed" and results else ""
         with sqlite3.connect(self._attempts_path) as connection:
             connection.execute(
-                "UPDATE processing_attempts SET status = ?, resulting_paths = ?, copy_provenance = ?, action_results = ? WHERE attempt_id = ?",
-                (status, json.dumps(paths), provenance, action_results, attempt_id),
+                "UPDATE processing_attempts SET status = ?, resulting_paths = ?, copy_provenance = ?, action_results = ?, failure_detail = ? WHERE attempt_id = ?",
+                (status, json.dumps(paths), provenance, action_results, failure_detail, attempt_id),
             )
 
     def _emit(self, plan: Plan, result: ActionResult) -> None:
@@ -594,6 +624,98 @@ class ItemProcessor:
             ).fetchone()
         return int(row[0]) > 0
 
+    def has_suppressed_attempt(self, watch_id: str, source: Path, fingerprint: str) -> bool:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM processing_suppressions WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
+                (watch_id, canonical, fingerprint),
+            ).fetchone()
+        return int(row[0]) > 0
+
+    def _create_suppression(self, watch_id: str, source: Path, fingerprint: str, attempt_id: str, reason: str) -> None:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO processing_suppressions (watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                (watch_id, canonical, fingerprint, attempt_id, str(time.time()), reason),
+            )
+
+    def clear_suppression(self, watch_id: str, source: Path, fingerprint: str) -> None:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            connection.execute(
+                "DELETE FROM processing_suppressions WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
+                (watch_id, canonical, fingerprint),
+            )
+
+    def suppressed_attempts(self) -> list[dict[str, object]]:
+        with sqlite3.connect(self._attempts_path) as connection:
+            rows = connection.execute(
+                "SELECT watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason FROM processing_suppressions ORDER BY suppressed_at"
+            ).fetchall()
+        return [
+            {
+                "watch_id": watch_id,
+                "source_path": source_path,
+                "source_fingerprint": source_fingerprint,
+                "attempt_id": attempt_id,
+                "suppressed_at": suppressed_at,
+                "reason": reason,
+            }
+            for watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason in rows
+        ]
+
+    def retry_attempt(
+        self,
+        attempt_id: str,
+        watch_root: Path,
+        rules_path: Path,
+        boundary_policy: BoundaryPolicy | None = None,
+    ) -> ExecutionReport:
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT watch_id, source_path, source_fingerprint, status FROM processing_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"attempt not found: {attempt_id}")
+        db_watch_id, source_path, source_fingerprint, status = row
+        if status not in ("failed", "needs-reconciliation"):
+            raise ValueError(f"attempt {attempt_id} is not retryable: {status}")
+        source = self._canonical_path(Path(source_path))
+        request = PlanRequest(
+            watch_id=db_watch_id,
+            watch_root=self._canonical_path(watch_root),
+            item=source,
+            rules_path=rules_path,
+            boundary_policy=boundary_policy,
+        )
+        plan = self.plan(request)
+        self.clear_suppression(db_watch_id, source, source_fingerprint)
+        return self.execute(plan, retry_of_attempt_id=attempt_id)
+
+    def reprocess_item(
+        self,
+        watch_id: str,
+        watch_root: Path,
+        item: Path,
+        rules_path: Path,
+        boundary_policy: BoundaryPolicy | None = None,
+    ) -> ExecutionReport:
+        source = self._canonical_path(item)
+        fingerprint = self._fingerprint(source)
+        self.clear_suppression(watch_id, source, fingerprint)
+        request = PlanRequest(
+            watch_id=watch_id,
+            watch_root=self._canonical_path(watch_root),
+            item=source,
+            rules_path=rules_path,
+            boundary_policy=boundary_policy,
+        )
+        plan = self.plan(request)
+        return self.execute(plan)
+
     def is_stable(self, watch_id: str, snapshot: ItemSnapshot, *, now: float, stability_interval: float) -> bool:
         canonical = str(self._canonical_path(snapshot.path))
         with sqlite3.connect(self._attempts_path) as connection:
@@ -641,6 +763,9 @@ class ItemProcessor:
             if self.has_completed_attempt(watch_id, canonical, fingerprint):
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.SKIPPED, detail="already completed"))
                 continue
+            if self.has_suppressed_attempt(watch_id, canonical, fingerprint):
+                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail="suppressed: collision"))
+                continue
             if self._has_active_lease(watch_id, canonical, fingerprint):
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.OUTSIDE_SNAPSHOT, detail="already leased"))
                 continue
@@ -655,7 +780,18 @@ class ItemProcessor:
                 plan = self.plan(request)
                 report = self.execute(plan)
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.EXECUTED, report=report))
-            except (ValueError, OSError) as error:
+            except ValueError as error:
+                is_collision = "collision" in str(error).lower()
+                if is_collision:
+                    attempt_id = str(uuid.uuid4())
+                    self._create_suppression(watch_id, canonical, fingerprint, attempt_id, "collision")
+                    with sqlite3.connect(self._attempts_path) as connection:
+                        connection.execute(
+                            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, action_results, source_fingerprint, failure_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (attempt_id, watch_id, str(canonical), "unknown", "failed", "[]", "[]", fingerprint, str(error)),
+                        )
+                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
+            except OSError as error:
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
         if has_deferred:
             diagnostics_set.add("deferred: unstable items withheld from planning")

@@ -11,6 +11,8 @@ Implemented:
 - YAML rule loading and validation diagnostics.
 - First-match rule evaluation.
 - Immutable plans with resolved move destinations.
+- Boundary policy validation for mounted data roots, config-volume exclusion,
+  disjoint watches, safe destinations, and case-aware collisions.
 - CLI and web dry-run previews.
 - Same-filesystem moves with no-overwrite collision protection.
 - SQLite execution-attempt records.
@@ -27,6 +29,10 @@ Not implemented yet:
 
 The complete product specification is in [`spec.md`](spec.md). The first
 vertical-slice ticket is in [`issues/01-bootstrap-safe-organizer-slice.md`](issues/01-bootstrap-safe-organizer-slice.md).
+
+Boundary policy is currently supplied to the `ItemProcessor` planning seam as
+an immutable `BoundaryPolicy`. Multi-watch configuration loading and UI editing
+remain future work; this ticket validates the policy whenever a plan is made.
 
 ## Requirements
 

@@ -5,7 +5,30 @@ from typer.testing import CliRunner
 
 from organizer.cli import app
 from organizer.web import create_app
-from organizer.item_processor import ExecutionMode, ItemProcessor, PlanRequest
+import pytest
+
+from organizer.item_processor import (
+    BoundaryPolicy,
+    ExecutionMode,
+    ItemProcessor,
+    PlanRequest,
+)
+
+
+def make_request(
+    watch_root: Path,
+    item: Path,
+    rules: Path,
+    *,
+    policy: BoundaryPolicy | None = None,
+) -> PlanRequest:
+    return PlanRequest(
+        watch_id="downloads",
+        watch_root=watch_root,
+        item=item,
+        rules_path=rules,
+        boundary_policy=policy,
+    )
 
 
 def test_plans_first_matching_move_as_immutable_preview(tmp_path: Path) -> None:
@@ -34,7 +57,7 @@ def test_plans_first_matching_move_as_immutable_preview(tmp_path: Path) -> None:
     )
 
     processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
-    plan = processor.plan(PlanRequest(watch_id="downloads", watch_root=watch_root, item=item, rules_path=rules))
+    plan = processor.plan(make_request(watch_root, item, rules))
 
     assert plan.rule_name == "videos"
     assert plan.actions[0].kind == "move"
@@ -73,9 +96,7 @@ def test_invalid_rule_does_not_prevent_valid_rule_from_planning(tmp_path: Path) 
 """
     )
 
-    plan = ItemProcessor(attempts_path=tmp_path / "attempts.db").plan(
-        PlanRequest(watch_id="downloads", watch_root=watch_root, item=item, rules_path=rules)
-    )
+    plan = ItemProcessor(attempts_path=tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
 
     assert plan.rule_name == "videos"
     assert len(plan.diagnostics) == 1
@@ -101,7 +122,7 @@ def test_apply_move_records_completed_attempt_after_success(tmp_path: Path) -> N
 """
     )
     processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
-    plan = processor.plan(PlanRequest(watch_id="downloads", watch_root=watch_root, item=item, rules_path=rules))
+    plan = processor.plan(make_request(watch_root, item, rules))
 
     report = processor.execute(plan)
 
@@ -176,3 +197,137 @@ def test_cli_check_accepts_the_documented_subcommand(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.stdout
     assert "videos" in result.stdout
+
+
+def write_move_rules(path: Path, destination: str) -> Path:
+    path.write_text(
+        f"""rules:
+  - name: move
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move:
+          destination: {destination}
+"""
+    )
+    return path
+
+
+def test_policy_requires_watch_and_destination_roots_inside_data_volumes(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    config = tmp_path / "config"
+    watch_root = data / "downloads"
+    watch_root.mkdir(parents=True)
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+
+    policy = BoundaryPolicy(data_roots=(data,), config_root=config, allowed_destinations=(data / "videos",))
+    plan = ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules, policy=policy))
+
+    assert plan.actions[0].target == data / "videos" / "movie.mkv"
+
+    with pytest.raises(ValueError, match="config volume"):
+        ItemProcessor(tmp_path / "config-attempts.db").plan(
+            make_request(watch_root, item, write_move_rules(watch_root / "config-rules.yaml", str(config / "out")), policy=policy)
+        )
+
+
+def test_policy_rejects_overlapping_watch_roots_and_config_watch(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    config = tmp_path / "config"
+    watch_root = data / "downloads"
+    watch_root.mkdir(parents=True)
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+
+    with pytest.raises(ValueError, match="watch roots must be disjoint"):
+        ItemProcessor(tmp_path / "attempts.db").plan(
+            make_request(
+                watch_root,
+                item,
+                rules,
+                policy=BoundaryPolicy(
+                    data_roots=(data,),
+                    config_root=config,
+                    watch_roots=(watch_root, watch_root / "nested"),
+                ),
+            )
+        )
+
+    with pytest.raises(ValueError, match="config volume"):
+        ItemProcessor(tmp_path / "config-attempts.db").plan(
+            make_request(
+                config,
+                config,
+                rules,
+                policy=BoundaryPolicy(data_roots=(data,), config_root=config),
+            )
+        )
+
+
+def test_plan_rejects_self_and_descendant_targets(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "folder"
+    item.mkdir()
+    rules = write_move_rules(watch_root / "rules.yaml", "folder/subfolder")
+
+    with pytest.raises(ValueError, match="self-targeting"):
+        ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+
+def test_plan_rejects_symlink_traversal(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    outside = tmp_path / "outside"
+    watch_root.mkdir()
+    outside.mkdir()
+    (watch_root / "linked").symlink_to(outside, target_is_directory=True)
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "linked")
+
+    with pytest.raises(ValueError, match="symlink"):
+        ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+
+def test_plan_rejects_existing_and_case_only_collisions(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "Movie.mkv"
+    item.write_text("movie")
+    (destination / "movie.mkv").write_text("existing")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+
+    with pytest.raises(ValueError, match="collision"):
+        ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+
+def test_cross_watch_destination_is_allowed_with_warning(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    watch_root = data / "downloads"
+    destination = data / "videos"
+    watch_root.mkdir(parents=True)
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+
+    plan = ItemProcessor(tmp_path / "attempts.db").plan(
+        make_request(
+            watch_root,
+            item,
+            rules,
+            policy=BoundaryPolicy(
+                data_roots=(data,),
+                watch_roots=(watch_root, destination),
+                allowed_destinations=(destination,),
+            ),
+        )
+    )
+
+    assert any("another watch folder" in diagnostic for diagnostic in plan.diagnostics)

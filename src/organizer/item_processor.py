@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -18,11 +19,23 @@ class ExecutionMode(StrEnum):
 
 
 @dataclass(frozen=True)
+class BoundaryPolicy:
+    """Mounted path policy used to validate watch and action boundaries."""
+
+    data_roots: tuple[Path, ...] = ()
+    config_root: Path | None = None
+    watch_roots: tuple[Path, ...] = ()
+    allowed_destinations: tuple[Path, ...] = ()
+    case_sensitive: bool | None = None
+
+
+@dataclass(frozen=True)
 class PlanRequest:
     watch_id: str
     watch_root: Path
     item: Path
     rules_path: Path
+    boundary_policy: BoundaryPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -66,9 +79,11 @@ class ItemProcessor:
         self._initialize_attempts()
 
     def plan(self, request: PlanRequest) -> Plan:
-        item = request.item.resolve()
-        watch_root = request.watch_root.resolve()
+        policy = request.boundary_policy or BoundaryPolicy()
+        item = self._canonical_path(request.item)
+        watch_root = self._canonical_path(request.watch_root)
         diagnostics: list[str] = []
+        self._validate_policy(policy, watch_root, item)
         matching_rule: tuple[str, list[dict[str, Any]]] | None = None
 
         loaded = yaml.safe_load(request.rules_path.read_text()) or {}
@@ -101,7 +116,14 @@ class ItemProcessor:
             root = Path(destination)
             if not root.is_absolute():
                 root = watch_root / root
-            current = root.resolve() / current.name
+            destination_root = self._resolve_destination(root)
+            self._validate_destination(policy, watch_root, current, destination_root)
+            current = destination_root / current.name
+            self._validate_destination_item(current)
+            if current.exists() or self._case_collision(current, policy):
+                raise ValueError(f"destination collision: {current}")
+            if destination_root in {self._canonical_path(root) for root in policy.watch_roots}:
+                diagnostics.append(f"destination is another watch folder: {destination_root}")
             planned.append(PlannedAction(kind="move", target=current))
 
         stat = item.stat()
@@ -133,6 +155,9 @@ class ItemProcessor:
             for action in plan.actions:
                 if action.kind != "move":
                     raise ValueError(f"unsupported action {action.kind}")
+                self._validate_destination_item(action.target)
+                if self._case_collision(action.target, BoundaryPolicy()):
+                    raise FileExistsError(f"destination already exists: {action.target}")
                 if action.target.exists():
                     raise FileExistsError(f"destination already exists: {action.target}")
                 action.target.parent.mkdir(parents=True, exist_ok=True)
@@ -234,3 +259,91 @@ class ItemProcessor:
         stat = plan.source.stat()
         if stat.st_size != plan.source_size or stat.st_mtime != plan.source_mtime:
             raise ValueError("stale plan: source changed")
+
+    @staticmethod
+    def _canonical_path(path: Path) -> Path:
+        return Path(os.path.abspath(os.path.normpath(path))).resolve(strict=False)
+
+    @classmethod
+    def _resolve_destination(cls, path: Path) -> Path:
+        current = Path(os.path.abspath(os.path.normpath(path)))
+        cursor = Path(current.anchor)
+        for component in current.parts[1:]:
+            cursor /= component
+            if cursor.is_symlink():
+                raise ValueError(f"unsafe symlink traversal in destination: {path}")
+        return current.resolve(strict=False)
+
+    @classmethod
+    def _validate_policy(cls, policy: BoundaryPolicy, watch_root: Path, item: Path) -> None:
+        data_roots = tuple(cls._canonical_path(root) for root in policy.data_roots)
+        config_root = cls._canonical_path(policy.config_root) if policy.config_root else None
+        watch_roots = tuple(cls._canonical_path(root) for root in policy.watch_roots)
+        for destination in policy.allowed_destinations:
+            cls._validate_destination_root(policy, cls._canonical_path(destination))
+        if config_root and cls._is_within(watch_root, config_root):
+            raise ValueError("config volume cannot be a watch root")
+        if data_roots and not any(cls._is_within(watch_root, root) for root in data_roots):
+            raise ValueError("watch root must be within a data volume")
+        if watch_roots and watch_root not in watch_roots:
+            watch_roots = (*watch_roots, watch_root)
+        for index, first in enumerate(watch_roots):
+            for second in watch_roots[index + 1 :]:
+                if cls._is_within(first, second) or cls._is_within(second, first):
+                    raise ValueError("watch roots must be disjoint")
+        if config_root and cls._is_within(item, config_root):
+            raise ValueError("config volume cannot be watched or targeted")
+
+    @classmethod
+    def _validate_destination_root(cls, policy: BoundaryPolicy, destination: Path) -> None:
+        if policy.config_root and cls._is_within(destination, cls._canonical_path(policy.config_root)):
+            raise ValueError("allowed destination cannot be within the config volume")
+        if policy.data_roots and not any(
+            cls._is_within(destination, cls._canonical_path(root)) for root in policy.data_roots
+        ):
+            raise ValueError("allowed destination must be within a data volume")
+        cls._resolve_destination(destination)
+
+    @classmethod
+    def _validate_destination(
+        cls, policy: BoundaryPolicy, watch_root: Path, source: Path, destination_root: Path
+    ) -> None:
+        if policy.config_root and cls._is_within(destination_root, cls._canonical_path(policy.config_root)):
+            raise ValueError("destination cannot be within the config volume")
+        if policy.data_roots and not any(
+            cls._is_within(destination_root, cls._canonical_path(root)) for root in policy.data_roots
+        ):
+            raise ValueError("destination must be within a data volume")
+        if policy.allowed_destinations and not any(
+            cls._is_within(destination_root, cls._canonical_path(root))
+            for root in policy.allowed_destinations
+        ):
+            raise ValueError("destination is not an allowed destination root")
+        if cls._is_within(destination_root, source) and source.is_dir():
+            raise ValueError("self-targeting or descendant-targeting destination")
+        if destination_root == source.parent and source.name == destination_root.name:
+            raise ValueError("self-targeting destination")
+        if destination_root == watch_root and source.name == watch_root.name:
+            raise ValueError("self-targeting destination")
+
+    @classmethod
+    def _validate_destination_item(cls, path: Path) -> None:
+        for parent in (path.parent, *path.parent.parents):
+            if parent.is_symlink():
+                raise ValueError(f"unsafe symlink traversal in destination: {path}")
+
+    @staticmethod
+    def _is_within(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return False
+        return True
+
+    @classmethod
+    def _case_collision(cls, path: Path, policy: BoundaryPolicy) -> bool:
+        if policy.case_sensitive is True:
+            return False
+        if path.parent.exists():
+            return any(candidate.name.casefold() == path.name.casefold() for candidate in path.parent.iterdir())
+        return False

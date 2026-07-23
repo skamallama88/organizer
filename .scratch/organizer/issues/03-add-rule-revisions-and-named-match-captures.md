@@ -6,6 +6,6 @@
 
 **Status:** ready-for-agent
 
-- [ ] Named match conditions support explicit numbered and named capture references, while invalid references fail validation.
-- [ ] Plans expose disabled-earlier-rule warnings and resolve `full_path` as a normalized container-visible absolute path within mounted data volumes.
-- [ ] Ruleset revisions make stale plans non-executable, UI saves detect conflicts, and only valid external edits become active revisions.
+- [x] Named match conditions support explicit numbered and named capture references, while invalid references fail validation.
+- [x] Plans expose disabled-earlier-rule warnings and resolve `full_path` as a normalized container-visible absolute path within mounted data volumes.
+- [x] Ruleset revisions make stale plans non-executable, UI saves detect conflicts, and only valid external edits become active revisions.

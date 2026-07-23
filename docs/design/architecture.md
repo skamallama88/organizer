@@ -29,6 +29,7 @@ The planner does not mutate the filesystem or Tracking DB. The executor creates 
 rules:
   - name: <string>                        # required, unique per watch folder
     match:
+      name: <string>                        # optional, unique within the rule
       field: folder_name | file_name | full_path
       pattern: <regex>                    # always regex
     actions:
@@ -36,7 +37,7 @@ rules:
           <action_params>
 ```
 
-Rules are evaluated in order within a watch folder; **first match wins** — the first rule whose match condition fires has its actions executed, and evaluation stops for that item.
+Rules are evaluated in order within a watch folder; **first match wins** — the first rule whose match condition fires has its actions executed, and evaluation stops for that item. A named match condition's numbered (`\\1`) and named (`\\g<name>`) captures must be valid references in all action parameters. Invalid references disable that rule and produce a visible disabled-earlier-rule warning when a later rule matches.
 
 Rules are loaded from the watch folder's `rules.yaml` file. Invalid YAML, invalid regex patterns, unknown fields or actions, and missing required action parameters prevent that rule from running and are logged as errors. Other valid rules continue to run.
 
@@ -87,7 +88,9 @@ Renames the matched file or folder within its current parent directory. `name` c
         name: '\1\2'
 ```
 
-This renames `Alice Costume [cosplay].zip` to `Alice Costume.zip`. An invalid capture reference or a name that is invalid for the host filesystem fails the action and is logged.
+This renames `Alice Costume [cosplay].zip` to `Alice Costume.zip`. An invalid capture reference or a name that is invalid for the host filesystem fails validation and disables the rule.
+
+Plans include a SHA-256 ruleset revision. Applying a plan after the rules file changes is rejected as stale. UI rule saves compare the submitted revision with the current file revision and return a conflict rather than overwriting concurrent edits.
 
 ### Unarchive
 

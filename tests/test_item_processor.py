@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
@@ -331,3 +332,129 @@ def test_cross_watch_destination_is_allowed_with_warning(tmp_path: Path) -> None
     )
 
     assert any("another watch folder" in diagnostic for diagnostic in plan.diagnostics)
+
+
+def test_named_condition_expands_numbered_and_named_captures_in_rename(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "Alice [cosplay].mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: normalize
+    match:
+      name: title
+      field: file_name
+      pattern: '^(?P<title>.*) \\[cosplay\\](?P<extension>\\.mkv)$'
+    actions:
+      - rename:
+          name: '\\g<title>\\g<extension>'
+      - rename:
+          name: '\\1\\2'
+"""
+    )
+
+    plan = ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+    assert [action.target for action in plan.actions] == [
+        watch_root / "Alice.mkv",
+        watch_root / "Alice.mkv",
+    ]
+
+
+def test_invalid_capture_reference_disables_rule_and_warns(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: invalid
+    match:
+      name: title
+      field: file_name
+      pattern: '(.*)'
+    actions:
+      - rename:
+          name: '\\g<missing>'
+  - name: videos
+    match:
+      field: file_name
+      pattern: '\\.mkv$'
+    actions:
+      - move:
+          destination: ../videos
+"""
+    )
+
+    plan = ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+    assert plan.rule_name == "videos"
+    assert any("disabled earlier rule 1" in diagnostic for diagnostic in plan.diagnostics)
+    assert "capture" in plan.diagnostics[0]
+
+
+def test_full_path_matches_normalized_container_absolute_path(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    watch_root = data_root / "downloads"
+    watch_root.mkdir(parents=True)
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: videos
+    match:
+      field: full_path
+      pattern: '^/.*?/data/downloads/movie\\.mkv$'
+    actions:
+      - move:
+          destination: ../videos
+"""
+    )
+
+    plan = ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+    assert plan.source == item.resolve()
+
+
+def test_plan_revision_blocks_execution_after_rules_change(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    plan = processor.plan(make_request(watch_root, item, rules))
+    rules.write_text(rules.read_text().replace("../videos", "../other"))
+
+    with pytest.raises(ValueError, match="stale plan: ruleset revision changed"):
+        processor.execute(plan)
+
+
+def test_ui_rule_save_uses_compare_and_swap_revision(tmp_path: Path) -> None:
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    client = TestClient(create_app(processor))
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("rules: []\n")
+    revision = hashlib.sha256(rules.read_bytes()).hexdigest()
+
+    response = client.put(
+        "/watches/downloads/rules",
+        params={"rules_path": rules, "expected_revision": revision},
+        content="rules:\n  - name: videos\n",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["revision"] != revision
+
+    conflict = client.put(
+        "/watches/downloads/rules",
+        params={"rules_path": rules, "expected_revision": revision},
+        content="rules: []\n",
+    )
+
+    assert conflict.status_code == 409

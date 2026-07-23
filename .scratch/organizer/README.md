@@ -19,6 +19,12 @@ Implemented:
 - SQLite execution-attempt records.
 - Structured in-memory events for dry runs and execution.
 - Docker image packaging.
+- Durable processing leases for exclusive per-source-identity ownership.
+- Completion skipping for unchanged items across restarts.
+- Item stability observations and deferred-item handling.
+- Discovery-batch processing with executed, skipped, deferred, and
+  outside-snapshot outcomes.
+- Restart recovery of nonterminal leased attempts to needs-reconciliation.
 
 Not implemented yet:
 

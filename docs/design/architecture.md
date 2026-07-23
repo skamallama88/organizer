@@ -15,9 +15,34 @@ class ItemProcessor(Protocol):
         mode: ExecutionMode = ExecutionMode.APPLY,
     ) -> ExecutionReport:
         """Apply or report a plan without exposing filesystem details."""
+
+    def acquire_lease(self, watch_id: str, source: Path, fingerprint: str) -> bool:
+        """Acquire an exclusive processing lease for a source identity."""
+
+    def has_completed_attempt(self, watch_id: str, source: Path, fingerprint: str) -> bool:
+        """Check whether a source identity has a completed attempt."""
+
+    def is_stable(self, watch_id: str, snapshot: ItemSnapshot, *, now: float, stability_interval: float) -> bool:
+        """Check whether an item observation is stable for the interval."""
+
+    def process_batch(
+        self,
+        watch_id: str,
+        watch_root: Path,
+        rules_path: Path,
+        snapshots: list[ItemSnapshot],
+        *,
+        stability_interval: float = 0.0,
+        boundary_policy: BoundaryPolicy | None = None,
+        now: float | None = None,
+    ) -> DiscoveryBatch:
+        """Process a discovery snapshot and return per-item outcomes."""
+
+    def recover_stale_leases(self) -> list[str]:
+        """Move nonterminal leased attempts to needs-reconciliation."""
 ```
 
-`BoundaryPolicy`, `PlanRequest`, `Plan`, `PlannedAction`, `ExecutionMode`, `ExecutionReport`, and `ActionResult` are immutable values at the module's interface. `BoundaryPolicy` declares mounted data roots, the excluded config volume, watch roots, and optional filesystem case capability. Planning rejects roots outside data volumes, config-volume paths, overlapping watches, unsafe symlink traversal, self/descendant targets, and destination collisions. A destination that is another watch root is allowed and adds a visible warning to the plan diagnostics. A `Plan` is the primary dry-run and preview artifact: it contains the matched rule, ordered intended actions, resolved destinations, and source fingerprint. Applying a plan revalidates the source and destinations immediately before mutation; a stale plan cannot silently apply. Callers do not parse YAML, construct actions, call filesystem adapters, or write the Tracking DB.
+`BoundaryPolicy`, `PlanRequest`, `Plan`, `PlannedAction`, `ExecutionMode`, `ExecutionReport`, `ActionResult`, `ItemSnapshot`, `BatchItemResult`, and `DiscoveryBatch` are immutable values at the module's interface. `BoundaryPolicy` declares mounted data roots, the excluded config volume, watch roots, and optional filesystem case capability. Planning rejects roots outside data volumes, config-volume paths, overlapping watches, unsafe symlink traversal, self/descendant targets, and destination collisions. A destination that is another watch root is allowed and adds a visible warning to the plan diagnostics. A `Plan` is the primary dry-run and preview artifact: it contains the matched rule, ordered intended actions, resolved destinations, and source fingerprint. Applying a plan revalidates the source and destinations immediately before mutation; a stale plan cannot silently apply. Callers do not parse YAML, construct actions, call filesystem adapters, or write the Tracking DB.
 
 The module's implementation uses internal seams for the YAML rule source, filesystem, archive formats, Tracking DB, and structured event sink. These adapters translate infrastructure failures into stable processing results. The public interface remains the same for watcher, scanner, CLI, and web UI callers.
 
@@ -160,15 +185,36 @@ Web UI: each watch folder has a "Dry run" button that shows results in-app.
 ## Evaluation flow
 
 1. **Item discovered** — via filesystem watcher event or periodic scan.
-2. **Tracking DB check** — if a completed processing attempt exists for the item's unchanged source fingerprint (path + mtime + size), skip. Items with failed or needs-reconciliation attempts are not treated as completed.
-3. **Planning** — rules for the watch folder are evaluated in order. The first matching rule produces an execution plan; no later rules are considered for that item.
-4. **Match** — the item's field (folder_name, file_name, full_path) is tested against the rule's regex pattern.
-5. **Attempt creation** — a durable processing attempt is recorded as `started` before filesystem mutation.
-6. **Preflight** — source state, action parameters, destinations, collisions, and known archive requirements are checked without promising transactional execution.
-7. **Execution** — the executor applies actions in sequence, records action outcomes, and stops processing the current item's remaining actions after the first failure. The watch processing loop continues with other discovered items.
-8. **Completion** — after every action succeeds, the attempt records `completed` and all resulting paths. Failures record `failed` or `needs-reconciliation` with their details. Collision failures are `failed` and require explicit user retry.
+2. **Stability check** — if the item's size and modification time have not remained unchanged for the configured stability interval, the item is deferred to a later evaluation. Deferred items do not create attempts, failures, or suppressions.
+3. **Tracking DB check** — if a completed processing attempt exists for the item's unchanged source fingerprint (path + content hash), skip. Items with failed or needs-reconciliation attempts are not treated as completed.
+4. **Lease acquisition** — an exclusive processing lease is acquired for the source identity (canonical path + source fingerprint). If a lease is already held by another trigger, the item is reported as outside the current snapshot.
+5. **Planning** — rules for the watch folder are evaluated in order. The first matching rule produces an execution plan; no later rules are considered for that item.
+6. **Match** — the item's field (folder_name, file_name, full_path) is tested against the rule's regex pattern.
+7. **Attempt creation** — a durable processing attempt is recorded as `started` before filesystem mutation.
+8. **Preflight** — source state, action parameters, destinations, collisions, and known archive requirements are checked without promising transactional execution.
+9. **Execution** — the executor applies actions in sequence, records action outcomes, and stops processing the current item's remaining actions after the first failure. The watch processing loop continues with other discovered items.
+10. **Completion** — after every action succeeds, the attempt records `completed` and all resulting paths. The processing lease is released. Failures record `failed` or `needs-reconciliation` with their details. Collision failures are `failed` and require explicit user retry.
 
 Filesystem mutation and Tracking DB writes are not one transaction. If filesystem mutation succeeds but completion recording fails, the attempt becomes `needs-reconciliation`; Organizer does not automatically repeat the filesystem actions. Reconciliation records the existing result before the item can be considered complete.
+
+## Processing leases
+
+A processing lease is an exclusive, durable ownership record for a source identity within a watch folder. The `processing_leases` table stores one lease per (watch_id, source_path, source_fingerprint) tuple. Lease acquisition is atomic and idempotent within the same source identity: a second acquisition attempt for the same identity returns false.
+
+The executor acquires a lease before creating a processing attempt and releases it after the attempt becomes terminal (completed or failed). Dry-run execution does not acquire or release leases.
+
+If a nonterminal leased attempt (status `started`) is found after a restart, `recover_stale_leases` moves it to `needs-reconciliation` and releases its lease. This prevents automatic repetition of uncertain filesystem work.
+
+## Discovery batches
+
+`process_batch` accepts a list of `ItemSnapshot` observations and returns a `DiscoveryBatch` with per-item outcomes. Each item is reported as one of:
+
+- **executed** — planned and executed in this batch
+- **skipped** — already completed for the same source identity
+- **deferred** — not yet stable for the configured interval
+- **outside_snapshot** — already leased by another trigger
+
+The batch reports a deduplicated diagnostic when any items are deferred. Batch processing does not pause other triggers; a concurrent watcher or scan can process different items while the batch runs.
 
 ## Logging
 
@@ -216,6 +262,7 @@ CREATE TABLE processing_attempts (
     source_path         TEXT NOT NULL,
     source_size         INTEGER NOT NULL,
     source_mtime        REAL NOT NULL,
+    source_fingerprint  TEXT NOT NULL DEFAULT '',
     rule_name           TEXT,
     planned_actions     TEXT NOT NULL,
     status              TEXT NOT NULL,
@@ -226,9 +273,31 @@ CREATE TABLE processing_attempts (
     started_at          TEXT NOT NULL,
     completed_at        TEXT
 );
+
+CREATE TABLE processing_leases (
+    watch_id           TEXT NOT NULL,
+    source_path        TEXT NOT NULL,
+    source_fingerprint TEXT NOT NULL,
+    attempt_id         TEXT NOT NULL,
+    acquired_at        TEXT NOT NULL,
+    PRIMARY KEY (watch_id, source_path, source_fingerprint)
+);
+
+CREATE TABLE item_observations (
+    watch_id      TEXT NOT NULL,
+    source_path   TEXT NOT NULL,
+    size          INTEGER NOT NULL,
+    mtime         REAL NOT NULL,
+    first_seen_at REAL NOT NULL,
+    PRIMARY KEY (watch_id, source_path)
+);
 ```
 
 An attempt is the unit of processing history. It can reference one source item and multiple resulting paths, so moves, renames, archives, and unarchives do not require a permanent source-path identity. `status` is one of `started`, `completed`, `failed`, or `needs-reconciliation`.
+
+`processing_leases` stores one exclusive lease per source identity (watch_id + source_path + source_fingerprint). A lease is acquired before attempt creation and released when the attempt becomes terminal.
+
+`item_observations` tracks when each item was first seen at its current size and modification time, enabling the stability check that defers items still being written.
 
 For actions with reliable outcome evidence, the attempt records the action result and resulting fingerprint. Archive and unarchive operations may produce multiple paths or uncertain outcomes and can require reconciliation rather than automatic retry.
 

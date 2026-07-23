@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass
 from enum import StrEnum
@@ -18,6 +19,14 @@ import yaml
 class ExecutionMode(StrEnum):
     APPLY = "apply"
     DRY_RUN = "dry-run"
+
+
+class BatchItemStatus(StrEnum):
+    EXECUTED = "executed"
+    SKIPPED = "skipped"
+    DEFERRED = "deferred"
+    OUTSIDE_SNAPSHOT = "outside_snapshot"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -75,6 +84,28 @@ class ExecutionReport:
     status: str
     dry_run: bool
     actions: tuple[ActionResult, ...]
+
+
+@dataclass(frozen=True)
+class ItemSnapshot:
+    path: Path
+    size: int
+    mtime: float
+
+
+@dataclass(frozen=True)
+class BatchItemResult:
+    source: Path
+    status: BatchItemStatus
+    detail: str = ""
+    report: ExecutionReport | None = None
+
+
+@dataclass(frozen=True)
+class DiscoveryBatch:
+    watch_id: str
+    items: tuple[BatchItemResult, ...]
+    diagnostics: tuple[str, ...]
 
 
 class ItemProcessor:
@@ -199,48 +230,53 @@ class ItemProcessor:
         self._validate_source(plan)
         if plan.rules_path is not None and self._ruleset_revision(plan.rules_path) != plan.ruleset_revision:
             raise ValueError("stale plan: ruleset revision changed")
+        if not self.acquire_lease(plan.watch_id, plan.source, plan.source_fingerprint):
+            raise ValueError("processing lease unavailable")
         attempt_id = str(uuid.uuid4())
-        self._start_attempt(attempt_id, plan)
-        results: list[ActionResult] = []
-        source = plan.source
         try:
-            for action in plan.actions:
-                if action.kind == "delete":
-                    if source.is_dir():
-                        shutil.rmtree(source)
+            self._start_attempt(attempt_id, plan)
+            results: list[ActionResult] = []
+            source = plan.source
+            try:
+                for action in plan.actions:
+                    if action.kind == "delete":
+                        if source.is_dir():
+                            shutil.rmtree(source)
+                        else:
+                            source.unlink()
+                        result = ActionResult(action.kind, action.target, "OK", source=source)
+                    elif action.kind == "copy":
+                        staging = self._copy_to_staging(source, action.target)
+                        try:
+                            self._validate_source(plan)
+                        except ValueError as error:
+                            staging.unlink(missing_ok=True)
+                            raise OSError(str(error)) from error
+                        self._publish_staged(staging, action.target)
+                        result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
                     else:
-                        source.unlink()
-                    result = ActionResult(action.kind, action.target, "OK", source=source)
-                elif action.kind == "copy":
-                    staging = self._copy_to_staging(source, action.target)
-                    try:
-                        self._validate_source(plan)
-                    except ValueError as error:
-                        staging.unlink(missing_ok=True)
-                        raise OSError(str(error)) from error
-                    self._publish_staged(staging, action.target)
-                    result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
-                else:
-                    action_source = source
-                    self._validate_destination_item(action.target)
-                    if action.target != source:
-                        if self._case_collision(action.target, BoundaryPolicy()) or action.target.exists():
-                            raise FileExistsError(f"destination already exists: {action.target}")
-                        action.target.parent.mkdir(parents=True, exist_ok=True)
-                        source.rename(action.target)
-                    source = action.target
-                    result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
+                        action_source = source
+                        self._validate_destination_item(action.target)
+                        if action.target != source:
+                            if self._case_collision(action.target, BoundaryPolicy()) or action.target.exists():
+                                raise FileExistsError(f"destination already exists: {action.target}")
+                            action.target.parent.mkdir(parents=True, exist_ok=True)
+                            source.rename(action.target)
+                        source = action.target
+                        result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
+                    results.append(result)
+                    self._emit(plan, result)
+            except OSError as error:
+                result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", str(error), source=source)
                 results.append(result)
+                self._finish_attempt(attempt_id, "failed", results)
                 self._emit(plan, result)
-        except OSError as error:
-            result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", str(error), source=source)
-            results.append(result)
-            self._finish_attempt(attempt_id, "failed", results)
-            self._emit(plan, result)
-            return ExecutionReport(status="failed", dry_run=False, actions=tuple(results))
+                return ExecutionReport(status="failed", dry_run=False, actions=tuple(results))
 
-        self._finish_attempt(attempt_id, "completed", results)
-        return ExecutionReport(status="completed", dry_run=False, actions=tuple(results))
+            self._finish_attempt(attempt_id, "completed", results)
+            return ExecutionReport(status="completed", dry_run=False, actions=tuple(results))
+        finally:
+            self._release_lease(plan.watch_id, plan.source, plan.source_fingerprint)
 
     def attempts(self) -> list[dict[str, object]]:
         with sqlite3.connect(self._attempts_path) as connection:
@@ -261,15 +297,36 @@ class ItemProcessor:
                 status TEXT NOT NULL,
                 resulting_paths TEXT NOT NULL,
                 copy_provenance TEXT,
-                action_results TEXT NOT NULL DEFAULT '[]'
+                action_results TEXT NOT NULL DEFAULT '[]',
+                source_fingerprint TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS processing_leases (
+                watch_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                PRIMARY KEY (watch_id, source_path, source_fingerprint)
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS item_observations (
+                watch_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime REAL NOT NULL,
+                first_seen_at REAL NOT NULL,
+                PRIMARY KEY (watch_id, source_path)
                 )"""
             )
 
     def _start_attempt(self, attempt_id: str, plan: Plan) -> None:
         with sqlite3.connect(self._attempts_path) as connection:
             connection.execute(
-                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None),
+                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None, plan.source_fingerprint),
             )
 
     def _finish_attempt(self, attempt_id: str, status: str, results: list[ActionResult]) -> None:
@@ -498,3 +555,135 @@ class ItemProcessor:
         if path.parent.exists():
             return any(candidate.name.casefold() == path.name.casefold() for candidate in path.parent.iterdir())
         return False
+
+    def acquire_lease(self, watch_id: str, source: Path, fingerprint: str) -> bool:
+        canonical = str(self._canonical_path(source))
+        try:
+            with sqlite3.connect(self._attempts_path) as connection:
+                connection.execute(
+                    "INSERT INTO processing_leases (watch_id, source_path, source_fingerprint, attempt_id, acquired_at) VALUES (?, ?, ?, ?, ?)",
+                    (watch_id, canonical, fingerprint, "", str(time.time())),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def _release_lease(self, watch_id: str, source: Path, fingerprint: str) -> None:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            connection.execute(
+                "DELETE FROM processing_leases WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
+                (watch_id, canonical, fingerprint),
+            )
+
+    def _has_active_lease(self, watch_id: str, source: Path, fingerprint: str) -> bool:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM processing_leases WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
+                (watch_id, canonical, fingerprint),
+            ).fetchone()
+        return int(row[0]) > 0
+
+    def has_completed_attempt(self, watch_id: str, source: Path, fingerprint: str) -> bool:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM processing_attempts WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ? AND status = ?",
+                (watch_id, canonical, fingerprint, "completed"),
+            ).fetchone()
+        return int(row[0]) > 0
+
+    def is_stable(self, watch_id: str, snapshot: ItemSnapshot, *, now: float, stability_interval: float) -> bool:
+        canonical = str(self._canonical_path(snapshot.path))
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT size, mtime, first_seen_at FROM item_observations WHERE watch_id = ? AND source_path = ?",
+                (watch_id, canonical),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO item_observations (watch_id, source_path, size, mtime, first_seen_at) VALUES (?, ?, ?, ?, ?)",
+                    (watch_id, canonical, snapshot.size, snapshot.mtime, now),
+                )
+                return stability_interval <= 0.0
+            stored_size, stored_mtime, first_seen_at = row
+            if stored_size != snapshot.size or stored_mtime != snapshot.mtime:
+                connection.execute(
+                    "UPDATE item_observations SET size = ?, mtime = ?, first_seen_at = ? WHERE watch_id = ? AND source_path = ?",
+                    (snapshot.size, snapshot.mtime, now, watch_id, canonical),
+                )
+                return stability_interval <= 0.0
+            return (now - float(first_seen_at)) >= stability_interval
+
+    def process_batch(
+        self,
+        watch_id: str,
+        watch_root: Path,
+        rules_path: Path,
+        snapshots: list[ItemSnapshot],
+        *,
+        stability_interval: float = 0.0,
+        boundary_policy: BoundaryPolicy | None = None,
+        now: float | None = None,
+    ) -> DiscoveryBatch:
+        current_time = now if now is not None else time.time()
+        results: list[BatchItemResult] = []
+        diagnostics_set: set[str] = set()
+        has_deferred = False
+        for snapshot in snapshots:
+            canonical = self._canonical_path(snapshot.path)
+            if not self.is_stable(watch_id, snapshot, now=current_time, stability_interval=stability_interval):
+                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.DEFERRED, detail="unstable item"))
+                has_deferred = True
+                continue
+            fingerprint = self._fingerprint(canonical)
+            if self.has_completed_attempt(watch_id, canonical, fingerprint):
+                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.SKIPPED, detail="already completed"))
+                continue
+            if self._has_active_lease(watch_id, canonical, fingerprint):
+                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.OUTSIDE_SNAPSHOT, detail="already leased"))
+                continue
+            request = PlanRequest(
+                watch_id=watch_id,
+                watch_root=watch_root,
+                item=canonical,
+                rules_path=rules_path,
+                boundary_policy=boundary_policy,
+            )
+            try:
+                plan = self.plan(request)
+                report = self.execute(plan)
+                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.EXECUTED, report=report))
+            except (ValueError, OSError) as error:
+                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
+        if has_deferred:
+            diagnostics_set.add("deferred: unstable items withheld from planning")
+        return DiscoveryBatch(
+            watch_id=watch_id,
+            items=tuple(results),
+            diagnostics=tuple(diagnostics_set),
+        )
+
+    def recover_stale_leases(self) -> list[str]:
+        recovered: list[str] = []
+        with sqlite3.connect(self._attempts_path) as connection:
+            leases = connection.execute(
+                "SELECT watch_id, source_path, source_fingerprint FROM processing_leases"
+            ).fetchall()
+            for watch_id, source_path, source_fingerprint in leases:
+                rows = connection.execute(
+                    "SELECT attempt_id FROM processing_attempts WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ? AND status = ?",
+                    (watch_id, source_path, source_fingerprint, "started"),
+                ).fetchall()
+                for (attempt_id,) in rows:
+                    connection.execute(
+                        "UPDATE processing_attempts SET status = ? WHERE attempt_id = ?",
+                        ("needs-reconciliation", attempt_id),
+                    )
+                    recovered.append(attempt_id)
+                connection.execute(
+                    "DELETE FROM processing_leases WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
+                    (watch_id, source_path, source_fingerprint),
+                )
+        return recovered

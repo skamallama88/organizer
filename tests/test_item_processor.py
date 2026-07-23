@@ -1,5 +1,6 @@
 from pathlib import Path
 import hashlib
+import sqlite3
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
@@ -12,6 +13,7 @@ from organizer.item_processor import (
     BoundaryPolicy,
     ExecutionMode,
     ItemProcessor,
+    ItemSnapshot,
     PlanRequest,
 )
 
@@ -619,3 +621,440 @@ def test_ui_rule_save_uses_compare_and_swap_revision(tmp_path: Path) -> None:
     )
 
     assert conflict.status_code == 409
+
+
+def test_acquire_lease_succeeds_for_new_source_identity(tmp_path: Path) -> None:
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    source = tmp_path / "movie.mkv"
+    source.write_text("movie")
+
+    acquired = processor.acquire_lease("downloads", source, "fp1")
+
+    assert acquired is True
+
+
+def test_acquire_lease_fails_for_already_leased_identity(tmp_path: Path) -> None:
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    source = tmp_path / "movie.mkv"
+    source.write_text("movie")
+    processor.acquire_lease("downloads", source, "fp1")
+
+    assert processor.acquire_lease("downloads", source, "fp1") is False
+
+
+def test_acquire_lease_succeeds_for_different_fingerprint(tmp_path: Path) -> None:
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    source = tmp_path / "movie.mkv"
+    source.write_text("movie")
+    processor.acquire_lease("downloads", source, "fp1")
+
+    assert processor.acquire_lease("downloads", source, "fp2") is True
+
+
+def test_acquire_lease_succeeds_for_different_path(tmp_path: Path) -> None:
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    source_a = tmp_path / "a.mkv"
+    source_a.write_text("a")
+    source_b = tmp_path / "b.mkv"
+    source_b.write_text("b")
+    processor.acquire_lease("downloads", source_a, "fp1")
+
+    assert processor.acquire_lease("downloads", source_b, "fp1") is True
+
+
+def test_execute_acquires_and_releases_lease(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+
+    report = processor.execute(plan)
+
+    assert report.status == "completed"
+    assert processor.acquire_lease("downloads", item, plan.source_fingerprint) is True
+
+
+def test_execute_fails_when_lease_unavailable(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    processor.acquire_lease("downloads", plan.source, plan.source_fingerprint)
+
+    with pytest.raises(ValueError, match="lease"):
+        processor.execute(plan)
+
+
+def test_has_completed_attempt_is_false_when_no_attempt(tmp_path: Path) -> None:
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    source = tmp_path / "movie.mkv"
+    source.write_text("movie")
+
+    assert processor.has_completed_attempt("downloads", source, "fp1") is False
+
+
+def test_has_completed_attempt_is_true_after_completed(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    processor.execute(plan)
+
+    assert processor.has_completed_attempt("downloads", item, plan.source_fingerprint) is True
+
+
+def test_has_completed_attempt_is_false_after_failed(tmp_path: Path) -> None:
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    source = tmp_path / "movie.mkv"
+    source.write_text("movie")
+    fingerprint = "test-fp"
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        conn.execute(
+            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("failed-1", "downloads", str(source), "move", "failed", "[]", fingerprint),
+        )
+
+    assert processor.has_completed_attempt("downloads", source, fingerprint) is False
+
+
+def test_has_completed_attempt_is_false_for_different_fingerprint(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    processor.execute(plan)
+
+    assert processor.has_completed_attempt("downloads", item, "different-fp") is False
+
+
+def test_is_stable_returns_true_with_zero_interval(tmp_path: Path) -> None:
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    snapshot = ItemSnapshot(path=tmp_path / "movie.mkv", size=5, mtime=1000.0)
+
+    assert processor.is_stable("downloads", snapshot, now=1000.0, stability_interval=0.0) is True
+
+
+def test_is_stable_returns_false_for_first_observation_with_interval(tmp_path: Path) -> None:
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    snapshot = ItemSnapshot(path=tmp_path / "movie.mkv", size=5, mtime=1000.0)
+
+    assert processor.is_stable("downloads", snapshot, now=1000.0, stability_interval=5.0) is False
+
+
+def test_is_stable_returns_true_after_interval_elapsed(tmp_path: Path) -> None:
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    snapshot = ItemSnapshot(path=tmp_path / "movie.mkv", size=5, mtime=1000.0)
+    processor.is_stable("downloads", snapshot, now=1000.0, stability_interval=5.0)
+
+    assert processor.is_stable("downloads", snapshot, now=1005.0, stability_interval=5.0) is True
+
+
+def test_is_stable_resets_on_changed_observation(tmp_path: Path) -> None:
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    snapshot1 = ItemSnapshot(path=tmp_path / "movie.mkv", size=5, mtime=1000.0)
+    processor.is_stable("downloads", snapshot1, now=1000.0, stability_interval=5.0)
+
+    snapshot2 = ItemSnapshot(path=tmp_path / "movie.mkv", size=10, mtime=1003.0)
+    assert processor.is_stable("downloads", snapshot2, now=1003.0, stability_interval=5.0) is False
+    assert processor.is_stable("downloads", snapshot2, now=1008.0, stability_interval=5.0) is True
+
+
+def test_process_batch_executes_eligible_item(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshots = [ItemSnapshot(path=item, size=5, mtime=item.stat().st_mtime)]
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=0.0, now=1000.0,
+    )
+
+    assert len(batch.items) == 1
+    assert batch.items[0].status == "executed"
+    assert batch.items[0].report is not None
+    assert batch.items[0].report.status == "completed"
+    assert (destination / "movie.mkv").read_text() == "movie"
+
+
+def test_process_batch_skips_completed_unchanged_item(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    mtime = item.stat().st_mtime
+    snapshots = [ItemSnapshot(path=item, size=5, mtime=mtime)]
+
+    first_batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=0.0, now=1000.0,
+    )
+    assert first_batch.items[0].status == "executed"
+
+    (destination / "movie.mkv").unlink()
+    item.write_text("movie")
+    snapshots2 = [ItemSnapshot(path=item, size=5, mtime=mtime)]
+    second_batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots2, stability_interval=0.0, now=2000.0,
+    )
+
+    assert len(second_batch.items) == 1
+    assert second_batch.items[0].status == "skipped"
+    assert second_batch.items[0].report is None
+
+
+def test_process_batch_defers_unstable_item(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshots = [ItemSnapshot(path=item, size=5, mtime=item.stat().st_mtime)]
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=5.0, now=1000.0,
+    )
+
+    assert len(batch.items) == 1
+    assert batch.items[0].status == "deferred"
+    assert batch.items[0].report is None
+    assert item.exists()
+
+
+def test_process_batch_processes_item_after_stability_interval(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    mtime = item.stat().st_mtime
+    snapshots = [ItemSnapshot(path=item, size=5, mtime=mtime)]
+
+    processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=5.0, now=1000.0,
+    )
+
+    snapshots2 = [ItemSnapshot(path=item, size=5, mtime=mtime)]
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots2, stability_interval=5.0, now=1005.0,
+    )
+
+    assert batch.items[0].status == "executed"
+    assert (destination / "movie.mkv").read_text() == "movie"
+
+
+def test_process_batch_marks_leased_item_as_outside_snapshot(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    processor.acquire_lease("downloads", plan.source, plan.source_fingerprint)
+    snapshots = [ItemSnapshot(path=item, size=5, mtime=item.stat().st_mtime)]
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=0.0, now=1000.0,
+    )
+
+    assert batch.items[0].status == "outside_snapshot"
+
+
+def test_process_batch_reports_mixed_outcomes(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item_a = watch_root / "a.mkv"
+    item_a.write_text("aaa")
+    item_b = watch_root / "b.mkv"
+    item_b.write_text("bbb")
+    item_c = watch_root / "c.mkv"
+    item_c.write_text("ccc")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    plan_a = processor.plan(make_request(watch_root, item_a, rules))
+    processor.acquire_lease("downloads", plan_a.source, plan_a.source_fingerprint)
+
+    snapshots = [
+        ItemSnapshot(path=item_a, size=3, mtime=item_a.stat().st_mtime),
+        ItemSnapshot(path=item_b, size=3, mtime=item_b.stat().st_mtime),
+        ItemSnapshot(path=item_c, size=3, mtime=item_c.stat().st_mtime),
+    ]
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=0.0, now=1000.0,
+    )
+
+    statuses = {item.source.name: item.status for item in batch.items}
+    assert statuses["a.mkv"] == "outside_snapshot"
+    assert statuses["b.mkv"] == "executed"
+    assert statuses["c.mkv"] == "executed"
+
+
+def test_process_batch_deduplicates_deferred_diagnostics(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item_a = watch_root / "a.mkv"
+    item_a.write_text("aaa")
+    item_b = watch_root / "b.mkv"
+    item_b.write_text("bbb")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshots = [
+        ItemSnapshot(path=item_a, size=3, mtime=item_a.stat().st_mtime),
+        ItemSnapshot(path=item_b, size=3, mtime=item_b.stat().st_mtime),
+    ]
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=5.0, now=1000.0,
+    )
+
+    assert len(batch.items) == 2
+    assert all(item.status == "deferred" for item in batch.items)
+    deferred_diags = [d for d in batch.diagnostics if "deferred" in d.lower() or "unstable" in d.lower()]
+    assert len(deferred_diags) <= 1
+
+
+def test_recover_stale_leases_moves_started_attempt_to_reconciliation(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        conn.execute(
+            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("stale-attempt", "downloads", str(plan.source), "move", "started", "[]", plan.source_fingerprint),
+        )
+        conn.execute(
+            "INSERT INTO processing_leases (watch_id, source_path, source_fingerprint, attempt_id, acquired_at) VALUES (?, ?, ?, ?, ?)",
+            ("downloads", str(plan.source), plan.source_fingerprint, "stale-attempt", "2024-01-01T00:00:00"),
+        )
+
+    recovered = processor.recover_stale_leases()
+
+    assert "stale-attempt" in recovered
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        row = conn.execute("SELECT status FROM processing_attempts WHERE attempt_id = ?", ("stale-attempt",)).fetchone()
+    assert row[0] == "needs-reconciliation"
+
+
+def test_recover_stale_leases_ignores_completed_attempts(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    processor.execute(plan)
+
+    recovered = processor.recover_stale_leases()
+
+    assert recovered == []
+
+
+def test_recover_stale_leases_releases_lease_for_recovered_attempt(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        conn.execute(
+            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("stale-attempt", "downloads", str(plan.source), "move", "started", "[]", plan.source_fingerprint),
+        )
+        conn.execute(
+            "INSERT INTO processing_leases (watch_id, source_path, source_fingerprint, attempt_id, acquired_at) VALUES (?, ?, ?, ?, ?)",
+            ("downloads", str(plan.source), plan.source_fingerprint, "stale-attempt", "2024-01-01T00:00:00"),
+        )
+
+    recovered = processor.recover_stale_leases()
+
+    assert "stale-attempt" in recovered
+    assert processor.acquire_lease("downloads", plan.source, plan.source_fingerprint) is True
+
+
+def test_recover_stale_leases_finds_attempts_from_real_execute_flow(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+
+    processor.acquire_lease("downloads", plan.source, plan.source_fingerprint)
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        conn.execute(
+            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("crash-attempt", "downloads", str(plan.source), "move", "started", "[]", plan.source_fingerprint),
+        )
+
+    recovered = processor.recover_stale_leases()
+
+    assert len(recovered) == 1
+    assert recovered[0] == "crash-attempt"
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        row = conn.execute("SELECT status FROM processing_attempts WHERE attempt_id = ?", ("crash-attempt",)).fetchone()
+    assert row[0] == "needs-reconciliation"
+    assert processor.acquire_lease("downloads", plan.source, plan.source_fingerprint) is True
+
+
+def test_process_batch_reports_failed_status_for_planning_error(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "nomatch.txt"
+    item.write_text("no matching rule")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: videos
+    match:
+      field: file_name
+      pattern: '\\.mkv$'
+    actions:
+      - move:
+          destination: ../videos
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshots = [ItemSnapshot(path=item, size=16, mtime=item.stat().st_mtime)]
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=0.0, now=1000.0,
+    )
+
+    assert batch.items[0].status == "failed"
+    assert "no valid rule" in batch.items[0].detail

@@ -7,6 +7,11 @@ from organizer.item_processor import ExecutionMode, ItemProcessor, PlanRequest
 app = typer.Typer(no_args_is_help=True)
 
 
+@app.callback()
+def main() -> None:
+    """Organizer command-line interface."""
+
+
 @app.command()
 def check(
     watch_id: str,

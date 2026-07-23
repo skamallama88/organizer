@@ -1,7 +1,9 @@
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from typer.testing import CliRunner
 
+from organizer.cli import app
 from organizer.web import create_app
 from organizer.item_processor import ExecutionMode, ItemProcessor, PlanRequest
 
@@ -139,3 +141,38 @@ def test_web_preview_renders_the_shared_dry_run_plan(tmp_path: Path) -> None:
     assert "videos" in response.text
     assert str(tmp_path / "videos" / "movie.mkv") in response.text
     assert item.exists()
+
+
+def test_cli_check_accepts_the_documented_subcommand(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: videos
+    match:
+      field: file_name
+      pattern: '\\.mkv$'
+    actions:
+      - move:
+          destination: ../videos
+"""
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "check",
+            "downloads",
+            str(watch_root),
+            str(item),
+            str(rules),
+            "--attempts-path",
+            str(tmp_path / "attempts.db"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "videos" in result.stdout

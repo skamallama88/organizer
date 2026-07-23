@@ -6,6 +6,6 @@
 
 **Status:** ready-for-agent
 
-- [ ] Rename applies a complete valid name with explicit captures and records its resulting identity.
-- [ ] Copy uses private destination staging and no-overwrite publication, refusing to publish when source consistency cannot be established.
-- [ ] Multi-action execution follows primary resulting-item semantics, stops after failure, and rejects chains whose next action cannot accept the prior result type.
+- [x] Rename applies a complete valid name with explicit captures and records its resulting identity.
+- [x] Copy uses private destination staging and no-overwrite publication, refusing to publish when source consistency cannot be established.
+- [x] Multi-action execution follows primary resulting-item semantics, stops after failure, and rejects chains whose next action cannot accept the prior result type.

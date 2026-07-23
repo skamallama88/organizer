@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import re
+import shutil
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ class Plan:
     rule_name: str
     actions: tuple[PlannedAction, ...]
     diagnostics: tuple[str, ...]
+    source_fingerprint: str = ""
     ruleset_revision: str = ""
     rules_path: Path | None = None
 
@@ -64,6 +66,8 @@ class ActionResult:
     target: Path
     result: str
     detail: str = ""
+    source: Path | None = None
+    resulting_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -132,16 +136,24 @@ class ItemProcessor:
                 if not isinstance(name, str) or not name:
                     raise ValueError(f"rule {rule_name} rename name is required")
                 target_name = self._expand_captures(name, matches)
+                if not target_name or target_name in {".", ".."} or Path(target_name).name != target_name:
+                    raise ValueError(f"rule {rule_name} rename name is invalid")
                 target = current.parent / target_name
                 self._validate_destination_item(target)
-                if target.exists() or self._case_collision(target, policy):
+                if target != current and (target.exists() or self._case_collision(target, policy)):
                     raise ValueError(f"destination collision: {target}")
                 planned.append(PlannedAction(kind="rename", target=target))
                 current = target
                 continue
-            if set(action) != {"move"} or not isinstance(action["move"], dict):
+            kind = next(iter(action), "")
+            if kind == "delete":
+                if action is not action_specs[-1]:
+                    raise ValueError(f"rule {rule_name} delete result cannot accept a later action")
+                planned.append(PlannedAction(kind="delete", target=current))
+                continue
+            if kind not in {"move", "copy"} or not isinstance(action.get(kind), dict):
                 raise ValueError(f"rule {rule_name} has unsupported action")
-            destination = action["move"].get("destination")
+            destination = action[kind].get("destination")
             if not isinstance(destination, str) or not destination:
                 raise ValueError(f"rule {rule_name} move destination is required")
             root = Path(destination)
@@ -155,7 +167,7 @@ class ItemProcessor:
                 raise ValueError(f"destination collision: {current}")
             if destination_root in {self._canonical_path(root) for root in policy.watch_roots}:
                 diagnostics.append(f"destination is another watch folder: {destination_root}")
-            planned.append(PlannedAction(kind="move", target=current))
+            planned.append(PlannedAction(kind=kind, target=current))
 
         stat = item.stat()
         return Plan(
@@ -163,6 +175,7 @@ class ItemProcessor:
             source=item,
             source_size=stat.st_size,
             source_mtime=stat.st_mtime,
+            source_fingerprint=self._fingerprint(item),
             rule_name=rule_name,
             actions=tuple(planned),
             diagnostics=tuple(diagnostics),
@@ -172,8 +185,12 @@ class ItemProcessor:
 
     def execute(self, plan: Plan, mode: ExecutionMode = ExecutionMode.APPLY) -> ExecutionReport:
         if mode is ExecutionMode.DRY_RUN:
+            self._validate_source(plan)
+            if plan.rules_path is not None and self._ruleset_revision(plan.rules_path) != plan.ruleset_revision:
+                raise ValueError("stale plan: ruleset revision changed")
             dry_run_results = tuple(
-                ActionResult(action.kind, action.target, "DRY_RUN", "would execute") for action in plan.actions
+                ActionResult(action.kind, action.target, "DRY_RUN", "would execute", plan.source, action.target)
+                for action in plan.actions
             )
             for result in dry_run_results:
                 self._emit(plan, result)
@@ -188,21 +205,35 @@ class ItemProcessor:
         source = plan.source
         try:
             for action in plan.actions:
-                if action.kind not in {"move", "rename"}:
-                    raise ValueError(f"unsupported action {action.kind}")
-                self._validate_destination_item(action.target)
-                if self._case_collision(action.target, BoundaryPolicy()):
-                    raise FileExistsError(f"destination already exists: {action.target}")
-                if action.target.exists():
-                    raise FileExistsError(f"destination already exists: {action.target}")
-                action.target.parent.mkdir(parents=True, exist_ok=True)
-                source.rename(action.target)
-                source = action.target
-                result = ActionResult(action.kind, action.target, "OK")
+                if action.kind == "delete":
+                    if source.is_dir():
+                        shutil.rmtree(source)
+                    else:
+                        source.unlink()
+                    result = ActionResult(action.kind, action.target, "OK", source=source)
+                elif action.kind == "copy":
+                    staging = self._copy_to_staging(source, action.target)
+                    try:
+                        self._validate_source(plan)
+                    except ValueError as error:
+                        staging.unlink(missing_ok=True)
+                        raise OSError(str(error)) from error
+                    self._publish_staged(staging, action.target)
+                    result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
+                else:
+                    action_source = source
+                    self._validate_destination_item(action.target)
+                    if action.target != source:
+                        if self._case_collision(action.target, BoundaryPolicy()) or action.target.exists():
+                            raise FileExistsError(f"destination already exists: {action.target}")
+                        action.target.parent.mkdir(parents=True, exist_ok=True)
+                        source.rename(action.target)
+                    source = action.target
+                    result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
                 results.append(result)
                 self._emit(plan, result)
         except OSError as error:
-            result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", str(error))
+            result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", str(error), source=source)
             results.append(result)
             self._finish_attempt(attempt_id, "failed", results)
             self._emit(plan, result)
@@ -214,9 +245,9 @@ class ItemProcessor:
     def attempts(self) -> list[dict[str, object]]:
         with sqlite3.connect(self._attempts_path) as connection:
             rows = connection.execute(
-                "SELECT status, resulting_paths FROM processing_attempts ORDER BY rowid"
+                "SELECT status, resulting_paths, copy_provenance FROM processing_attempts ORDER BY rowid"
             ).fetchall()
-        return [{"status": status, "resulting_paths": json.loads(paths)} for status, paths in rows]
+        return [{"status": status, "resulting_paths": json.loads(paths), **({"copy_provenance": json.loads(provenance)} if provenance else {})} for status, paths, provenance in rows]
 
     def _initialize_attempts(self) -> None:
         self._attempts_path.parent.mkdir(parents=True, exist_ok=True)
@@ -228,23 +259,27 @@ class ItemProcessor:
                 source_path TEXT NOT NULL,
                 rule_name TEXT NOT NULL,
                 status TEXT NOT NULL,
-                resulting_paths TEXT NOT NULL
+                resulting_paths TEXT NOT NULL,
+                copy_provenance TEXT,
+                action_results TEXT NOT NULL DEFAULT '[]'
                 )"""
             )
 
     def _start_attempt(self, attempt_id: str, plan: Plan) -> None:
         with sqlite3.connect(self._attempts_path) as connection:
             connection.execute(
-                "INSERT INTO processing_attempts VALUES (?, ?, ?, ?, ?, ?)",
-                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]"),
+                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None),
             )
 
     def _finish_attempt(self, attempt_id: str, status: str, results: list[ActionResult]) -> None:
-        paths = [str(result.target) for result in results if result.result == "OK"]
+        paths = [str(result.resulting_path or result.target) for result in results if result.result == "OK"]
+        provenance = next((json.dumps({"source": str(result.source), "result": str(result.resulting_path)}) for result in results if result.kind == "copy" and result.result == "OK"), None)
+        action_results = json.dumps([{"kind": result.kind, "target": str(result.target), "result": result.result, "detail": result.detail, "source": str(result.source) if result.source else None, "resulting_path": str(result.resulting_path) if result.resulting_path else None} for result in results])
         with sqlite3.connect(self._attempts_path) as connection:
             connection.execute(
-                "UPDATE processing_attempts SET status = ?, resulting_paths = ? WHERE attempt_id = ?",
-                (status, json.dumps(paths), attempt_id),
+                "UPDATE processing_attempts SET status = ?, resulting_paths = ?, copy_provenance = ?, action_results = ? WHERE attempt_id = ?",
+                (status, json.dumps(paths), provenance, action_results, attempt_id),
             )
 
     def _emit(self, plan: Plan, result: ActionResult) -> None:
@@ -258,6 +293,26 @@ class ItemProcessor:
                 "detail": result.detail,
             }
         )
+
+    def _copy_to_staging(self, source: Path, target: Path) -> Path:
+        staging = target.parent / f".organizer-staging-{uuid.uuid4()}"
+        if source.is_dir():
+            shutil.copytree(source, staging)
+        else:
+            staging.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, staging)
+        return staging
+
+    @staticmethod
+    def _publish_staged(staging: Path, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if staging.is_dir():
+                shutil.rmtree(staging)
+            else:
+                staging.unlink(missing_ok=True)
+            raise FileExistsError(f"destination already exists: {target}")
+        staging.rename(target)
 
     @staticmethod
     def _validate_rule(rule: object) -> tuple[str, dict[str, tuple[str, str]], list[dict[str, Any]]]:
@@ -335,8 +390,26 @@ class ItemProcessor:
     @staticmethod
     def _validate_source(plan: Plan) -> None:
         stat = plan.source.stat()
-        if stat.st_size != plan.source_size or stat.st_mtime != plan.source_mtime:
+        if stat.st_size != plan.source_size or stat.st_mtime != plan.source_mtime or ItemProcessor._fingerprint(plan.source) != plan.source_fingerprint:
             raise ValueError("stale plan: source changed")
+
+    @classmethod
+    def _fingerprint(cls, path: Path) -> str:
+        digest = hashlib.sha256()
+        if path.is_dir():
+            for child in sorted(path.rglob("*")):
+                if child.is_symlink():
+                    digest.update(f"link:{child.relative_to(path)}:{os.readlink(child)}".encode())
+                elif child.is_file():
+                    digest.update(f"file:{child.relative_to(path)}:".encode())
+                    with child.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(chunk)
+        else:
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        return digest.hexdigest()
 
     @staticmethod
     def _canonical_path(path: Path) -> Path:

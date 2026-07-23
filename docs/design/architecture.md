@@ -59,7 +59,7 @@ Moves the matched file or folder to `destination`. If the destination directory 
     destination: <path>       # required
 ```
 
-Copies the matched item, leaving the original in place. An existing destination item is a collision and is never overwritten.
+Copies the matched item through private destination staging, then publishes it without overwriting an existing item. The source must retain its planned fingerprint until publication; otherwise publication is refused.
 
 ### Delete
 
@@ -117,7 +117,7 @@ Matches files or folders and bundles them into a single archive file in `destina
 
 ## Destination collisions
 
-Organizer never overwrites an existing item. If a move, copy, rename, unarchive, or archive action would create an item at a path that already exists, the action fails. Remaining actions in the rule are skipped, automatic watcher and scan retries are suppressed, and the collision is logged as an ERROR result.
+Organizer never overwrites an existing item. If a move, copy, rename, unarchive, or archive action would create an item at a path that already exists, the action fails. Remaining actions in the rule are skipped, automatic watcher and scan retries are suppressed, and the collision is logged as an ERROR result. Each action consumes the primary resulting item from the prior action; direct deletion produces no result and must be final. Completed copies retain source and result identities as copy provenance.
 
 The web UI exposes failed items for review, including the source item, intended destination, rule, action, and failure detail. Collision and archive-input failures, including password-protected archives, are not retried automatically by watcher or scan events. After the user resolves the problem, an explicit retry creates a new processing attempt; the original attempt remains in history.
 

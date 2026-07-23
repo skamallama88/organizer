@@ -435,6 +435,167 @@ def test_plan_revision_blocks_execution_after_rules_change(tmp_path: Path) -> No
         processor.execute(plan)
 
 
+def test_execute_rejects_stale_source_before_creating_attempt(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    item.write_text("changed")
+
+    with pytest.raises(ValueError, match="stale plan: source changed"):
+        processor.execute(plan)
+
+    assert processor.attempts() == []
+
+
+def test_rename_executes_named_capture_and_records_result_identity(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "Alice [cosplay].mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: normalize
+    match:
+      name: title
+      field: file_name
+      pattern: '^(?P<title>.*) \\[cosplay\\](?P<extension>\\.mkv)$'
+    actions:
+      - rename:
+          name: '\\g<title>\\g<extension>'
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    renamed = watch_root / "Alice.mkv"
+    assert report.status == "completed"
+    assert renamed.exists()
+    assert processor.attempts() == [{"status": "completed", "resulting_paths": [str(renamed)]}]
+
+
+def test_copy_stages_without_overwrite_and_preserves_provenance(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_copy_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    copied = destination / item.name
+    assert report.status == "completed"
+    assert item.exists() and copied.read_text() == "movie"
+    assert report.actions[0].resulting_path == copied
+    assert report.actions[0].source == item
+    assert processor.attempts()[0]["copy_provenance"] == {"source": str(item), "result": str(copied)}
+
+
+def test_copy_refuses_when_source_changes_before_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_copy_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    original_copy = processor._copy_to_staging
+
+    def mutate_source(source: Path, target: Path) -> Path:
+        result = original_copy(source, target)
+        item.write_text("changed")
+        return result
+
+    monkeypatch.setattr(processor, "_copy_to_staging", mutate_source)
+
+    report = processor.execute(plan)
+
+    assert report.status == "failed"
+    assert not (destination / item.name).exists()
+    assert item.read_text() == "changed"
+
+
+def test_action_chain_uses_primary_result_and_stops_after_failure(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: chain
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - copy:
+          destination: ../videos
+      - rename:
+          name: renamed.mkv
+      - delete: {}
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    assert report.status == "completed"
+    assert not item.exists()
+    assert (destination / "movie.mkv").exists()
+    assert not (destination / "renamed.mkv").exists()
+    assert [result.kind for result in report.actions] == ["copy", "rename", "delete"]
+
+
+def test_invalid_action_chain_is_rejected_at_planning(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: invalid
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - delete: {}
+      - rename:
+          name: renamed.mkv
+"""
+    )
+
+    with pytest.raises(ValueError, match="cannot accept"):
+        ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+
+def write_copy_rules(path: Path, destination: str) -> Path:
+    path.write_text(
+        f"""rules:
+  - name: copy
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - copy:
+          destination: {destination}
+"""
+    )
+    return path
+
+
 def test_ui_rule_save_uses_compare_and_swap_revision(tmp_path: Path) -> None:
     processor = ItemProcessor(tmp_path / "attempts.db")
     client = TestClient(create_app(processor))

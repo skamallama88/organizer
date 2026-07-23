@@ -1,8 +1,8 @@
 # Organizer
 
 Organizer is a file organization daemon for macOS and Unraid. The current
-vertical slice previews and applies a first-match YAML `move` rule through a
-shared `ItemProcessor` module.
+vertical slice previews and applies first-match YAML move, copy, rename, and
+delete rules through a shared `ItemProcessor` module.
 
 ## Current Status
 
@@ -14,7 +14,8 @@ Implemented:
 - Boundary policy validation for mounted data roots, config-volume exclusion,
   disjoint watches, safe destinations, and case-aware collisions.
 - CLI and web dry-run previews.
-- Same-filesystem moves with no-overwrite collision protection.
+- Same-filesystem moves and staged copies with no-overwrite collision protection.
+- Capture-based renames and ordered action chains using the primary resulting item.
 - SQLite execution-attempt records.
 - Structured in-memory events for dry runs and execution.
 - Docker image packaging.
@@ -22,7 +23,7 @@ Implemented:
 Not implemented yet:
 
 - Filesystem watcher and periodic scanner.
-- Copy, rename, delete, archive, and unarchive actions.
+- Archive and unarchive actions.
 - Multi-watch configuration loading.
 - Rule editor, status pages, log viewer, and reconciliation UI.
 - Persistent structured log files.

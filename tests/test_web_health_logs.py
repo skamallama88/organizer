@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 from organizer.item_processor import ItemProcessor
 from organizer.operational_health import OperationalHealth
 from organizer.structured_log import LogEntry, LogLevel, LogResult, MemoryLogSink, StructuredLogger
-from organizer.web import WatchFolderConfig, create_app
+from organizer.config import WatchFolderConfig
+from organizer.web import create_app
 
 
 def test_logs_endpoint_returns_recent_entries(tmp_path: Path) -> None:
@@ -135,7 +136,7 @@ def test_health_endpoint_returns_overall_status(tmp_path: Path) -> None:
     app = create_app(
         processor,
         health_checker=health_checker,
-        watch_folders=[WatchFolderConfig("downloads", watch_root, watch_root / "rules.yaml")],
+            watch_folders=[WatchFolderConfig(watch_id="downloads", watch_root=watch_root, rules_path=watch_root / "rules.yaml")],
         db_path=db_path,
     )
     client = TestClient(app)
@@ -162,8 +163,8 @@ def test_health_endpoint_reports_unhealthy_watch_folder(tmp_path: Path) -> None:
         processor,
         health_checker=health_checker,
         watch_folders=[
-            WatchFolderConfig("downloads", watch_root, watch_root / "rules.yaml"),
-            WatchFolderConfig("broken", broken_root, broken_root / "rules.yaml"),
+            WatchFolderConfig(watch_id="downloads", watch_root=watch_root, rules_path=watch_root / "rules.yaml"),
+            WatchFolderConfig(watch_id="broken", watch_root=broken_root, rules_path=broken_root / "rules.yaml"),
         ],
         db_path=db_path,
     )
@@ -187,7 +188,7 @@ def test_health_endpoint_reports_unhealthy_persistence(tmp_path: Path) -> None:
     app = create_app(
         processor,
         health_checker=health_checker,
-        watch_folders=[WatchFolderConfig("downloads", watch_root, watch_root / "rules.yaml")],
+        watch_folders=[WatchFolderConfig(watch_id="downloads", watch_root=watch_root, rules_path=watch_root / "rules.yaml")],
         db_path=db_path,
     )
     client = TestClient(app)
@@ -198,3 +199,12 @@ def test_health_endpoint_reports_unhealthy_persistence(tmp_path: Path) -> None:
     data = response.json()
     assert data["all_healthy"] is False
     assert data["persistence_health"]["tracking_db_writable"] is False
+
+
+def test_unknown_watch_is_rejected_by_dry_run(tmp_path: Path) -> None:
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    response = TestClient(create_app(processor)).get(
+        "/watches/missing/dry-run", params={"item": tmp_path / "item"}
+    )
+
+    assert response.status_code == 404

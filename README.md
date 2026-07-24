@@ -54,8 +54,13 @@ warning and should only be used behind a trusted reverse proxy or private networ
 Preview a plan without mutating files:
 
 ```sh
-organizer check <watch-id> <watch-root> <item> <rules-path>
+organizer check <watch-id> <item>
+organizer status
 ```
+
+The CLI and web app load watch roots, rules paths, data volumes, quarantine,
+and global settings from `/config/organizer.yaml` (override the config path on
+CLI commands with `--config-path`).
 
 Review failed and uncertain processing attempts:
 

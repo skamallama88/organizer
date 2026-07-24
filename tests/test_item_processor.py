@@ -587,12 +587,15 @@ def test_web_preview_renders_the_shared_dry_run_plan(tmp_path: Path) -> None:
           destination: ../videos
 """
     )
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(f"config_root: {tmp_path / 'config'}\ndata_roots: [{tmp_path}]\nwatches:\n  - id: downloads\n    root: {watch_root}\n    rules: {rules}\n")
     processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
-    client = TestClient(create_app(processor))
+    from organizer.config import load_config
+    client = TestClient(create_app(processor, watch_folders=load_config(config_path).watches))
 
     response = client.get(
         "/watches/downloads/dry-run",
-        params={"watch_root": watch_root, "item": item, "rules_path": rules},
+        params={"item": item},
     )
 
     assert response.status_code == 200
@@ -618,15 +621,17 @@ def test_cli_check_accepts_the_documented_subcommand(tmp_path: Path) -> None:
           destination: ../videos
 """
     )
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(f"config_root: {tmp_path / 'config'}\ndata_roots: [{tmp_path}]\nwatches:\n  - id: downloads\n    root: {watch_root}\n    rules: {rules}\n")
 
     result = CliRunner().invoke(
         app,
         [
             "check",
             "downloads",
-            str(watch_root),
             str(item),
-            str(rules),
+            "--config-path",
+            str(config_path),
             "--attempts-path",
             str(tmp_path / "attempts.db"),
         ],
@@ -1401,7 +1406,7 @@ def test_ui_rule_save_uses_compare_and_swap_revision(tmp_path: Path) -> None:
     revision = hashlib.sha256(rules.read_bytes()).hexdigest()
     client = TestClient(create_app(
         processor,
-        watch_folders=[WatchFolderConfig("downloads", tmp_path, rules)],
+        watch_folders=[WatchFolderConfig(watch_id="downloads", watch_root=tmp_path, rules_path=rules)],
     ))
 
     response = client.put(
@@ -1437,7 +1442,7 @@ def test_ui_rule_save_rejects_invalid_rules(tmp_path: Path) -> None:
     revision = hashlib.sha256(rules.read_bytes()).hexdigest()
     client = TestClient(create_app(
         processor,
-        watch_folders=[WatchFolderConfig("downloads", tmp_path, rules)],
+        watch_folders=[WatchFolderConfig(watch_id="downloads", watch_root=tmp_path, rules_path=rules)],
     ))
 
     response = client.put(
@@ -1457,7 +1462,7 @@ def test_ui_rule_save_rejects_unknown_watch_id(tmp_path: Path) -> None:
     revision = hashlib.sha256(rules.read_bytes()).hexdigest()
     client = TestClient(create_app(
         processor,
-        watch_folders=[WatchFolderConfig("downloads", tmp_path, rules)],
+        watch_folders=[WatchFolderConfig(watch_id="downloads", watch_root=tmp_path, rules_path=rules)],
     ))
 
     response = client.put(

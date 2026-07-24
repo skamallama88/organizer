@@ -369,6 +369,31 @@ For actions with reliable outcome evidence, the attempt records the action resul
   Inbox/
 ```
 
+## Runtime configuration
+
+`/config/organizer.yaml` is the source of truth for watch discovery. It defines
+global `scan_interval`, `log_level`, and `retention_days` settings, mounted
+`data_roots`, a `quarantine_root`, and a non-empty `watches` list. Each watch
+has an `id`, an absolute `root`, and a `rules` path (relative paths resolve from
+the configuration file). Startup validates that watch roots are disjoint, lie
+within a data root, and do not enter the config volume. The loader resolves each
+watch to a `WatchFolderConfig` and `BoundaryPolicy`; CLI and web callers accept
+only a watch identifier and resolve these values from the loaded configuration.
+
+Example:
+
+```yaml
+scan_interval: 300
+log_level: INFO
+retention_days: 7
+data_roots: [/data]
+quarantine_root: /data/.quarantine
+watches:
+  - id: downloads
+    root: /data/Downloads
+    rules: watches/Downloads/rules.yaml
+```
+
 ## Production deployment
 
 The production image is built from `Dockerfile` and persists Organizer configuration,

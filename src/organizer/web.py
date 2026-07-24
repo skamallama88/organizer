@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from pathlib import Path
 import hashlib
 import json
@@ -17,17 +16,12 @@ from organizer.attempt_review import (
     Reopen,
     RetryFromStart,
 )
+from organizer.config import WatchFolderConfig
 from organizer.item_processor import BoundaryPolicy, ExecutionMode, ItemProcessor, PlanRequest
 from organizer.operational_health import OperationalHealth
 from organizer.structured_log import LogLevel, MemoryLogSink
 
-
-@dataclass(frozen=True)
-class WatchFolderConfig:
-    watch_id: str
-    watch_root: Path
-    rules_path: Path
-    boundary_policy: BoundaryPolicy | None = None
+__all__ = ["WatchFolderConfig", "create_app"]
 
 
 def create_app(
@@ -35,7 +29,7 @@ def create_app(
     *,
     log_sink: MemoryLogSink | None = None,
     health_checker: OperationalHealth | None = None,
-    watch_folders: list[WatchFolderConfig] | None = None,
+    watch_folders: list[WatchFolderConfig] | tuple[WatchFolderConfig, ...] | None = None,
     db_path: Path | None = None,
 ) -> FastAPI:
     app = FastAPI()
@@ -49,9 +43,12 @@ def create_app(
                 return config
         return None
 
-    @app.get("/watches/{watch_id}/dry-run", response_class=HTMLResponse)
-    def dry_run(watch_id: str, watch_root: Path, item: Path, rules_path: Path) -> str:
-        plan = processor.plan(PlanRequest(watch_id, watch_root, item, rules_path))
+    @app.get("/watches/{watch_id}/dry-run", response_class=HTMLResponse, response_model=None)
+    def dry_run(watch_id: str, item: Path) -> str | JSONResponse:
+        config = _watch_config(watch_id)
+        if config is None:
+            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
+        plan = processor.plan(PlanRequest(watch_id, config.watch_root, item, config.rules_path, config.boundary_policy))
         report = processor.execute(plan, ExecutionMode.DRY_RUN)
         rows = "".join(
             f"<li>{plan.rule_name}: {action.kind} {plan.source} to {action.target}</li>" for action in report.actions
@@ -96,7 +93,9 @@ def create_app(
         return {"watch_id": watch_id, "revision": hashlib.sha256(body).hexdigest()}
 
     @app.get("/attempts", response_model=None)
-    def list_attempts(status: str = "", watch_id: str = "") -> list[dict[str, object]]:
+    def list_attempts(status: str = "", watch_id: str = "") -> list[dict[str, object]] | JSONResponse:
+        if watch_id and _watch_config(watch_id) is None:
+            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
         statuses = tuple(s.strip() for s in status.split(",") if s.strip()) if status else ()
         summaries = review.list(AttemptFilters(statuses=statuses, watch_id=watch_id))
         return [
@@ -188,12 +187,14 @@ def create_app(
     def reopen_attempt(attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | JSONResponse:
         try:
             payload = json.loads(body)
-            watch_root = Path(payload["watch_root"])
-            rules_path = Path(payload["rules_path"])
+            watch_id = str(payload["watch_id"])
         except (json.JSONDecodeError, KeyError, ValueError) as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
+        config = _watch_config(watch_id)
+        if config is None:
+            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
         try:
-            result = review.command(attempt_id, Reopen(watch_root=watch_root, rules_path=rules_path))
+            result = review.command(attempt_id, Reopen(watch_root=config.watch_root, rules_path=config.rules_path, boundary_policy=config.boundary_policy))
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
         return {
@@ -208,12 +209,14 @@ def create_app(
     def retry_attempt(attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | JSONResponse:
         try:
             payload = json.loads(body)
-            watch_root = Path(payload["watch_root"])
-            rules_path = Path(payload["rules_path"])
+            watch_id = str(payload["watch_id"])
         except (json.JSONDecodeError, KeyError, ValueError) as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
+        config = _watch_config(watch_id)
+        if config is None:
+            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
         try:
-            result = review.command(attempt_id, RetryFromStart(watch_root=watch_root, rules_path=rules_path))
+            result = review.command(attempt_id, RetryFromStart(watch_root=config.watch_root, rules_path=config.rules_path, boundary_policy=config.boundary_policy))
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
         return {

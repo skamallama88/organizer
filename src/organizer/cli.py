@@ -10,6 +10,7 @@ from organizer.attempt_review import (
     Reopen,
     RetryFromStart,
 )
+from organizer.config import OrganizerConfig, WatchFolderConfig, load_config
 from organizer.item_processor import ExecutionMode, ItemProcessor, PlanRequest
 
 app = typer.Typer(no_args_is_help=True)
@@ -25,14 +26,15 @@ def main() -> None:
 @app.command()
 def check(
     watch_id: str,
-    watch_root: Path,
     item: Path,
-    rules_path: Path,
+    config_path: Path = Path("/config/organizer.yaml"),
     attempts_path: Path = Path("/config/organizer.db"),
 ) -> None:
     """Render an immutable dry-run plan without mutating the item or attempts."""
+    config = load_config(config_path)
+    watch = _watch(config, watch_id)
     processor = ItemProcessor(attempts_path=attempts_path)
-    plan = processor.plan(PlanRequest(watch_id, watch_root, item, rules_path))
+    plan = processor.plan(PlanRequest(watch_id, watch.watch_root, item, watch.rules_path, watch.boundary_policy))
     report = processor.execute(plan, ExecutionMode.DRY_RUN)
     for result in report.actions:
         typer.echo(f"{plan.rule_name}: {result.kind} {plan.source} -> {result.target}")
@@ -42,9 +44,13 @@ def check(
 def review_list(
     status: str = typer.Option("", help="Filter by status (comma-separated)"),
     watch_id: str = typer.Option("", help="Filter by watch ID"),
+    config_path: Path = Path("/config/organizer.yaml"),
     attempts_path: Path = Path("/config/organizer.db"),
 ) -> None:
     """List attempts needing review."""
+    config = load_config(config_path)
+    if watch_id:
+        _watch(config, watch_id)
     processor = ItemProcessor(attempts_path=attempts_path)
     review = AttemptReview(processor)
     statuses = tuple(s.strip() for s in status.split(",") if s.strip()) if status else ()
@@ -56,6 +62,7 @@ def review_list(
 @review_app.command("inspect")
 def review_inspect(
     attempt_id: str,
+    config_path: Path = Path("/config/organizer.yaml"),
     attempts_path: Path = Path("/config/organizer.db"),
 ) -> None:
     """Show full details of an attempt."""
@@ -93,15 +100,18 @@ def review_accept(
     attempt_id: str,
     action_index: int,
     resulting_path: str,
-    watch_root: Path,
+    watch_id: str,
+    config_path: Path = Path("/config/organizer.yaml"),
     attempts_path: Path = Path("/config/organizer.db"),
 ) -> None:
     """Accept an uncertain action result during reconciliation."""
+    config = load_config(config_path)
+    watch = _watch(config, watch_id)
     processor = ItemProcessor(attempts_path=attempts_path)
     review = AttemptReview(processor)
     result = review.command(
         attempt_id,
-        Accept(action_index=action_index, resulting_path=resulting_path, watch_root=watch_root),
+        Accept(action_index=action_index, resulting_path=resulting_path, watch_root=watch.watch_root, boundary_policy=watch.boundary_policy),
     )
     typer.echo(f"Accepted: {result.detail}")
 
@@ -122,14 +132,15 @@ def review_abandon(
 @review_app.command("reopen")
 def review_reopen(
     attempt_id: str,
-    watch_root: Path,
-    rules_path: Path,
+    watch_id: str,
+    config_path: Path = Path("/config/organizer.yaml"),
     attempts_path: Path = Path("/config/organizer.db"),
 ) -> None:
     """Reopen an abandoned attempt with a fresh plan."""
+    watch = _watch(load_config(config_path), watch_id)
     processor = ItemProcessor(attempts_path=attempts_path)
     review = AttemptReview(processor)
-    result = review.command(attempt_id, Reopen(watch_root=watch_root, rules_path=rules_path))
+    result = review.command(attempt_id, Reopen(watch_root=watch.watch_root, rules_path=watch.rules_path, boundary_policy=watch.boundary_policy))
     typer.echo(f"Reopened: {result.detail}")
     if result.new_attempt_id:
         typer.echo(f"New attempt: {result.new_attempt_id}")
@@ -138,14 +149,51 @@ def review_reopen(
 @review_app.command("retry")
 def review_retry(
     attempt_id: str,
-    watch_root: Path,
-    rules_path: Path,
+    watch_id: str,
+    config_path: Path = Path("/config/organizer.yaml"),
     attempts_path: Path = Path("/config/organizer.db"),
 ) -> None:
     """Retry an attempt from the start with a fresh plan."""
+    watch = _watch(load_config(config_path), watch_id)
     processor = ItemProcessor(attempts_path=attempts_path)
     review = AttemptReview(processor)
-    result = review.command(attempt_id, RetryFromStart(watch_root=watch_root, rules_path=rules_path))
+    result = review.command(attempt_id, RetryFromStart(watch_root=watch.watch_root, rules_path=watch.rules_path, boundary_policy=watch.boundary_policy))
     typer.echo(f"Retried: {result.detail}")
     if result.new_attempt_id:
         typer.echo(f"New attempt: {result.new_attempt_id}")
+
+
+@app.command()
+def status(
+    config_path: Path = Path("/config/organizer.yaml"),
+    attempts_path: Path = Path("/config/organizer.db"),
+) -> None:
+    """Show configured watches and their current health."""
+    config = load_config(config_path)
+    processor = ItemProcessor(attempts_path=attempts_path)
+    for watch in config.watches:
+        rules = processor.validate_rules_document(watch.rules_path) if watch.rules_path.exists() else ["rules file missing"]
+        rule_count = _rule_count(watch.rules_path)
+        health = "healthy" if watch.watch_root.is_dir() and not rules else "unhealthy"
+        last_activity = _last_activity(processor, watch.watch_id)
+        typer.echo(f"{watch.watch_id}: {health}  root={watch.watch_root}  rules={watch.rules_path}  rule_count={rule_count}  last_activity={last_activity}")
+
+
+def _watch(config: OrganizerConfig, watch_id: str) -> WatchFolderConfig:
+    try:
+        return config.watch(watch_id)
+    except KeyError as error:
+        raise typer.BadParameter(f"watch folder not configured: {watch_id}") from error
+
+
+def _rule_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    import yaml
+    loaded = yaml.safe_load(path.read_text()) or {}
+    return len(loaded.get("rules", [])) if isinstance(loaded, dict) and isinstance(loaded.get("rules", []), list) else 0
+
+
+def _last_activity(processor: ItemProcessor, watch_id: str) -> str:
+    summaries = AttemptReview(processor).list(AttemptFilters(watch_id=watch_id))
+    return summaries[0].created_at if summaries else "never"

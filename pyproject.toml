@@ -15,6 +15,7 @@ dependencies = [
     "rarfile>=4.2,<5",
     "typer>=0.12,<1",
     "uvicorn>=0.30,<1",
+    "watchdog>=6,<7",
 ]
 
 [project.scripts]

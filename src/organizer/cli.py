@@ -11,6 +11,7 @@ from organizer.attempt_review import (
     RetryFromStart,
 )
 from organizer.config import OrganizerConfig, WatchFolderConfig, load_config
+from organizer.daemon import create_daemon
 from organizer.item_processor import ExecutionMode, ItemProcessor, PlanRequest
 
 app = typer.Typer(no_args_is_help=True)
@@ -38,6 +39,25 @@ def check(
     report = processor.execute(plan, ExecutionMode.DRY_RUN)
     for result in report.actions:
         typer.echo(f"{plan.rule_name}: {result.kind} {plan.source} -> {result.target}")
+
+
+@app.command()
+def run(
+    config_path: Path = Path("/config/organizer.yaml"),
+    attempts_path: Path = Path("/config/organizer.db"),
+) -> None:
+    """Start Organizer's web server, filesystem watcher, and periodic scanner."""
+    config = load_config(config_path)
+    processor = ItemProcessor(attempts_path=attempts_path)
+    daemon = create_daemon(config, processor)
+    daemon.start()
+    try:
+        import uvicorn
+        from organizer.web import create_app
+
+        uvicorn.run(create_app(processor, watch_folders=config.watches, db_path=attempts_path), host="127.0.0.1", port=8000)
+    finally:
+        daemon.stop()
 
 
 @review_app.command("list")

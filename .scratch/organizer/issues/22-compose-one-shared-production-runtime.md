@@ -6,8 +6,8 @@
 
 **Status:** ready-for-agent
 
-- [ ] `organizer run` and the production container start the combined daemon rather than a web-only process.
-- [ ] The web app, watcher, scanner, and CLI-triggered services share the configured processor, database, health checker, memory log sink, and persistent log sink.
-- [ ] Host, port, scan interval, database path, log path, log level, and retention settings come from runtime configuration without hardcoded production overrides.
-- [ ] Graceful shutdown stops watcher and scanner services and leaves durable processing state consistent.
-- [ ] A Docker smoke test proves the combined runtime processes an item, serves the UI, records an attempt, and writes a persistent log.
+- [x] `organizer run` and the production container start the combined daemon rather than a web-only process.
+- [x] The web app, watcher, scanner, and CLI-triggered services share the configured processor, database, health checker, memory log sink, and persistent log sink.
+- [x] Host, port, scan interval, database path, log path, log level, and retention settings come from runtime configuration without hardcoded production overrides.
+- [x] Graceful shutdown stops watcher and scanner services and leaves durable processing state consistent.
+- [x] A Docker smoke test proves the combined runtime processes an item, serves the UI, records an attempt, and writes a persistent log.

@@ -6,6 +6,6 @@
 
 **Status:** ready-for-agent
 
-- [ ] Nested archives are processed only within the active parent extraction boundary up to configured depth, never concurrently through ordinary discovery.
-- [ ] A resulting-path handoff carries processing lineage to a different unvisited watch folder.
-- [ ] Same-watch reevaluation and watch-folder cycles are rejected while intentional forward pipelines remain possible.
+- [x] Nested archives are processed only within the active parent extraction boundary up to configured depth, never concurrently through ordinary discovery.
+- [x] A resulting-path handoff carries processing lineage to a different unvisited watch folder.
+- [x] Same-watch reevaluation and watch-folder cycles are rejected while intentional forward pipelines remain possible.

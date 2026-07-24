@@ -42,6 +42,7 @@ class BoundaryPolicy:
     allowed_destinations: tuple[Path, ...] = ()
     case_sensitive: bool | None = None
     quarantine_root: Path | None = None
+    watch_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,7 @@ class PlanRequest:
     item: Path
     rules_path: Path
     boundary_policy: BoundaryPolicy | None = None
+    processing_lineage: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ class PlannedAction:
     target: Path
     preserve_original: bool = True
     limits: tuple[int, int, int] = (10000, 1024 * 1024 * 1024, 1024 * 1024 * 1024)
+    max_depth: int = 0
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,8 @@ class Plan:
     watch_root: Path | None = None
     allow_hard_link_removal: bool = False
     source_link_count: int = 0
+    processing_lineage: tuple[str, ...] = ()
+    boundary_policy: BoundaryPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -89,10 +94,17 @@ class ActionResult:
 
 
 @dataclass(frozen=True)
+class ProcessingLineageHandoff:
+    watch_id: str
+    resulting_path: Path
+
+
+@dataclass(frozen=True)
 class ExecutionReport:
     status: str
     dry_run: bool
     actions: tuple[ActionResult, ...]
+    handoffs: tuple[ProcessingLineageHandoff, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +151,7 @@ class ItemProcessor:
         watch_root = self._canonical_path(request.watch_root)
         diagnostics: list[str] = []
         self._validate_policy(policy, watch_root, item)
+        lineage = self._build_processing_lineage(request, policy, watch_root)
         matching_rule: tuple[str, list[dict[str, Any]], dict[str, re.Match[str]]] | None = None
         ruleset_revision = self._ruleset_revision(request.rules_path)
 
@@ -249,6 +262,9 @@ class ItemProcessor:
                 destination = unarchive.get("destination", ".")
                 preserve_original = unarchive.get("preserve_original", True)
                 limits = self._archive_limits(unarchive)
+                max_depth = int(unarchive.get("max_depth", 0))
+                if max_depth < 0:
+                    raise ValueError(f"rule {rule_name} unarchive max_depth must be non-negative")
                 if not isinstance(destination, str) or not destination:
                     raise ValueError(f"rule {rule_name} unarchive destination is required")
                 if not isinstance(preserve_original, bool):
@@ -262,7 +278,7 @@ class ItemProcessor:
                 self._validate_destination_item(target)
                 if target.exists() or self._case_collision(target, policy):
                     raise ValueError(f"destination collision: {target}")
-                planned.append(PlannedAction(kind="unarchive", target=target, preserve_original=preserve_original, limits=limits))
+                planned.append(PlannedAction(kind="unarchive", target=target, preserve_original=preserve_original, limits=limits, max_depth=max_depth))
                 current = target
                 continue
             if kind not in {"move", "copy"} or not isinstance(action.get(kind), dict):
@@ -279,7 +295,13 @@ class ItemProcessor:
             self._validate_destination_item(current)
             if current.exists() or self._case_collision(current, policy):
                 raise ValueError(f"destination collision: {current}")
-            if destination_root in {self._canonical_path(root) for root in policy.watch_roots}:
+            destination_watch = self._watch_id_for_path(destination_root, policy)
+            if destination_watch is not None:
+                if destination_watch in lineage:
+                    raise ValueError(f"processing lineage cycle: {destination_watch}")
+                lineage = (*lineage, destination_watch)
+                diagnostics.append(f"resulting-path handoff to watch {destination_watch}")
+            elif destination_root in {self._canonical_path(root) for root in policy.watch_roots}:
                 diagnostics.append(f"destination is another watch folder: {destination_root}")
             planned.append(PlannedAction(kind=kind, target=current))
 
@@ -298,7 +320,37 @@ class ItemProcessor:
             watch_root=watch_root,
             allow_hard_link_removal=allow_hard_link_removal,
             source_link_count=stat.st_nlink,
+            processing_lineage=lineage,
+            boundary_policy=policy,
         )
+
+    def _build_processing_lineage(self, request: PlanRequest, policy: BoundaryPolicy, watch_root: Path) -> tuple[str, ...]:
+        lineage = tuple(request.processing_lineage)
+        current_watch = request.watch_id
+        if current_watch not in lineage:
+            lineage = (*lineage, current_watch)
+        return lineage
+
+    def _watch_id_for_path(self, path: Path, policy: BoundaryPolicy) -> str | None:
+        canonical = self._canonical_path(path)
+        if len(policy.watch_ids) != len(policy.watch_roots):
+            return None
+        for watch_id, watch_root in zip(policy.watch_ids, policy.watch_roots):
+            if self._is_within(canonical, self._canonical_path(watch_root)):
+                return watch_id
+        return None
+
+    def _compute_handoffs(self, plan: Plan) -> list[ProcessingLineageHandoff]:
+        policy = plan.boundary_policy or BoundaryPolicy()
+        handoffs: list[ProcessingLineageHandoff] = []
+        seen: set[str] = {plan.watch_id}
+        for action in plan.actions:
+            if action.kind in ("move", "copy"):
+                dest_watch = self._watch_id_for_path(action.target.parent, policy)
+                if dest_watch is not None and dest_watch not in seen:
+                    seen.add(dest_watch)
+                    handoffs.append(ProcessingLineageHandoff(watch_id=dest_watch, resulting_path=action.target))
+        return handoffs
 
     def _has_destructive_action(self, plan: Plan) -> bool:
         return any(action.kind in ("delete", "quarantine") for action in plan.actions)
@@ -347,7 +399,7 @@ class ItemProcessor:
                                 needs_reconcile = True
                         if needs_reconcile:
                             result = ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed", source=source)
-                            self._finish_attempt(attempt_id, "needs-reconciliation", results + [result])
+                            self._finish_attempt(attempt_id, "needs-reconciliation", results + [result], plan.processing_lineage)
                             self._emit(plan, result)
                             return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [result]))
                         if action.kind == "delete":
@@ -389,13 +441,13 @@ class ItemProcessor:
                         if not action.preserve_original:
                             if self._fingerprint(source) != plan.source_fingerprint:
                                 result = ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)
-                                self._finish_attempt(attempt_id, "needs-reconciliation", results + [result])
+                                self._finish_attempt(attempt_id, "needs-reconciliation", results + [result], plan.processing_lineage)
                                 self._emit(plan, result)
                                 return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [result]))
                             self._remove_source(source)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
                     elif action.kind == "unarchive":
-                        staging = self._unarchive_to_staging(source, action.target, action.limits)
+                        staging = self._unarchive_to_staging(source, action.target, action.limits, action.max_depth)
                         try:
                             self._validate_source(plan)
                         except ValueError as error:
@@ -405,7 +457,7 @@ class ItemProcessor:
                         if not action.preserve_original:
                             if self._fingerprint(source) != plan.source_fingerprint:
                                 result = ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)
-                                self._finish_attempt(attempt_id, "needs-reconciliation", results + [result])
+                                self._finish_attempt(attempt_id, "needs-reconciliation", results + [result], plan.processing_lineage)
                                 self._emit(plan, result)
                                 return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [result]))
                             self._remove_source(source)
@@ -430,23 +482,24 @@ class ItemProcessor:
                 reason = "collision" if isinstance(error, FileExistsError) else "archive-input" if plan.actions[len(results) - 1].kind == "unarchive" else ""
                 if reason:
                     self._create_suppression(plan.watch_id, plan.source, plan.source_fingerprint, attempt_id, reason)
-                self._finish_attempt(attempt_id, "failed", results)
+                self._finish_attempt(attempt_id, "failed", results, plan.processing_lineage)
                 self._emit(plan, result)
                 return ExecutionReport(status="failed", dry_run=False, actions=tuple(results))
 
-            self._finish_attempt(attempt_id, "completed", results)
-            return ExecutionReport(status="completed", dry_run=False, actions=tuple(results))
+            self._finish_attempt(attempt_id, "completed", results, plan.processing_lineage)
+            handoffs = self._compute_handoffs(plan)
+            return ExecutionReport(status="completed", dry_run=False, actions=tuple(results), handoffs=tuple(handoffs))
         finally:
             self._release_lease(plan.watch_id, plan.source, plan.source_fingerprint)
 
     def attempts(self) -> list[dict[str, object]]:
         with sqlite3.connect(self._attempts_path) as connection:
             rows = connection.execute(
-                "SELECT status, resulting_paths, copy_provenance, failure_detail, retry_of_attempt_id FROM processing_attempts ORDER BY rowid"
+                "SELECT status, resulting_paths, copy_provenance, failure_detail, retry_of_attempt_id, processing_lineage FROM processing_attempts ORDER BY rowid"
             ).fetchall()
         result: list[dict[str, object]] = []
         for row in rows:
-            status, paths, provenance, failure_detail, retry_of = row
+            status, paths, provenance, failure_detail, retry_of, lineage_json = row
             entry: dict[str, object] = {"status": status, "resulting_paths": json.loads(paths)}
             if provenance:
                 entry["copy_provenance"] = json.loads(provenance)
@@ -454,6 +507,8 @@ class ItemProcessor:
                 entry["failure_detail"] = failure_detail
             if retry_of:
                 entry["retry_of_attempt_id"] = retry_of
+            if lineage_json:
+                entry["processing_lineage"] = json.loads(lineage_json)
             result.append(entry)
         return result
 
@@ -473,7 +528,7 @@ class ItemProcessor:
                 source_fingerprint TEXT NOT NULL DEFAULT ''
                 )"""
             )
-            for col in ("retry_of_attempt_id", "failure_detail"):
+            for col in ("retry_of_attempt_id", "failure_detail", "processing_lineage"):
                 try:
                     connection.execute(f"ALTER TABLE processing_attempts ADD COLUMN {col} TEXT")
                 except sqlite3.OperationalError:
@@ -513,19 +568,19 @@ class ItemProcessor:
     def _start_attempt(self, attempt_id: str, plan: Plan, retry_of_attempt_id: str | None = None) -> None:
         with sqlite3.connect(self._attempts_path) as connection:
             connection.execute(
-                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance, source_fingerprint, retry_of_attempt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None, plan.source_fingerprint, retry_of_attempt_id),
+                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance, source_fingerprint, retry_of_attempt_id, processing_lineage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None, plan.source_fingerprint, retry_of_attempt_id, json.dumps(list(plan.processing_lineage))),
             )
 
-    def _finish_attempt(self, attempt_id: str, status: str, results: list[ActionResult]) -> None:
+    def _finish_attempt(self, attempt_id: str, status: str, results: list[ActionResult], processing_lineage: tuple[str, ...] = ()) -> None:
         paths = [str(result.resulting_path or result.target) for result in results if result.result == "OK"]
         provenance = next((json.dumps({"source": str(result.source), "result": str(result.resulting_path)}) for result in results if result.kind == "copy" and result.result == "OK"), None)
         action_results = json.dumps([{"kind": result.kind, "target": str(result.target), "result": result.result, "detail": result.detail, "source": str(result.source) if result.source else None, "resulting_path": str(result.resulting_path) if result.resulting_path else None} for result in results])
         failure_detail = results[-1].detail if status == "failed" and results else ""
         with sqlite3.connect(self._attempts_path) as connection:
             connection.execute(
-                "UPDATE processing_attempts SET status = ?, resulting_paths = ?, copy_provenance = ?, action_results = ?, failure_detail = ? WHERE attempt_id = ?",
-                (status, json.dumps(paths), provenance, action_results, failure_detail, attempt_id),
+                "UPDATE processing_attempts SET status = ?, resulting_paths = ?, copy_provenance = ?, action_results = ?, failure_detail = ?, processing_lineage = ? WHERE attempt_id = ?",
+                (status, json.dumps(paths), provenance, action_results, failure_detail, json.dumps(list(processing_lineage)), attempt_id),
             )
 
     def _emit(self, plan: Plan, result: ActionResult) -> None:
@@ -585,7 +640,7 @@ class ItemProcessor:
                     return ArchivePreview(target, count, total, True)
         return ArchivePreview(target, count, total, False)
 
-    def _unarchive_to_staging(self, source: Path, target: Path, limits: tuple[int, int, int]) -> Path:
+    def _unarchive_to_staging(self, source: Path, target: Path, limits: tuple[int, int, int], max_depth: int = 0) -> Path:
         max_entries, max_bytes, max_entry_size = limits
         staging = self._attempts_path.parent / "staging" / f".organizer-staging-{uuid.uuid4()}"
         staging.mkdir(parents=True)
@@ -622,10 +677,27 @@ class ItemProcessor:
                             if copied > max_entry_size or total - entry_size + copied > max_bytes:
                                 raise ValueError("archive resource limit exceeded")
                             output_stream.write(chunk)
+            if max_depth > 0:
+                self._extract_nested_archives(staging, limits, max_depth, 1)
             return staging
         except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, py7zr.exceptions.ArchiveError, rarfile.Error, rarfile.RarCannotExec):
             self._remove_tree(staging)
             raise
+
+    def _extract_nested_archives(self, tree: Path, limits: tuple[int, int, int], max_depth: int, current_depth: int) -> None:
+        if current_depth > max_depth:
+            return
+        archive_suffixes = {".zip", ".7z", ".rar"}
+        nested = sorted(
+            child for child in tree.rglob("*")
+            if child.is_file() and child.suffix.lower() in archive_suffixes
+        )
+        for archive_path in nested:
+            extraction_root = archive_path.parent / self._archive_output_name(archive_path, "")
+            nested_staging = self._unarchive_to_staging(archive_path, extraction_root, limits, max_depth - current_depth)
+            extraction_root.parent.mkdir(parents=True, exist_ok=True)
+            nested_staging.rename(extraction_root)
+            shutil.move(str(archive_path), str(extraction_root / archive_path.name))
 
     @staticmethod
     def _open_archive(source: Path) -> Any:

@@ -426,7 +426,7 @@ def test_apply_move_records_completed_attempt_after_success(tmp_path: Path) -> N
     assert report.actions[0].result == "OK"
     assert not item.exists()
     assert (destination / "movie.mkv").read_text() == "movie"
-    assert processor.attempts() == [{"status": "completed", "resulting_paths": [str(destination / "movie.mkv")] }]
+    assert processor.attempts() == [{"status": "completed", "resulting_paths": [str(destination / "movie.mkv")], "processing_lineage": ["downloads"]}]
 
 
 def test_web_preview_renders_the_shared_dry_run_plan(tmp_path: Path) -> None:
@@ -771,7 +771,7 @@ def test_rename_executes_named_capture_and_records_result_identity(tmp_path: Pat
     renamed = watch_root / "Alice.mkv"
     assert report.status == "completed"
     assert renamed.exists()
-    assert processor.attempts() == [{"status": "completed", "resulting_paths": [str(renamed)]}]
+    assert processor.attempts() == [{"status": "completed", "resulting_paths": [str(renamed)], "processing_lineage": ["downloads"]}]
 
 
 def test_copy_stages_without_overwrite_and_preserves_provenance(tmp_path: Path) -> None:
@@ -1831,3 +1831,220 @@ def test_suppressed_attempts_lists_suppressed_identities(tmp_path: Path) -> None
     assert suppressions[0]["watch_id"] == "downloads"
     assert suppressions[0]["reason"] == "collision"
     assert suppressions[0]["source_path"] == str(item.resolve())
+
+
+def test_nested_extraction_extracts_inner_archive_within_parent_extraction_root(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    inner_archive = tmp_path / "inner.txt"
+    inner_archive.write_text("inner content")
+    inner_zip = tmp_path / "inner.zip"
+    make_zip(inner_zip, {"inner.txt": "inner content"})
+    outer_zip = watch_root / "outer.zip"
+    with zipfile.ZipFile(outer_zip, "w") as archive:
+        archive.write(inner_zip, "inner.zip")
+    rules = write_unarchive_rules(watch_root / "rules.yaml", max_depth=1)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, outer_zip, rules)))
+
+    assert report.status == "completed"
+    assert (watch_root / "outer" / "inner" / "inner.txt").read_text() == "inner content"
+
+
+def test_nested_extraction_respects_configured_depth_limit(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    deep_zip = tmp_path / "deep.zip"
+    make_zip(deep_zip, {"deep.txt": "deep"})
+    mid_zip = tmp_path / "mid.zip"
+    with zipfile.ZipFile(mid_zip, "w") as archive:
+        archive.write(deep_zip, "deep.zip")
+    outer_zip = watch_root / "outer.zip"
+    with zipfile.ZipFile(outer_zip, "w") as archive:
+        archive.write(mid_zip, "mid.zip")
+    rules = write_unarchive_rules(watch_root / "rules.yaml", max_depth=1)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, outer_zip, rules)))
+
+    assert report.status == "completed"
+    assert (watch_root / "outer" / "mid").is_dir()
+    assert (watch_root / "outer" / "mid" / "mid.zip").exists()
+    assert not (watch_root / "outer" / "mid" / "deep").is_dir()
+
+
+def test_nested_extraction_with_zero_depth_does_not_extract_inner_archives(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    inner_zip = tmp_path / "inner.zip"
+    make_zip(inner_zip, {"file.txt": "content"})
+    outer_zip = watch_root / "outer.zip"
+    with zipfile.ZipFile(outer_zip, "w") as archive:
+        archive.write(inner_zip, "inner.zip")
+    rules = write_unarchive_rules(watch_root / "rules.yaml", max_depth=0)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, outer_zip, rules)))
+
+    assert report.status == "completed"
+    assert (watch_root / "outer" / "inner.zip").exists()
+    assert not (watch_root / "outer" / "inner").is_dir()
+
+
+def test_cross_watch_handoff_records_processing_lineage_in_attempt(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    watch_a = data / "downloads"
+    watch_b = data / "videos"
+    watch_a.mkdir(parents=True)
+    watch_b.mkdir()
+    item = watch_a / "movie.mkv"
+    item.write_text("movie")
+    rules = write_copy_rules(watch_a / "rules.yaml", "../videos")
+    policy = BoundaryPolicy(
+        data_roots=(data,),
+        watch_roots=(watch_a, watch_b),
+        watch_ids=("downloads", "videos"),
+        allowed_destinations=(watch_b,),
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    request = PlanRequest(
+        watch_id="downloads",
+        watch_root=watch_a,
+        item=item,
+        rules_path=rules,
+        boundary_policy=policy,
+        processing_lineage=(),
+    )
+
+    report = processor.execute(processor.plan(request))
+
+    assert report.status == "completed"
+    attempts = processor.attempts()
+    assert attempts[0]["processing_lineage"] == ["downloads", "videos"]
+
+
+def test_cross_watch_handoff_rejects_return_to_visited_watch(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    watch_a = data / "downloads"
+    watch_b = data / "videos"
+    watch_a.mkdir(parents=True)
+    watch_b.mkdir()
+    item = watch_b / "movie.mkv"
+    item.write_text("movie")
+    rules = write_copy_rules(watch_b / "rules.yaml", "../downloads")
+    policy = BoundaryPolicy(
+        data_roots=(data,),
+        watch_roots=(watch_a, watch_b),
+        watch_ids=("downloads", "videos"),
+        allowed_destinations=(watch_a,),
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    request = PlanRequest(
+        watch_id="videos",
+        watch_root=watch_b,
+        item=item,
+        rules_path=rules,
+        boundary_policy=policy,
+        processing_lineage=("downloads",),
+    )
+
+    with pytest.raises(ValueError, match="lineage"):
+        processor.plan(request)
+
+
+def test_cross_watch_handoff_allows_forward_pipeline_to_new_watch(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    watch_a = data / "downloads"
+    watch_b = data / "videos"
+    watch_c = data / "archive"
+    watch_a.mkdir(parents=True)
+    watch_b.mkdir()
+    watch_c.mkdir()
+    item = watch_b / "movie.mkv"
+    item.write_text("movie")
+    rules = write_copy_rules(watch_b / "rules.yaml", "../archive")
+    policy = BoundaryPolicy(
+        data_roots=(data,),
+        watch_roots=(watch_a, watch_b, watch_c),
+        watch_ids=("downloads", "videos", "archive"),
+        allowed_destinations=(watch_c,),
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    request = PlanRequest(
+        watch_id="videos",
+        watch_root=watch_b,
+        item=item,
+        rules_path=rules,
+        boundary_policy=policy,
+        processing_lineage=("downloads", "videos"),
+    )
+
+    plan = processor.plan(request)
+    report = processor.execute(plan)
+
+    assert report.status == "completed"
+    attempts = processor.attempts()
+    assert attempts[0]["processing_lineage"] == ["downloads", "videos", "archive"]
+
+
+def test_processing_lineage_includes_current_watch_automatically(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    watch_a = data / "downloads"
+    watch_b = data / "videos"
+    watch_a.mkdir(parents=True)
+    watch_b.mkdir()
+    item = watch_a / "movie.mkv"
+    item.write_text("movie")
+    rules = write_copy_rules(watch_a / "rules.yaml", "../videos")
+    policy = BoundaryPolicy(
+        data_roots=(data,),
+        watch_roots=(watch_a, watch_b),
+        watch_ids=("downloads", "videos"),
+        allowed_destinations=(watch_b,),
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    request = PlanRequest(
+        watch_id="downloads",
+        watch_root=watch_a,
+        item=item,
+        rules_path=rules,
+        boundary_policy=policy,
+    )
+
+    plan = processor.plan(request)
+
+    assert "downloads" in plan.processing_lineage
+
+
+def test_cross_watch_handoff_records_resulting_path_handoff(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    watch_a = data / "downloads"
+    watch_b = data / "videos"
+    watch_a.mkdir(parents=True)
+    watch_b.mkdir()
+    item = watch_a / "movie.mkv"
+    item.write_text("movie")
+    rules = write_copy_rules(watch_a / "rules.yaml", "../videos")
+    policy = BoundaryPolicy(
+        data_roots=(data,),
+        watch_roots=(watch_a, watch_b),
+        watch_ids=("downloads", "videos"),
+        allowed_destinations=(watch_b,),
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    request = PlanRequest(
+        watch_id="downloads",
+        watch_root=watch_a,
+        item=item,
+        rules_path=rules,
+        boundary_policy=policy,
+    )
+
+    report = processor.execute(processor.plan(request))
+
+    assert report.status == "completed"
+    handoffs = report.handoffs
+    assert len(handoffs) == 1
+    assert handoffs[0].watch_id == "videos"
+    assert handoffs[0].resulting_path == watch_b / "movie.mkv"

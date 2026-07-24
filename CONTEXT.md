@@ -166,7 +166,7 @@ The single item produced by an action and used as the next action's input. Direc
 _Avoid_: Multiple action outputs, implicit next input
 
 **Bounded archive inspection**:
-Read-only archive metadata inspection subject to configured entry-count and metadata-size limits. Planning reports an extraction-root summary but defers definitive archive validation to execution.
+Read-only ZIP metadata inspection subject to configured entry-count, total-uncompressed-byte, and individual-entry limits. Planning reports an extraction-root summary but defers definitive archive validation to execution.
 _Avoid_: Full preview extraction, unbounded archive listing
 
 **Execution attempt**:

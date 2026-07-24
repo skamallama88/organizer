@@ -6,6 +6,6 @@
 
 **Status:** ready-for-agent
 
-- [ ] ZIP preview reports a bounded read-only extraction summary without creating an attempt or mutating filesystem state.
-- [ ] Extraction stages all content before no-overwrite publication to a single extraction root and rejects traversal, escaping symlinks, and resource-limit violations.
-- [ ] Corrupt or protected archives remain in place with visible failure classification and suppressed automatic retries; successful extraction honors source preservation.
+- [x] ZIP preview reports a bounded read-only extraction summary without creating an attempt or mutating filesystem state.
+- [x] Extraction stages all content before no-overwrite publication to a single extraction root and rejects traversal, escaping symlinks, and resource-limit violations.
+- [x] Corrupt or protected archives remain in place with visible failure classification and suppressed automatic retries; successful extraction honors source preservation.

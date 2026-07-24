@@ -56,6 +56,7 @@ class PlannedAction:
     kind: str
     target: Path
     preserve_original: bool = True
+    limits: tuple[int, int, int] = (10000, 1024 * 1024 * 1024, 1024 * 1024 * 1024)
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,14 @@ class ExecutionReport:
     status: str
     dry_run: bool
     actions: tuple[ActionResult, ...]
+
+
+@dataclass(frozen=True)
+class ArchivePreview:
+    extraction_root: Path
+    entry_count: int
+    total_uncompressed_bytes: int
+    truncated: bool
 
 
 @dataclass(frozen=True)
@@ -231,6 +240,27 @@ class ItemProcessor:
                 planned.append(PlannedAction(kind="archive", target=target, preserve_original=preserve_original))
                 current = target
                 continue
+            if kind == "unarchive" and isinstance(action.get(kind), dict):
+                unarchive = action[kind]
+                destination = unarchive.get("destination", ".")
+                preserve_original = unarchive.get("preserve_original", True)
+                limits = self._archive_limits(unarchive)
+                if not isinstance(destination, str) or not destination:
+                    raise ValueError(f"rule {rule_name} unarchive destination is required")
+                if not isinstance(preserve_original, bool):
+                    raise ValueError(f"rule {rule_name} unarchive preserve_original must be boolean")
+                root = Path(destination)
+                if not root.is_absolute():
+                    root = watch_root / root
+                destination_root = self._resolve_destination(root)
+                self._validate_destination(policy, watch_root, current, destination_root)
+                target = destination_root / self._archive_output_name(current, "")
+                self._validate_destination_item(target)
+                if target.exists() or self._case_collision(target, policy):
+                    raise ValueError(f"destination collision: {target}")
+                planned.append(PlannedAction(kind="unarchive", target=target, preserve_original=preserve_original, limits=limits))
+                current = target
+                continue
             if kind not in {"move", "copy"} or not isinstance(action.get(kind), dict):
                 raise ValueError(f"rule {rule_name} has unsupported action")
             destination = action[kind].get("destination")
@@ -360,6 +390,22 @@ class ItemProcessor:
                                 return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [result]))
                             self._remove_source(source)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
+                    elif action.kind == "unarchive":
+                        staging = self._unarchive_to_staging(source, action.target, action.limits)
+                        try:
+                            self._validate_source(plan)
+                        except ValueError as error:
+                            self._remove_tree(staging)
+                            raise OSError(str(error)) from error
+                        self._publish_staged(staging, action.target)
+                        if not action.preserve_original:
+                            if self._fingerprint(source) != plan.source_fingerprint:
+                                result = ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)
+                                self._finish_attempt(attempt_id, "needs-reconciliation", results + [result])
+                                self._emit(plan, result)
+                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [result]))
+                            self._remove_source(source)
+                        result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
                     else:
                         action_source = source
                         self._validate_destination_item(action.target)
@@ -372,11 +418,14 @@ class ItemProcessor:
                         result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
                     results.append(result)
                     self._emit(plan, result)
-            except OSError as error:
-                result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", str(error), source=source)
+            except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as error:
+                classification = "password-protected archive" if isinstance(error, RuntimeError) else type(error).__name__
+                detail = f"{classification}: {error}"
+                result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", detail, source=source)
                 results.append(result)
-                if isinstance(error, FileExistsError):
-                    self._create_suppression(plan.watch_id, plan.source, plan.source_fingerprint, attempt_id, "collision")
+                reason = "collision" if isinstance(error, FileExistsError) else "archive-input" if plan.actions[len(results) - 1].kind == "unarchive" else ""
+                if reason:
+                    self._create_suppression(plan.watch_id, plan.source, plan.source_fingerprint, attempt_id, reason)
                 self._finish_attempt(attempt_id, "failed", results)
                 self._emit(plan, result)
                 return ExecutionReport(status="failed", dry_run=False, actions=tuple(results))
@@ -507,6 +556,71 @@ class ItemProcessor:
             else:
                 archive.write(source, source.name)
         return staging
+
+    def preview(self, plan: Plan) -> ArchivePreview | None:
+        action = next((action for action in plan.actions if action.kind == "unarchive"), None)
+        if action is None:
+            return None
+        return self._inspect_archive(plan.source, action.target, action.limits)
+
+    def _inspect_archive(self, source: Path, target: Path, limits: tuple[int, int, int]) -> ArchivePreview:
+        max_entries, max_bytes, max_entry_size = limits
+        count = total = 0
+        with zipfile.ZipFile(source) as archive:
+            for info in archive.infolist():
+                count += 1
+                total += info.file_size
+                if count > max_entries or total > max_bytes or info.file_size > max_entry_size:
+                    return ArchivePreview(target, count, total, True)
+        return ArchivePreview(target, count, total, False)
+
+    def _unarchive_to_staging(self, source: Path, target: Path, limits: tuple[int, int, int]) -> Path:
+        max_entries, max_bytes, max_entry_size = limits
+        staging = self._attempts_path.parent / "staging" / f".organizer-staging-{uuid.uuid4()}"
+        staging.mkdir(parents=True)
+        count = total = 0
+        try:
+            with zipfile.ZipFile(source) as archive:
+                for info in archive.infolist():
+                    count += 1
+                    total += info.file_size
+                    if count > max_entries or total > max_bytes or info.file_size > max_entry_size:
+                        raise ValueError("archive resource limit exceeded")
+                    relative = Path(info.filename)
+                    destination = staging / relative
+                    if relative.is_absolute() or ".." in relative.parts:
+                        raise ValueError("archive path traversal rejected")
+                    if info.is_dir():
+                        destination.mkdir(parents=True, exist_ok=True)
+                        continue
+                    if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                        raise ValueError("archive symlink rejected")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    copied = 0
+                    with archive.open(info) as input_stream, destination.open("wb") as output_stream:
+                        while chunk := input_stream.read(1024 * 1024):
+                            copied += len(chunk)
+                            if copied > max_entry_size or total - info.file_size + copied > max_bytes:
+                                raise ValueError("archive resource limit exceeded")
+                            output_stream.write(chunk)
+            return staging
+        except (zipfile.BadZipFile, RuntimeError, ValueError, OSError):
+            self._remove_tree(staging)
+            raise
+
+    @staticmethod
+    def _remove_tree(path: Path) -> None:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _archive_limits(settings: dict[str, Any]) -> tuple[int, int, int]:
+        values = (settings.get("max_entries", 10000), settings.get("max_uncompressed_bytes", 1024 * 1024 * 1024), settings.get("max_entry_bytes", 1024 * 1024 * 1024))
+        if not all(isinstance(value, int) and value > 0 for value in values):
+            raise ValueError("unarchive resource limits must be positive integers")
+        return values
 
     @staticmethod
     def _archive_output_name(source: Path, extension: str) -> str:

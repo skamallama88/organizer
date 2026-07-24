@@ -1,6 +1,7 @@
 from pathlib import Path
 import hashlib
 import sqlite3
+import zipfile
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
@@ -983,6 +984,111 @@ def test_archive_refuses_publication_and_removal_when_source_changes(tmp_path: P
     assert report.status == "failed"
     assert not (destination / "movie.zip").exists()
     assert item.read_text() == "changed"
+
+
+def write_unarchive_rules(path: Path, destination: str = ".", **settings: object) -> Path:
+    values = "\n".join(f"          {key}: {value}" for key, value in settings.items())
+    path.write_text(f"""rules:
+  - name: unarchive
+    match:
+      field: file_name
+      pattern: '\\.zip$'
+    actions:
+      - unarchive:
+          destination: {destination}
+{values}
+""")
+    return path
+
+
+def make_zip(path: Path, entries: dict[str, str]) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+
+
+def test_unarchive_preview_is_bounded_and_read_only(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.zip"
+    make_zip(archive, {"folder/file.txt": "content"})
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, archive, rules))
+
+    preview = processor.preview(plan)
+
+    assert preview is not None
+    assert preview.extraction_root == watch_root / "bundle"
+    assert preview.entry_count == 1
+    assert preview.truncated is False
+    assert sorted(watch_root.iterdir()) == sorted([archive, rules])
+    assert processor.attempts() == []
+
+
+def test_unarchive_stages_and_publishes_under_extraction_root(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.zip"
+    make_zip(archive, {"folder/file.txt": "content"})
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "completed"
+    assert (watch_root / "bundle" / "folder" / "file.txt").read_text() == "content"
+    assert archive.exists()
+
+
+def test_unarchive_rejects_traversal_and_limits_without_publishing(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.zip"
+    make_zip(archive, {"../outside.txt": "nope"})
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "failed"
+    assert "traversal" in report.actions[-1].detail
+    assert not (tmp_path / "outside.txt").exists()
+    assert not (watch_root / "bundle").exists()
+
+
+def test_unarchive_classifies_corrupt_archive_and_suppresses_retry(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.zip"
+    archive.write_bytes(b"not a zip")
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "failed"
+    assert "BadZipFile" in report.actions[-1].detail
+    assert archive.exists()
+    assert processor.has_suppressed_attempt("downloads", archive, processor._fingerprint(archive)) is True
+
+
+def test_unarchive_rejects_zip_symlink_entry(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.zip"
+    with zipfile.ZipFile(archive, "w") as zip_file:
+        entry = zipfile.ZipInfo("link")
+        entry.create_system = 3
+        entry.external_attr = 0o120777 << 16
+        zip_file.writestr(entry, "../../outside")
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "failed"
+    assert "symlink" in report.actions[-1].detail
 
 
 def test_ui_rule_save_uses_compare_and_swap_revision(tmp_path: Path) -> None:

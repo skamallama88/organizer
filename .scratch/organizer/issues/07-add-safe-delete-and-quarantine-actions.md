@@ -4,8 +4,8 @@
 
 **Blocked by:** 02 — Enforce watch-folder and destination boundaries; 04 — Add copy, rename, and action-chain execution; 05 — Add durable leases, completion skipping, and trigger processing.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Delete rules require direct-deletion opt-in or a configured quarantine root, and no implicit delete mode exists.
-- [ ] Quarantine preserves source identity and original relative path in an attempt-specific managed location excluded from ordinary processing.
-- [ ] Direct deletion and folder removal enforce fingerprint or stable-tree checks; uncertain deletion is never automatically accepted or retried.
+- [x] Delete rules require direct-deletion opt-in or a configured quarantine root, and no implicit delete mode exists.
+- [x] Quarantine preserves source identity and original relative path in an attempt-specific managed location excluded from ordinary processing.
+- [x] Direct deletion and folder removal enforce fingerprint or stable-tree checks; uncertain deletion is never automatically accepted or retried.

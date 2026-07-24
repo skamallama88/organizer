@@ -4,8 +4,8 @@
 
 **Blocked by:** 01 — Bootstrap the safe Organizer vertical slice.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Configuration accepts only disjoint watch roots and allowed destination roots within mounted data volumes, never within the config volume.
-- [ ] Plans reject self-targeting and descendant-targeting folder actions, unsafe symlink traversal, and collisions including case-only collisions on applicable filesystems.
-- [ ] A destination that is another watch folder is allowed but yields a visible configuration warning.
+- [x] Configuration accepts only disjoint watch roots and allowed destination roots within mounted data volumes, never within the config volume.
+- [x] Plans reject self-targeting and descendant-targeting folder actions, unsafe symlink traversal, and collisions including case-only collisions on applicable filesystems.
+- [x] A destination that is another watch folder is allowed but yields a visible configuration warning.

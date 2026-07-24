@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] A configured watch folder can load valid rules, report invalid rules without disabling valid rules, and produce an immutable first-match plan.
 - [x] CLI and web dry runs render the same intended move and structured dry-run event without filesystem mutation or Tracking DB completion.

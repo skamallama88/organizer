@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Define Pydantic models for `organizer.yaml` (global settings, watches, data volumes, quarantine root)
 - [x] Implement config file loader with validation (missing required fields, invalid paths, overlapping watches)

@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Bootstrap the safe Organizer vertical slice; 02 — Enforce watch-folder and destination boundaries.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Named match conditions support explicit numbered and named capture references, while invalid references fail validation.
 - [x] Plans expose disabled-earlier-rule warnings and resolve `full_path` as a normalized container-visible absolute path within mounted data volumes.

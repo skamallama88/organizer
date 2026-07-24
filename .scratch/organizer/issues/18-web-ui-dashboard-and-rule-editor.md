@@ -4,7 +4,7 @@
 
 **Blocked by:** 16 (dashboard needs config-discovered watches; rule editor needs watch_id and rules_path resolution)
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Add Jinja2 template directory and static asset setup to the FastAPI app
 - [x] Add HTMX and Alpine.js client-side assets

@@ -4,7 +4,7 @@
 
 **Blocked by:** 08 — Add ZIP archive creation; 09 — Add safe ZIP unarchive.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] 7z creation follows the ZIP archive action contract for files, folders, source preservation, and resulting-path recording.
 - [x] 7z and RAR extraction follow the same staged extraction, path safety, collision, and resource-limit guarantees as ZIP.

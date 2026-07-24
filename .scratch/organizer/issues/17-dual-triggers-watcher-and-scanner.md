@@ -4,7 +4,7 @@
 
 **Blocked by:** 16 (daemon needs config to discover watch folders and their paths)
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Add `watchdog` to `pyproject.toml` dependencies
 - [x] Implement watcher service: observe `IN_CLOSE_WRITE` / `IN_CREATE` events per watch root, debounce/coalesce, call `process_batch()` with discovered items

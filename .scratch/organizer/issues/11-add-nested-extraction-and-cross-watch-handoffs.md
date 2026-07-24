@@ -4,7 +4,7 @@
 
 **Blocked by:** 05 — Add durable leases, completion skipping, and trigger processing; 09 — Add safe ZIP unarchive; 10 — Add 7z and RAR archive adapters.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Nested archives are processed only within the active parent extraction boundary up to configured depth, never concurrently through ordinary discovery.
 - [x] A resulting-path handoff carries processing lineage to a different unvisited watch folder.

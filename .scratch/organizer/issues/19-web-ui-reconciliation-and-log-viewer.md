@@ -4,7 +4,7 @@
 
 **Blocked by:** 16 (needs config-discovered watches for context links and watch_id resolution)
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Implement attempt list template: filterable by status (`failed`, `needs-reconciliation`, `all`) and watch_id, shows source path, rule, action, failure detail, timestamp
 - [x] Implement attempt detail template: source fingerprint, planned actions, per-action results, intended destinations, resulting paths, filesystem evidence, failure detail, related retry attempts; command buttons trigger HTMX POST to existing API endpoints

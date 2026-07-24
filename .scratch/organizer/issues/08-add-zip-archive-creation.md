@@ -4,8 +4,8 @@
 
 **Blocked by:** 02 — Enforce watch-folder and destination boundaries; 04 — Add copy, rename, and action-chain execution; 05 — Add durable leases, completion skipping, and trigger processing.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] ZIP archive actions create correctly named archive output for files and folders and reject destination collisions without overwriting.
-- [ ] Archive creation uses private staging and refuses publication or source removal if the source identity changes during creation.
-- [ ] Original preservation is honored, and uncertain publication or source removal retains evidence for reconciliation.
+- [x] ZIP archive actions create correctly named archive output for files and folders and reject destination collisions without overwriting.
+- [x] Archive creation uses private staging and refuses publication or source removal if the source identity changes during creation.
+- [x] Original preservation is honored, and uncertain publication or source removal retains evidence for reconciliation.

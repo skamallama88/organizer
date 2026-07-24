@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Bootstrap the safe Organizer vertical slice; 02 — Enforce watch-folder and destination boundaries; 03 — Add rule revisions and named match captures.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Rename applies a complete valid name with explicit captures and records its resulting identity.
 - [x] Copy uses private destination staging and no-overwrite publication, refusing to publish when source consistency cannot be established.

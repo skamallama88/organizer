@@ -4,7 +4,7 @@
 
 **Blocked by:** 04 — Add copy, rename, and action-chain execution; 05 — Add durable leases, completion skipping, and trigger processing.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] A collision leaves existing data unchanged, stops later actions, records a failed execution attempt, and suppresses automatic processing of that source identity.
 - [x] Explicit retry and reprocess commands create fresh plans and linked history rather than reusing historical actions.

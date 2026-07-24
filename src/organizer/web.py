@@ -15,9 +15,18 @@ from organizer.attempt_review import (
     RetryFromStart,
 )
 from organizer.item_processor import ExecutionMode, ItemProcessor, PlanRequest
+from organizer.operational_health import OperationalHealth
+from organizer.structured_log import LogLevel, MemoryLogSink
 
 
-def create_app(processor: ItemProcessor) -> FastAPI:
+def create_app(
+    processor: ItemProcessor,
+    *,
+    log_sink: MemoryLogSink | None = None,
+    health_checker: OperationalHealth | None = None,
+    watch_folders: list[tuple[str, Path]] | None = None,
+    db_path: Path | None = None,
+) -> FastAPI:
     app = FastAPI()
     review = AttemptReview(processor)
 
@@ -158,6 +167,55 @@ def create_app(processor: ItemProcessor) -> FastAPI:
             "status": result.status,
             "detail": result.detail,
             "new_attempt_id": result.new_attempt_id,
+        }
+
+    @app.get("/logs", response_model=None)
+    def get_logs(
+        watch: str = "",
+        level: str = "",
+        limit: int = 1000,
+    ) -> list[dict[str, object]]:
+        if log_sink is None:
+            return []
+        log_level = LogLevel(level) if level else None
+        entries = log_sink.read_recent(limit=limit, watch=watch, level=log_level)
+        return [
+            {
+                "timestamp": entry.timestamp,
+                "level": entry.level.value,
+                "watch": entry.watch,
+                "rule": entry.rule,
+                "action": entry.action,
+                "item": entry.item,
+                "result": entry.result.value,
+                "detail": entry.detail,
+            }
+            for entry in entries
+        ]
+
+    @app.get("/health", response_model=None)
+    def get_health() -> dict[str, object]:
+        if health_checker is None or db_path is None or watch_folders is None:
+            return {
+                "all_healthy": True,
+                "watch_folder_healths": [],
+                "persistence_health": {"tracking_db_writable": True, "detail": ""},
+            }
+        overall = health_checker.check_all(watch_folders=watch_folders, db_path=db_path)
+        return {
+            "all_healthy": overall.all_healthy,
+            "watch_folder_healths": [
+                {
+                    "watch_id": h.watch_id,
+                    "accessible": h.accessible,
+                    "detail": h.detail,
+                }
+                for h in overall.watch_folder_healths
+            ],
+            "persistence_health": {
+                "tracking_db_writable": overall.persistence_health.tracking_db_writable,
+                "detail": overall.persistence_health.detail,
+            },
         }
 
     return app

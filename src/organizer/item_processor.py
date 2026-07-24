@@ -18,6 +18,9 @@ import yaml
 import py7zr
 import rarfile  # type: ignore[import-untyped]
 
+from organizer.structured_log import LogEntry, LogLevel, LogResult, StructuredLogger
+from organizer.operational_health import OperationalHealth
+
 
 class ExecutionMode(StrEnum):
     APPLY = "apply"
@@ -140,9 +143,17 @@ class DiscoveryBatch:
 class ItemProcessor:
     """Plans and executes item actions without exposing storage details to callers."""
 
-    def __init__(self, attempts_path: Path, events: list[dict[str, str]] | None = None) -> None:
+    def __init__(
+        self,
+        attempts_path: Path,
+        events: list[dict[str, str]] | None = None,
+        logger: StructuredLogger | None = None,
+        health_checker: OperationalHealth | None = None,
+    ) -> None:
         self._attempts_path = attempts_path
         self._events = events if events is not None else []
+        self._logger = logger
+        self._health_checker = health_checker
         self._initialize_attempts()
 
     def plan(self, request: PlanRequest) -> Plan:
@@ -376,6 +387,8 @@ class ItemProcessor:
         self._validate_plan_source(plan)
         if plan.rules_path is not None and self._ruleset_revision(plan.rules_path) != plan.ruleset_revision:
             raise ValueError("stale plan: ruleset revision changed")
+        if not self.check_persistence_health():
+            raise ValueError("persistence unhealthy: execution paused")
         if not self.acquire_lease(plan.watch_id, plan.source, plan.source_fingerprint):
             raise ValueError("processing lease unavailable")
         attempt_id = str(uuid.uuid4())
@@ -600,16 +613,36 @@ class ItemProcessor:
             )
 
     def _emit(self, plan: Plan, result: ActionResult) -> None:
-        self._events.append(
-            {
-                "watch": plan.watch_id,
-                "rule": plan.rule_name,
-                "action": result.kind,
-                "item": str(plan.source),
-                "result": result.result,
-                "detail": result.detail,
-            }
-        )
+        event = {
+            "watch": plan.watch_id,
+            "rule": plan.rule_name,
+            "action": result.kind,
+            "item": str(plan.source),
+            "result": result.result,
+            "detail": result.detail,
+        }
+        self._events.append(event)
+        if self._logger is not None:
+            level = LogLevel.DRYRUN if result.result == "DRY_RUN" else LogLevel.INFO if result.result == "OK" else LogLevel.ERROR
+            log_result = LogResult(result.result) if result.result in {r.value for r in LogResult} else LogResult.FAILED
+            self._logger.log(
+                LogEntry.create(
+                    level=level,
+                    watch=plan.watch_id,
+                    rule=plan.rule_name,
+                    action=result.kind,
+                    item=str(plan.source),
+                    result=log_result,
+                    detail=result.detail,
+                )
+            )
+
+    def check_persistence_health(self) -> bool:
+        """Check if persistence is healthy. Returns True if healthy or no checker configured."""
+        if self._health_checker is None:
+            return True
+        health = self._health_checker.check_persistence(self._attempts_path)
+        return health.tracking_db_writable
 
     def _copy_to_staging(self, source: Path, target: Path) -> Path:
         staging = target.parent / f".organizer-staging-{uuid.uuid4()}"

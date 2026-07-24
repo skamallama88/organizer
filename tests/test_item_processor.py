@@ -15,12 +15,14 @@ from organizer.web import WatchFolderConfig, create_app
 import pytest
 
 from organizer.item_processor import (
+    BatchItemStatus,
     BoundaryPolicy,
     ExecutionMode,
     ItemProcessor,
     ItemSnapshot,
     PlanRequest,
 )
+from organizer.operational_health import OperationalHealth, PersistenceHealth, WatchFolderHealth
 
 
 def write_delete_direct_rules(path: Path) -> Path:
@@ -2582,3 +2584,248 @@ def test_web_dry_run_via_editor_uses_process_batch(tmp_path: Path) -> None:
     assert response.status_code == 200, response.text
     assert "Dry run" in response.text or "move" in response.text
     assert item.exists() is True
+
+
+class _UnhealthyWatchFolder(OperationalHealth):
+    def check_watch_folder(self, watch_id: str, watch_root: Path) -> WatchFolderHealth:
+        return WatchFolderHealth(watch_id=watch_id, accessible=False, detail="simulated watch folder failure")
+
+
+class _UnhealthyPersistence(OperationalHealth):
+    def check_persistence(self, db_path: Path) -> PersistenceHealth:
+        return PersistenceHealth(tracking_db_writable=False, detail="simulated persistence failure")
+
+
+def test_watch_folder_health_pauses_processing_when_unhealthy(tmp_path: Path) -> None:
+    watch_root = tmp_path / "watch"
+    watch_root.mkdir()
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.parent.mkdir(parents=True, exist_ok=True)
+    rules_path.write_text("rules: []")
+    source = tmp_path / "item.txt"
+    source.write_text("content")
+
+    processor = ItemProcessor(
+        attempts_path=tmp_path / "organizer.db",
+        health_checker=_UnhealthyWatchFolder(),
+    )
+
+    snapshot = ItemSnapshot(path=source, size=source.stat().st_size, mtime=source.stat().st_mtime)
+    batch = processor.process_batch(
+        watch_id="test",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        snapshots=[snapshot],
+    )
+
+    assert any("paused" in d.lower() for d in batch.diagnostics)
+    assert len(batch.items) > 0
+    for item in batch.items:
+        assert "unhealthy" in item.detail.lower() or "paused" in item.detail.lower()
+
+
+def test_watch_folder_health_allows_processing_when_healthy(tmp_path: Path) -> None:
+    watch_root = tmp_path / "watch"
+    watch_root.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        """rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move:
+          destination: ../target
+"""
+    )
+    source = watch_root / "test.txt"
+    source.write_text("content")
+
+    processor = ItemProcessor(
+        attempts_path=tmp_path / "organizer.db",
+        health_checker=OperationalHealth(),
+    )
+
+    snapshot = ItemSnapshot(path=source, size=source.stat().st_size, mtime=source.stat().st_mtime)
+    batch = processor.process_batch(
+        watch_id="test",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        snapshots=[snapshot],
+    )
+
+    assert not any("paused" in d.lower() for d in batch.diagnostics)
+    assert len(batch.items) == 1
+    assert batch.items[0].status == BatchItemStatus.EXECUTED
+
+
+def test_no_health_checker_does_not_pause_processing(tmp_path: Path) -> None:
+    watch_root = tmp_path / "watch"
+    watch_root.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        """rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move:
+          destination: ../target
+"""
+    )
+    source = watch_root / "test.txt"
+    source.write_text("content")
+
+    processor = ItemProcessor(attempts_path=tmp_path / "organizer.db")
+
+    snapshot = ItemSnapshot(path=source, size=source.stat().st_size, mtime=source.stat().st_mtime)
+    batch = processor.process_batch(
+        watch_id="test",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        snapshots=[snapshot],
+    )
+
+    assert not any("paused" in d.lower() for d in batch.diagnostics)
+    assert len(batch.items) == 1
+
+
+def test_persistence_health_pauses_real_execution_at_batch_level(tmp_path: Path) -> None:
+    watch_root = tmp_path / "watch"
+    watch_root.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        """rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move:
+          destination: ../target
+"""
+    )
+    source = watch_root / "test.txt"
+    source.write_text("content")
+
+    processor = ItemProcessor(
+        attempts_path=tmp_path / "organizer.db",
+        health_checker=_UnhealthyPersistence(),
+    )
+
+    snapshot = ItemSnapshot(path=source, size=source.stat().st_size, mtime=source.stat().st_mtime)
+    batch = processor.process_batch(
+        watch_id="test",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        snapshots=[snapshot],
+        dry_run=False,
+    )
+
+    assert any("persistence" in d.lower() for d in batch.diagnostics)
+    assert len(batch.items) > 0
+    for item in batch.items:
+        assert "persistence" in item.detail.lower()
+
+
+def test_persistence_health_allows_dry_run_when_unhealthy(tmp_path: Path) -> None:
+    watch_root = tmp_path / "watch"
+    watch_root.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        """rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move:
+          destination: ../target
+"""
+    )
+    source = watch_root / "test.txt"
+    source.write_text("content")
+
+    processor = ItemProcessor(
+        attempts_path=tmp_path / "organizer.db",
+        health_checker=_UnhealthyPersistence(),
+    )
+
+    snapshot = ItemSnapshot(path=source, size=source.stat().st_size, mtime=source.stat().st_mtime)
+    batch = processor.process_batch(
+        watch_id="test",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        snapshots=[snapshot],
+        dry_run=True,
+    )
+
+    assert not any("paused" in d.lower() for d in batch.diagnostics)
+    assert len(batch.items) == 1
+    assert batch.items[0].status == BatchItemStatus.EXECUTED
+
+
+def test_health_recovery_after_restoration_resumes_processing(tmp_path: Path) -> None:
+    class _ToggleWatchFolderHealth(OperationalHealth):
+        def __init__(self) -> None:
+            self.healthy = False
+
+        def check_watch_folder(self, watch_id: str, watch_root: Path) -> WatchFolderHealth:
+            return WatchFolderHealth(watch_id=watch_id, accessible=self.healthy)
+
+    watch_root = tmp_path / "watch"
+    watch_root.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        """rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move:
+          destination: ../target
+"""
+    )
+    source = watch_root / "test.txt"
+    source.write_text("content")
+    toggle = _ToggleWatchFolderHealth()
+
+    processor = ItemProcessor(
+        attempts_path=tmp_path / "organizer.db",
+        health_checker=toggle,
+    )
+
+    snapshot = ItemSnapshot(path=source, size=source.stat().st_size, mtime=source.stat().st_mtime)
+
+    toggle.healthy = False
+    batch = processor.process_batch(
+        watch_id="test",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        snapshots=[snapshot],
+    )
+    assert any("paused" in d.lower() for d in batch.diagnostics)
+
+    toggle.healthy = True
+    batch = processor.process_batch(
+        watch_id="test",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        snapshots=[snapshot],
+    )
+    assert not any("paused" in d.lower() for d in batch.diagnostics)
+    assert len(batch.items) == 1
+    assert batch.items[0].status == BatchItemStatus.EXECUTED

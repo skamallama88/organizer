@@ -653,6 +653,39 @@ class ItemProcessor:
         health = self._health_checker.check_persistence(self._attempts_path)
         return health.tracking_db_writable
 
+    def check_watch_folder_health(self, watch_id: str, watch_root: Path) -> bool:
+        """Check if a watch folder is healthy. Returns True if healthy or no checker configured."""
+        if self._health_checker is None:
+            return True
+        health = self._health_checker.check_watch_folder(watch_id, watch_root)
+        return health.accessible
+
+    def _pause_batch(self, watch_id: str, reason: str, snapshots: list[ItemSnapshot], *, diagnostic: str | None = None) -> DiscoveryBatch:
+        """Return a paused discovery batch when a health check fails."""
+        paused = tuple(
+            BatchItemResult(source=snapshot.path, status=BatchItemStatus.SKIPPED, detail=reason)
+            for snapshot in snapshots
+        )
+        if self._logger is not None:
+            for item in paused:
+                self._logger.log(
+                    LogEntry.create(
+                        level=LogLevel.WARN,
+                        watch=watch_id,
+                        rule="",
+                        action="",
+                        item=str(item.source),
+                        result=LogResult.SKIPPED,
+                        detail=reason,
+                    )
+                )
+        batch_diagnostic = diagnostic or reason
+        return DiscoveryBatch(
+            watch_id=watch_id,
+            items=paused,
+            diagnostics=(batch_diagnostic,),
+        )
+
     def _copy_to_staging(self, source: Path, target: Path) -> Path:
         staging = target.parent / f".organizer-staging-{uuid.uuid4()}"
         if source.is_dir():
@@ -1285,6 +1318,13 @@ class ItemProcessor:
         dry_run: bool = False,
     ) -> DiscoveryBatch:
         current_time = now if now is not None else time.time()
+
+        if not self.check_watch_folder_health(watch_id, watch_root):
+            return self._pause_batch(watch_id, "watch folder unhealthy: paused", snapshots, diagnostic="watch folder unhealthy: processing paused")
+
+        if not dry_run and not self.check_persistence_health():
+            return self._pause_batch(watch_id, "persistence unhealthy: execution paused", snapshots)
+
         results: list[BatchItemResult] = []
         diagnostics_set: set[str] = set()
         has_deferred = False

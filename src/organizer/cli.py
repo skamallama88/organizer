@@ -246,14 +246,19 @@ def status(
     attempts_path: Path = Path("/config/organizer.db"),
 ) -> None:
     """Show configured watches and their current health."""
+    from organizer.operational_health import OperationalHealth
+
     config = load_config(config_path)
+    health_checker = OperationalHealth()
     processor = ItemProcessor(attempts_path=attempts_path)
     for watch in config.watches:
         rules = processor.validate_rules_document(watch.rules_path) if watch.rules_path.exists() else ["rules file missing"]
         rule_count = _rule_count(watch.rules_path)
-        health = "healthy" if watch.watch_root.is_dir() and not rules else "unhealthy"
+        health_result = health_checker.check_watch_folder(watch.watch_id, watch.watch_root)
+        health = "healthy" if health_result.accessible and not rules else "unhealthy"
+        health_detail = f"  detail={health_result.detail}" if health_result.detail else ""
         last_activity = _last_activity(processor, watch.watch_id)
-        typer.echo(f"{watch.watch_id}: {health}  root={watch.watch_root}  rules={watch.rules_path}  rule_count={rule_count}  last_activity={last_activity}")
+        typer.echo(f"{watch.watch_id}: {health}  root={watch.watch_root}  rules={watch.rules_path}  rule_count={rule_count}  last_activity={last_activity}{health_detail}")
 
 
 def _watch(config: OrganizerConfig, watch_id: str) -> WatchFolderConfig:

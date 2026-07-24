@@ -362,3 +362,18 @@ For actions with reliable outcome evidence, the attempt records the action resul
   Downloads/                     # watch folder contents
   Inbox/
 ```
+
+## Production deployment
+
+The production image is built from `Dockerfile` and persists Organizer configuration,
+the Tracking DB, and logs under `/config`, separately from watched content under
+`/data`. The image installs `unrar-free` for RAR extraction; startup logs an explicit
+error if neither `unrar` nor `unar` is available, and affected RAR inputs remain
+available for review.
+
+The standalone web process binds to `127.0.0.1:8000` by default. The container binds
+to `0.0.0.0:8000` so Docker forwarding works; the supplied Compose configuration
+publishes it only on the host's loopback interface. `ORGANIZER_HOST` and
+`ORGANIZER_PORT` may override the container bind for a trusted deployment boundary.
+Any non-loopback host emits a prominent warning because the administrative UI is
+unauthenticated.

@@ -6,6 +6,6 @@
 
 **Status:** ready-for-agent
 
-- [ ] The image runs Organizer with persistent configuration and logs separated from mounted data volumes.
-- [ ] RAR extraction dependencies are available in the image and their absence is reported clearly when unavailable.
-- [ ] The unauthenticated UI binds to localhost by default and logs a prominent warning when explicitly configured for non-loopback exposure.
+- [x] The image runs Organizer with persistent configuration and logs separated from mounted data volumes.
+- [x] RAR extraction dependencies are available in the image and their absence is reported clearly when unavailable.
+- [x] The unauthenticated UI binds to localhost by default and logs a prominent warning when explicitly configured for non-loopback exposure.

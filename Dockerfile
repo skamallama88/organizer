@@ -1,9 +1,19 @@
 FROM python:3.12-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    ORGANIZER_HOST=0.0.0.0 \
+    ORGANIZER_PORT=8000
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y unrar-free \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock ./
 COPY src ./src
 RUN pip install --no-cache-dir .
 
+VOLUME ["/config", "/data"]
 EXPOSE 8000
-CMD ["uvicorn", "organizer.webapp:app", "--host", "127.0.0.1", "--port", "8000"]
+ENTRYPOINT ["organizer-web"]

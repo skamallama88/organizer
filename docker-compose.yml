@@ -1,0 +1,15 @@
+services:
+  organizer:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      ORGANIZER_HOST: "0.0.0.0"
+      ORGANIZER_PORT: "8000"
+    volumes:
+      - organizer_config:/config
+      - organizer_data:/data
+
+volumes:
+  organizer_config:
+  organizer_data:

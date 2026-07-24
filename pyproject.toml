@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 organizer = "organizer.cli:app"
+organizer-web = "organizer.webapp:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/organizer"]

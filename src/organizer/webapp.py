@@ -1,7 +1,9 @@
 from pathlib import Path
+import logging
 
 from organizer.item_processor import ItemProcessor
 from organizer.operational_health import OperationalHealth
+from organizer.runtime import RuntimeSettings, log_startup_diagnostics
 from organizer.structured_log import MemoryLogSink, StdoutLogSink, StructuredLogger
 from organizer.web import create_app
 
@@ -17,3 +19,12 @@ app = create_app(
     watch_folders=[],
     db_path=db_path,
 )
+
+settings = RuntimeSettings.from_environment()
+log_startup_diagnostics(settings, logging.getLogger("organizer"))
+
+
+def run() -> None:
+    import uvicorn
+
+    uvicorn.run(app, host=settings.host, port=settings.port)

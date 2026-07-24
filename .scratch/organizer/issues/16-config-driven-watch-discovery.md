@@ -6,10 +6,10 @@
 
 **Status:** ready-for-agent
 
-- [ ] Define Pydantic models for `organizer.yaml` (global settings, watches, data volumes, quarantine root)
-- [ ] Implement config file loader with validation (missing required fields, invalid paths, overlapping watches)
-- [ ] Wire config resolution into existing web endpoints (`/watches/{watch_id}/dry-run`, `/watches/{watch_id}/rules`, `/attempts`)
-- [ ] Wire config resolution into existing CLI commands (`check`, `review list/inspect/accept/abandon/reopen/retry`)
-- [ ] Add `organizer status` CLI command showing configured watches, rules path, last activity, health
-- [ ] Update `webapp.py` to load config on startup and pass to the app factory
-- [ ] Tests: config loading, validation errors, status output, endpoint resolution
+- [x] Define Pydantic models for `organizer.yaml` (global settings, watches, data volumes, quarantine root)
+- [x] Implement config file loader with validation (missing required fields, invalid paths, overlapping watches)
+- [x] Wire config resolution into existing web endpoints (`/watches/{watch_id}/dry-run`, `/watches/{watch_id}/rules`, `/attempts`)
+- [x] Wire config resolution into existing CLI commands (`check`, `review list/inspect/accept/abandon/reopen/retry`)
+- [x] Add `organizer status` CLI command showing configured watches, rules path, last activity, health
+- [x] Update `webapp.py` to load config on startup and pass to the app factory
+- [x] Tests: config loading, validation errors, status output, endpoint resolution

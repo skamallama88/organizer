@@ -6,9 +6,9 @@
 
 **Status:** ready-for-agent
 
-- [ ] Add Jinja2 template directory and static asset setup to the FastAPI app
-- [ ] Add HTMX and Alpine.js client-side assets
-- [ ] Implement watch dashboard template: list configured watches, show health status, rule counts, last-activity time, links to rule editor and log viewer
-- [ ] Implement rule editor template: YAML textarea, validate button → HTMX to validation endpoint inline, dry-run preview → HTMX to dry-run endpoint, save button with conflict feedback
-- [ ] Wire template routes into FastAPI app (`GET /` → dashboard, `GET /watches/{watch_id}/rules` → editor)
-- [ ] Tests: template rendering, HTMX form interactions, validation and dry-run feedback, atomic save with conflict detection
+- [x] Add Jinja2 template directory and static asset setup to the FastAPI app
+- [x] Add HTMX and Alpine.js client-side assets
+- [x] Implement watch dashboard template: list configured watches, show health status, rule counts, last-activity time, links to rule editor and log viewer
+- [x] Implement rule editor template: YAML textarea, validate button → HTMX to validation endpoint inline, dry-run preview → HTMX to dry-run endpoint, save button with conflict feedback
+- [x] Wire template routes into FastAPI app (`GET /` → dashboard, `GET /watches/{watch_id}/rules` → editor)
+- [x] Tests: template rendering, HTMX form interactions, validation and dry-run feedback, atomic save with conflict detection

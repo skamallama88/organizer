@@ -6,11 +6,11 @@
 
 **Status:** ready-for-agent
 
-- [ ] Implement attempt list template: filterable by status (`failed`, `needs-reconciliation`, `all`) and watch_id, shows source path, rule, action, failure detail, timestamp
-- [ ] Implement attempt detail template: source fingerprint, planned actions, per-action results, intended destinations, resulting paths, filesystem evidence, failure detail, related retry attempts; command buttons trigger HTMX POST to existing API endpoints
-- [ ] Implement log viewer template: filter by level (INFO/WARN/ERROR/DRYRUN) and watch_id, shows structured log entries with timestamp, level, watch, rule, action, item, result, detail
-- [ ] Wire template routes into FastAPI app (`GET /attempts` → list, `GET /attempts/{attempt_id}` → detail, `GET /logs` → viewer)
-- [ ] Tests: template rendering, HTMX command interactions (accept, abandon, retry, reopen), log filtering
+- [x] Implement attempt list template: filterable by status (`failed`, `needs-reconciliation`, `all`) and watch_id, shows source path, rule, action, failure detail, timestamp
+- [x] Implement attempt detail template: source fingerprint, planned actions, per-action results, intended destinations, resulting paths, filesystem evidence, failure detail, related retry attempts; command buttons trigger HTMX POST to existing API endpoints
+- [x] Implement log viewer template: filter by level (INFO/WARN/ERROR/DRYRUN) and watch_id, shows structured log entries with timestamp, level, watch, rule, action, item, result, detail
+- [x] Wire template routes into FastAPI app (`GET /attempts` → list, `GET /attempts/{attempt_id}` → detail, `GET /logs` → viewer)
+- [x] Tests: template rendering, HTMX command interactions (accept, abandon, retry, reopen), log filtering
 
 ## Implementation note
 

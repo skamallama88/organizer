@@ -61,6 +61,181 @@ docker compose restart organizer
 The default rules file contains no rules, so Organizer starts safely without
 modifying files. Add rules through the web UI or edit the configured YAML file.
 
+## Rules YAML
+
+Each watch folder has a rules file with a top-level `rules` list. Rules are
+evaluated from top to bottom and the first matching rule wins. A rule requires a
+`name`, a regular-expression `match`, and one or more ordered `actions`.
+
+```yaml
+rules:
+  - name: Move videos
+    match:
+      field: file_name       # file_name, folder_name, or full_path
+      pattern: '\.(mkv|mp4)$' # Python regular expression
+    actions:
+      - move:
+          destination: /data/Videos
+```
+
+Relative destinations are resolved from the watch folder. Absolute destinations
+must remain inside a configured `data_roots` path. Organizer never overwrites an
+existing destination item, and a failed action stops the rest of that action
+chain.
+
+### Match fields and captures
+
+Use `file_name` for a file's name, `folder_name` for the containing folder name
+(or the item's name when it is a folder), and `full_path` for the normalized
+absolute path. Give a match a name when an action needs its regular-expression
+captures. Rename actions can use numbered captures (`\1`, `\2`) or named
+captures (`\g<title>`).
+
+```yaml
+rules:
+  - name: Remove tag from filename
+    match:
+      name: title
+      field: file_name
+      pattern: '^(?P<title>.*) \[processed\](?P<extension>\.[^.]+)$'
+    actions:
+      - rename:
+          name: '\g<title>\g<extension>'
+```
+
+For multiple independent conditions, use `conditions` instead of relying only
+on the default condition name `match`. Every condition must match for the rule
+to apply.
+
+```yaml
+rules:
+  - name: Move processed video folders
+    conditions:
+      folder:
+        field: folder_name
+        pattern: '^Season [0-9]+$'
+      video:
+        field: file_name
+        pattern: '\.(mkv|mp4)$'
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move:
+          destination: /data/Processed
+```
+
+### Available actions
+
+Move an item and preserve its name:
+
+```yaml
+actions:
+  - move:
+      destination: ../Videos
+```
+
+Copy an item and keep the original in place:
+
+```yaml
+actions:
+  - copy:
+      destination: /data/Backups
+```
+
+Rename an item within its current directory:
+
+```yaml
+actions:
+  - rename:
+      name: normalized-name.mkv
+```
+
+Direct deletion is irreversible and requires an explicit rule-level opt-in:
+
+```yaml
+rules:
+  - name: Delete temporary files
+    match:
+      field: file_name
+      pattern: '\.tmp$'
+    actions:
+      - delete:
+          mode: direct
+    allow_direct_deletion: true
+```
+
+Quarantine removes an item recoverably under the configured `quarantine_root`.
+The original relative path is retained under an attempt-specific directory:
+
+```yaml
+rules:
+  - name: Quarantine unknown files
+    match:
+      field: file_name
+      pattern: '\.unknown$'
+    actions:
+      - delete:
+          mode: quarantine
+```
+
+Create a ZIP or 7z archive. `extension` defaults to `.zip`; set
+`preserve_originals` to `false` to remove the source after successful archive
+publication.
+
+```yaml
+actions:
+  - archive:
+      destination: /data/Archives
+      extension: .zip       # .zip or .7z
+      preserve_originals: true
+```
+
+Unarchive ZIP, 7z, or RAR files into an extraction directory named after the
+archive. `destination` defaults to the watch folder. The source is preserved by
+default; set `preserve_original` to `false` to remove it after successful
+extraction. Resource limits and nested extraction depth are optional.
+
+```yaml
+rules:
+  - name: Extract downloads
+    match:
+      field: file_name
+      pattern: '\.(zip|7z|rar)$'
+    actions:
+      - unarchive:
+          destination: /data/Extracted
+          preserve_original: true
+          max_depth: 1
+          max_entries: 10000
+          max_uncompressed_bytes: 1073741824
+          max_entry_bytes: 1073741824
+```
+
+Actions can be chained. Each action receives the primary result of the prior
+action, and direct deletion must be the final action:
+
+```yaml
+rules:
+  - name: Copy then rename
+    match:
+      field: file_name
+      pattern: '\.mkv$'
+    actions:
+      - copy:
+          destination: /data/Review
+      - rename:
+          name: reviewed.mkv
+```
+
+Use `allow_hard_link_removal: true` only when a direct delete or quarantine rule
+is intentionally allowed to remove files that have multiple hard links. Use the
+CLI or web UI dry run before enabling mutating rules:
+
+```sh
+organizer check <watch-id> <item>
+```
+
 For Unraid, replace the named volumes in `docker-compose.yml` with host paths, for
 example:
 

@@ -1,5 +1,6 @@
 from pathlib import Path
 import hashlib
+import os
 import sqlite3
 import zipfile
 import py7zr
@@ -427,6 +428,39 @@ def test_apply_move_records_completed_attempt_after_success(tmp_path: Path) -> N
     assert not item.exists()
     assert (destination / "movie.mkv").read_text() == "movie"
     assert processor.attempts() == [{"status": "completed", "resulting_paths": [str(destination / "movie.mkv")], "processing_lineage": ["downloads"]}]
+
+
+def test_move_never_overwrites_destination_created_after_preflight(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("source")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    target = destination / item.name
+    original_link = os.link
+
+    def create_target_before_link(source: str | Path, destination_path: str | Path, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None, follow_symlinks: bool = True) -> None:
+        if Path(source) == item and Path(destination_path) == target:
+            target.write_text("existing")
+        original_link(
+            source,
+            destination_path,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(os, "link", create_target_before_link)
+
+    report = processor.execute(plan)
+
+    assert report.status == "failed"
+    assert target.read_text() == "existing"
+    assert item.read_text() == "source"
 
 
 def test_web_preview_renders_the_shared_dry_run_plan(tmp_path: Path) -> None:

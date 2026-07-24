@@ -479,10 +479,7 @@ class ItemProcessor:
                         action_source = source
                         self._validate_destination_item(action.target)
                         if action.target != source:
-                            if self._case_collision(action.target, BoundaryPolicy()) or action.target.exists():
-                                raise FileExistsError(f"destination already exists: {action.target}")
-                            action.target.parent.mkdir(parents=True, exist_ok=True)
-                            source.rename(action.target)
+                            self._move_without_overwrite(source, action.target)
                         source = action.target
                         result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
                     results.append(result)
@@ -834,6 +831,19 @@ class ItemProcessor:
                 staging.unlink(missing_ok=True)
             raise FileExistsError(f"destination already exists: {target}")
         staging.rename(target)
+
+    @staticmethod
+    def _move_without_overwrite(source: Path, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source, target)
+        except FileExistsError as error:
+            raise FileExistsError(f"destination already exists: {target}") from error
+        try:
+            source.unlink()
+        except OSError:
+            target.unlink(missing_ok=True)
+            raise
 
     @staticmethod
     def _validate_rule(rule: object) -> tuple[str, dict[str, tuple[str, str]], list[dict[str, Any]], bool, bool]:

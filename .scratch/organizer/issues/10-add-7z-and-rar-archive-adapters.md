@@ -6,6 +6,6 @@
 
 **Status:** ready-for-agent
 
-- [ ] 7z creation follows the ZIP archive action contract for files, folders, source preservation, and resulting-path recording.
-- [ ] 7z and RAR extraction follow the same staged extraction, path safety, collision, and resource-limit guarantees as ZIP.
-- [ ] Unsupported, corrupt, password-protected, or unavailable-RAR-tooling cases remain visible failures without destroying the input archive.
+- [x] 7z creation follows the ZIP archive action contract for files, folders, source preservation, and resulting-path recording.
+- [x] 7z and RAR extraction follow the same staged extraction, path safety, collision, and resource-limit guarantees as ZIP.
+- [x] Unsupported, corrupt, password-protected, or unavailable-RAR-tooling cases remain visible failures without destroying the input archive.

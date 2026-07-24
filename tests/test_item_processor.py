@@ -2,6 +2,8 @@ from pathlib import Path
 import hashlib
 import sqlite3
 import zipfile
+import py7zr
+import rarfile
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
@@ -960,6 +962,64 @@ def test_archive_rejects_destination_collision(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="collision"):
         ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+
+def test_archive_creates_7z_and_preserves_original(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_archive_rules(watch_root / "rules.yaml", "../archives", extension=".7z")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    archive = destination / "movie.mkv.7z"
+    assert report.status == "completed"
+    assert item.exists()
+    with py7zr.SevenZipFile(archive, "r") as seven_zip:
+        assert seven_zip.readall()["movie.mkv"].read() == b"movie"
+
+
+def test_unarchive_7z_uses_staging_and_retains_source(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.7z"
+    source = tmp_path / "source.txt"
+    source.write_text("content")
+    with py7zr.SevenZipFile(archive, "w") as seven_zip:
+        seven_zip.write(source, arcname="folder/file.txt")
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    rules.write_text(rules.read_text().replace("\\.zip$", "\\.(zip|7z)$"))
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "completed"
+    assert (watch_root / "bundle" / "folder" / "file.txt").read_text() == "content"
+    assert archive.exists()
+
+
+def test_unarchive_rar_tooling_failure_is_visible_and_retains_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.rar"
+    archive.write_bytes(b"rar")
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    rules.write_text(rules.read_text().replace("\\.zip$", "\\.(zip|rar)$"))
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    def unavailable(_: Path) -> object:
+        raise rarfile.RarCannotExec("unrar unavailable")
+
+    monkeypatch.setattr(processor, "_open_archive", unavailable)
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "failed"
+    assert "RarCannotExec" in report.actions[-1].detail
+    assert archive.exists()
 
 
 def test_archive_refuses_publication_and_removal_when_source_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

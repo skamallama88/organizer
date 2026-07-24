@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+import py7zr
+import rarfile  # type: ignore[import-untyped]
 
 
 class ExecutionMode(StrEnum):
@@ -226,6 +228,8 @@ class ItemProcessor:
                     raise ValueError(f"rule {rule_name} archive destination is required")
                 if not isinstance(extension, str) or not extension.startswith(".") or Path(extension).name != extension:
                     raise ValueError(f"rule {rule_name} archive extension is invalid")
+                if extension.lower() not in {".zip", ".7z"}:
+                    raise ValueError(f"rule {rule_name} archive extension is unsupported")
                 if not isinstance(preserve_original, bool):
                     raise ValueError(f"rule {rule_name} archive preserve_original must be boolean")
                 root = Path(destination)
@@ -418,8 +422,8 @@ class ItemProcessor:
                         result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
                     results.append(result)
                     self._emit(plan, result)
-            except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as error:
-                classification = "password-protected archive" if isinstance(error, RuntimeError) else type(error).__name__
+            except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, py7zr.exceptions.ArchiveError, rarfile.Error, rarfile.RarCannotExec) as error:
+                classification = "password-protected archive" if isinstance(error, (RuntimeError, rarfile.PasswordRequired)) else type(error).__name__
                 detail = f"{classification}: {error}"
                 result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", detail, source=source)
                 results.append(result)
@@ -546,8 +550,15 @@ class ItemProcessor:
         return staging
 
     def _archive_to_staging(self, source: Path, target: Path) -> Path:
-        staging = self._attempts_path.parent / "staging" / f".organizer-staging-{uuid.uuid4()}.zip"
+        staging = self._attempts_path.parent / "staging" / f".organizer-staging-{uuid.uuid4()}{target.suffix.lower()}"
         staging.parent.mkdir(parents=True, exist_ok=True)
+        if target.suffix.lower() == ".7z":
+            with py7zr.SevenZipFile(staging, "w") as archive:
+                if source.is_dir():
+                    archive.writeall(source, arcname=source.name)
+                else:
+                    archive.write(source, arcname=source.name)
+            return staging
         with zipfile.ZipFile(staging, "x", compression=zipfile.ZIP_DEFLATED) as archive:
             if source.is_dir():
                 for child in sorted(source.rglob("*")):
@@ -566,11 +577,11 @@ class ItemProcessor:
     def _inspect_archive(self, source: Path, target: Path, limits: tuple[int, int, int]) -> ArchivePreview:
         max_entries, max_bytes, max_entry_size = limits
         count = total = 0
-        with zipfile.ZipFile(source) as archive:
-            for info in archive.infolist():
+        for info in self._archive_info(source):
                 count += 1
-                total += info.file_size
-                if count > max_entries or total > max_bytes or info.file_size > max_entry_size:
+                total += self._entry_size(info)
+                entry_size = self._entry_size(info)
+                if count > max_entries or total > max_bytes or entry_size > max_entry_size:
                     return ArchivePreview(target, count, total, True)
         return ArchivePreview(target, count, total, False)
 
@@ -580,33 +591,85 @@ class ItemProcessor:
         staging.mkdir(parents=True)
         count = total = 0
         try:
-            with zipfile.ZipFile(source) as archive:
-                for info in archive.infolist():
+            with self._open_archive(source) as archive:
+                for info in self._archive_info(source, archive):
                     count += 1
-                    total += info.file_size
-                    if count > max_entries or total > max_bytes or info.file_size > max_entry_size:
+                    entry_size = self._entry_size(info)
+                    total += entry_size
+                    if count > max_entries or total > max_bytes or entry_size > max_entry_size:
                         raise ValueError("archive resource limit exceeded")
-                    relative = Path(info.filename)
+                    relative = Path(self._entry_name(info))
                     destination = staging / relative
                     if relative.is_absolute() or ".." in relative.parts:
                         raise ValueError("archive path traversal rejected")
-                    if info.is_dir():
+                    if self._entry_is_dir(info):
                         destination.mkdir(parents=True, exist_ok=True)
                         continue
-                    if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                    if self._entry_is_symlink(info):
                         raise ValueError("archive symlink rejected")
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     copied = 0
-                    with archive.open(info) as input_stream, destination.open("wb") as output_stream:
+                    if isinstance(archive, py7zr.SevenZipFile):
+                        extracted = archive.read([self._entry_name(info)])
+                        input_stream = extracted[self._entry_name(info)] if extracted else None
+                        if input_stream is None:
+                            raise OSError(f"archive entry unavailable: {self._entry_name(info)}")
+                    else:
+                        input_stream = self._open_entry(archive, info)
+                    with input_stream, destination.open("wb") as output_stream:
                         while chunk := input_stream.read(1024 * 1024):
                             copied += len(chunk)
-                            if copied > max_entry_size or total - info.file_size + copied > max_bytes:
+                            if copied > max_entry_size or total - entry_size + copied > max_bytes:
                                 raise ValueError("archive resource limit exceeded")
                             output_stream.write(chunk)
             return staging
-        except (zipfile.BadZipFile, RuntimeError, ValueError, OSError):
+        except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, py7zr.exceptions.ArchiveError, rarfile.Error, rarfile.RarCannotExec):
             self._remove_tree(staging)
             raise
+
+    @staticmethod
+    def _open_archive(source: Path) -> Any:
+        if source.suffix.lower() == ".7z":
+            return py7zr.SevenZipFile(source, "r")
+        if source.suffix.lower() == ".rar":
+            return rarfile.RarFile(source)
+        if source.suffix.lower() == ".zip":
+            return zipfile.ZipFile(source)
+        raise ValueError(f"unsupported archive format: {source.suffix}")
+
+    @classmethod
+    def _archive_info(cls, source: Path, archive: Any | None = None) -> list[Any]:
+        opened = archive is None
+        handle = archive or cls._open_archive(source)
+        try:
+            if isinstance(handle, zipfile.ZipFile):
+                return list(handle.infolist())
+            if isinstance(handle, rarfile.RarFile):
+                return list(handle.infolist())
+            return list(handle.list())
+        finally:
+            if opened:
+                handle.close()
+
+    @staticmethod
+    def _entry_name(info: Any) -> str:
+        return str(getattr(info, "filename", getattr(info, "name", "")))
+
+    @staticmethod
+    def _entry_size(info: Any) -> int:
+        return int(getattr(info, "file_size", getattr(info, "uncompressed", 0)))
+
+    @staticmethod
+    def _entry_is_dir(info: Any) -> bool:
+        return bool(info.is_dir() if hasattr(info, "is_dir") else getattr(info, "is_directory", False))
+
+    @staticmethod
+    def _entry_is_symlink(info: Any) -> bool:
+        return isinstance(info, zipfile.ZipInfo) and (info.external_attr >> 16) & 0o170000 == 0o120000
+
+    @staticmethod
+    def _open_entry(archive: Any, info: Any) -> Any:
+        return archive.open(info)
 
     @staticmethod
     def _remove_tree(path: Path) -> None:

@@ -20,6 +20,10 @@ The web UI is available at `http://127.0.0.1:8000`. The Compose configuration ke
 the published port on host loopback while the container listens on `0.0.0.0`, which
 is required for Docker port forwarding.
 
+On first start, the image creates `/config/organizer.yaml` and `/config/rules.yaml`
+in an empty config volume. Edit those files to configure watch folders and rules;
+existing files are never overwritten on restart.
+
 For Unraid, replace the named volumes in `docker-compose.yml` with host paths, for
 example:
 

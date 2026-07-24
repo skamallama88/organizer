@@ -12,8 +12,11 @@ RUN apt-get update \
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY src ./src
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN pip install --no-cache-dir .
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 VOLUME ["/config", "/data"]
 EXPOSE 8000
-ENTRYPOINT ["organizer-web"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["organizer-web"]

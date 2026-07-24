@@ -1,0 +1,12 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; }
+header, main { max-width: 72rem; margin: auto; padding: 1rem; }
+header { border-bottom: 1px solid #888; font-size: 1.25rem; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid #888; padding: .75rem; text-align: left; vertical-align: top; }
+textarea, input { box-sizing: border-box; font: inherit; width: 100%; }
+textarea { min-height: 24rem; }
+button { font: inherit; margin-right: .5rem; padding: .4rem .7rem; }
+.feedback { padding: .75rem; }
+.feedback.error { color: #a00000; }
+.feedback.success { color: #006400; }

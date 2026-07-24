@@ -9,7 +9,9 @@ description = "Safe file organization daemon"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115,<1",
+    "jinja2>=3.1,<4",
     "pydantic>=2.9,<3",
+    "python-multipart>=0.0.20,<1",
     "py7zr>=0.22,<1",
     "pyyaml>=6,<7",
     "rarfile>=4.2,<5",
@@ -24,6 +26,9 @@ organizer-web = "organizer.webapp:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/organizer"]
+
+[tool.hatch.build]
+include = ["src/organizer/web_ui/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,12 +1,17 @@
 from pathlib import Path
 import hashlib
+import html
 import json
 import os
+import threading
 import uuid
 import yaml
 
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
 
 from organizer.attempt_review import (
     Abandon,
@@ -17,11 +22,15 @@ from organizer.attempt_review import (
     RetryFromStart,
 )
 from organizer.config import WatchFolderConfig
-from organizer.item_processor import BoundaryPolicy, ExecutionMode, ItemProcessor, PlanRequest
+from organizer.item_processor import ExecutionMode, ItemProcessor, PlanRequest
 from organizer.operational_health import OperationalHealth
 from organizer.structured_log import LogLevel, MemoryLogSink
 
 __all__ = ["WatchFolderConfig", "create_app"]
+
+_WEB_ROOT = Path(__file__).parent / "web_ui"
+_TEMPLATES = Jinja2Templates(directory=str(_WEB_ROOT / "templates"))
+_RULE_SAVE_LOCK = threading.Lock()
 
 
 def create_app(
@@ -33,6 +42,7 @@ def create_app(
     db_path: Path | None = None,
 ) -> FastAPI:
     app = FastAPI()
+    app.mount("/static", StaticFiles(directory=_WEB_ROOT / "static"), name="static")
     review = AttemptReview(processor)
 
     def _watch_config(watch_id: str) -> WatchFolderConfig | None:
@@ -42,6 +52,135 @@ def create_app(
             if config.watch_id == watch_id:
                 return config
         return None
+
+    def _rule_count(rules_path: Path) -> int:
+        try:
+            document = yaml.safe_load(rules_path.read_text()) or {}
+        except (OSError, yaml.YAMLError):
+            return 0
+        rules = document.get("rules", []) if isinstance(document, dict) else []
+        return len(rules) if isinstance(rules, list) else 0
+
+    def _health_by_watch() -> dict[str, tuple[bool, str]]:
+        if health_checker is None or db_path is None or watch_folders is None:
+            return {}
+        health = health_checker.check_all(
+            watch_folders=[(config.watch_id, config.watch_root) for config in watch_folders],
+            db_path=db_path,
+        )
+        return {entry.watch_id: (entry.accessible, entry.detail) for entry in health.watch_folder_healths}
+
+    def _fragment(request: Request, template: str, **context: object) -> HTMLResponse:
+        return _TEMPLATES.TemplateResponse(request, template, context)
+
+    def _rules_feedback(message: str, *, error: bool = False) -> str:
+        css_class = "feedback error" if error else "feedback success"
+        return f'<p class="{css_class}">{html.escape(message)}</p>'
+
+    @app.get("/", response_class=HTMLResponse)
+    def dashboard(request: Request) -> HTMLResponse:
+        health_by_watch = _health_by_watch()
+        watches = []
+        for config in watch_folders or ():
+            accessible, detail = health_by_watch.get(config.watch_id, (True, ""))
+            entries = log_sink.read_recent(limit=1, watch=config.watch_id) if log_sink is not None else []
+            watches.append({
+                "id": config.watch_id,
+                "root": config.watch_root,
+                "healthy": accessible and not processor.validate_rules_document(config.rules_path),
+                "health_detail": detail,
+                "rule_count": _rule_count(config.rules_path),
+                "recent_activity": entries[-1] if entries else None,
+            })
+        return _fragment(request, "dashboard.html", watches=watches)
+
+    @app.get("/watches/{watch_id}/rules", response_class=HTMLResponse)
+    def rule_editor(request: Request, watch_id: str) -> HTMLResponse:
+        config = _watch_config(watch_id)
+        if config is None:
+            raise HTTPException(status_code=404, detail="watch folder not configured")
+        try:
+            rules = config.rules_path.read_text()
+        except OSError as error:
+            raise HTTPException(status_code=500, detail=f"cannot read rules: {error}") from error
+        revision = hashlib.sha256(rules.encode()).hexdigest()
+        return _fragment(request, "rule_editor.html", watch=config, rules=rules, revision=revision)
+
+    @app.post("/watches/{watch_id}/rules/validate", response_class=HTMLResponse)
+    def validate_rules(request: Request, watch_id: str, rules: str = Form()) -> HTMLResponse:
+        config = _watch_config(watch_id)
+        if config is None:
+            raise HTTPException(status_code=404, detail="watch folder not configured")
+        temp_path = config.rules_path.with_suffix(f"{config.rules_path.suffix}.validate-{uuid.uuid4().hex}")
+        try:
+            temp_path.write_text(rules)
+            diagnostics = processor.validate_rules_document(temp_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+        if diagnostics:
+            return HTMLResponse(_rules_feedback("; ".join(diagnostics), error=True), status_code=422)
+        return HTMLResponse(_rules_feedback("Rules are valid."))
+
+    @app.post("/watches/{watch_id}/rules/dry-run", response_class=HTMLResponse)
+    def editor_dry_run(request: Request, watch_id: str, item: Path = Form(), rules: str = Form()) -> HTMLResponse:
+        config = _watch_config(watch_id)
+        if config is None:
+            raise HTTPException(status_code=404, detail="watch folder not configured")
+        temp_path = config.rules_path.with_suffix(f"{config.rules_path.suffix}.preview-{uuid.uuid4().hex}")
+        try:
+            temp_path.write_text(rules)
+            diagnostics = processor.validate_rules_document(temp_path)
+            if diagnostics:
+                return HTMLResponse(_rules_feedback("; ".join(diagnostics), error=True), status_code=422)
+            plan = processor.plan(PlanRequest(watch_id, config.watch_root, item, temp_path, config.boundary_policy))
+            report = processor.execute(plan, ExecutionMode.DRY_RUN)
+        except ValueError as error:
+            if str(error) == "no valid rule matched item":
+                return HTMLResponse(_rules_feedback("Dry run: No rule matched."))
+            return HTMLResponse(_rules_feedback(str(error), error=True), status_code=422)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+        if not report.actions:
+            return HTMLResponse(_rules_feedback("Dry run: No rule matched."))
+        rows = "".join(
+            f"<li>{html.escape(action.kind)}: {html.escape(str(action.source))} to {html.escape(str(action.target))}</li>"
+            for action in report.actions
+        )
+        return HTMLResponse(f"<section class=\"preview\"><h2>Dry run</h2><ul>{rows}</ul></section>")
+
+    @app.post("/watches/{watch_id}/rules/save", response_class=HTMLResponse)
+    def editor_save(
+        request: Request,
+        watch_id: str,
+        rules: str = Form(),
+        expected_revision: str = Form(),
+    ) -> HTMLResponse:
+        config = _watch_config(watch_id)
+        if config is None:
+            raise HTTPException(status_code=404, detail="watch folder not configured")
+        rules_path = config.rules_path
+        temp_path = rules_path.with_suffix(f"{rules_path.suffix}.tmp-{uuid.uuid4().hex}")
+        try:
+            with _RULE_SAVE_LOCK:
+                temp_path.write_text(rules)
+                diagnostics = processor.validate_rules_document(temp_path)
+                if diagnostics:
+                    return HTMLResponse(_rules_feedback("; ".join(diagnostics), error=True), status_code=422)
+                try:
+                    current_revision = hashlib.sha256(rules_path.read_bytes()).hexdigest()
+                except OSError as error:
+                    return HTMLResponse(_rules_feedback(f"cannot read current rules: {error}", error=True), status_code=500)
+                if current_revision != expected_revision:
+                    return HTMLResponse(_rules_feedback("Ruleset revision conflict. Reload before saving.", error=True), status_code=409)
+                rules_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(temp_path, rules_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+        revision = hashlib.sha256(rules.encode()).hexdigest()
+        return HTMLResponse(_rules_feedback(f"Rules saved. Revision: {revision}"))
 
     @app.get("/watches/{watch_id}/dry-run", response_class=HTMLResponse, response_model=None)
     def dry_run(watch_id: str, item: Path) -> str | JSONResponse:

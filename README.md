@@ -49,6 +49,14 @@ ORGANIZER_HOST=0.0.0.0 ORGANIZER_PORT=8000 organizer-web
 The administrative UI is unauthenticated. Any non-loopback bind logs a prominent
 warning and should only be used behind a trusted reverse proxy or private network.
 
+## Web UI
+
+The dashboard at `/` lists configured watch folders, their health, rule count, and
+recent activity. Each watch folder links to its YAML rule editor at
+`/watches/<watch-id>/rules`, where validation, dry-run previews, and atomic
+revision-checked saves return inline HTMX feedback. The UI serves its Jinja2
+templates, CSS, HTMX, and Alpine.js assets locally under `/static`.
+
 ## CLI
 
 Preview a plan without mutating files:

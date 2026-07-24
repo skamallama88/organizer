@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Rule editor: {{ watch.watch_id }}</h1>
+<p><a href="/">Back to watch folders</a></p>
+<form x-data="{ dirty: false }">
+  <input type="hidden" name="expected_revision" value="{{ revision }}">
+  <label for="rules">Rules YAML</label>
+  <textarea id="rules" name="rules" rows="24" x-on:input="dirty = true">{{ rules }}</textarea>
+  <p>
+    <button type="button" hx-post="/watches/{{ watch.watch_id }}/rules/validate" hx-include="closest form" hx-target="#feedback">Validate</button>
+    <button type="button" hx-post="/watches/{{ watch.watch_id }}/rules/save" hx-include="closest form" hx-target="#feedback">Save</button>
+  </p>
+  <p><label for="item">Item for dry run</label><input id="item" name="item" type="text" placeholder="{{ watch.watch_root }}/example.txt"></p>
+  <button type="button" hx-post="/watches/{{ watch.watch_id }}/rules/dry-run" hx-include="closest form" hx-target="#preview">Dry run</button>
+</form>
+<section id="feedback" aria-live="polite"></section>
+<section id="preview" aria-live="polite"></section>
+{% endblock %}

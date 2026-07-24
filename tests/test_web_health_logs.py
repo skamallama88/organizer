@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
@@ -125,6 +126,47 @@ def test_logs_endpoint_respects_limit(tmp_path: Path) -> None:
     assert response.status_code == 200
     data = response.json()
     assert len(data) == 5
+
+
+def test_logs_endpoint_rejects_invalid_level(tmp_path: Path) -> None:
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    client = TestClient(create_app(processor, log_sink=MemoryLogSink()))
+
+    response = client.get("/logs", params={"level": "NOPE"})
+
+    assert response.status_code == 422
+
+
+def test_logs_page_renders_and_filters_date_range(tmp_path: Path) -> None:
+    memory_sink = MemoryLogSink()
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    app = create_app(processor, log_sink=memory_sink)
+    client = TestClient(app)
+    entry = LogEntry(
+        timestamp=datetime(2026, 7, 24, tzinfo=timezone.utc).isoformat(),
+        level=LogLevel.ERROR, watch="downloads", rule="videos", action="move",
+        item="/data/movie.mkv", result=LogResult.FAILED, detail="collision",
+    )
+    memory_sink.write(entry)
+
+    response = client.get("/logs", params={"level": "ERROR", "start": "2026-07-24", "end": "2026-07-24"}, headers={"accept": "text/html"})
+
+    assert response.status_code == 200
+    assert "Log viewer" in response.text
+    assert "collision" in response.text
+    assert 'name="start"' in response.text
+
+
+def test_logs_page_excludes_entries_outside_date_range(tmp_path: Path) -> None:
+    memory_sink = MemoryLogSink()
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    app = create_app(processor, log_sink=memory_sink)
+    client = TestClient(app)
+    memory_sink.write(LogEntry(timestamp="2026-07-23T00:00:00+00:00", level=LogLevel.INFO, watch="downloads", rule="old", action="move", item="old", result=LogResult.OK))
+
+    response = client.get("/logs", params={"start": "2026-07-24"}, headers={"accept": "text/html"})
+
+    assert "old" not in response.text
 
 
 def test_health_endpoint_returns_overall_status(tmp_path: Path) -> None:

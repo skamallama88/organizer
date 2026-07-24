@@ -11,7 +11,7 @@
       <td>{% if watch.healthy %}Healthy{% else %}Unhealthy{% endif %}{% if watch.health_detail %}<br><small>{{ watch.health_detail }}</small>{% endif %}</td>
       <td>{{ watch.rule_count }} rule{% if watch.rule_count != 1 %}s{% endif %}</td>
       <td>{% if watch.recent_activity %}{{ watch.recent_activity.timestamp }}: {{ watch.recent_activity.rule }} {{ watch.recent_activity.action }}{% else %}No activity{% endif %}</td>
-      <td><a href="/watches/{{ watch.id }}/rules">Rules</a> <a href="/watches/{{ watch.id }}/logs">Logs</a></td>
+       <td><a href="/watches/{{ watch.id }}/rules">Rules</a> <a href="/logs?watch={{ watch.id }}">Logs</a></td>
     </tr>
   {% endfor %}
   </tbody>

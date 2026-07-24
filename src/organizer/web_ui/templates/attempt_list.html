@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Processing attempts</h1>
+<form method="get" action="/attempts" class="filters">
+  <label>Status <select name="status">
+    <option value="failed{% if status == 'failed' %} selected{% endif %}">Failed</option>
+    <option value="needs-reconciliation{% if status == 'needs-reconciliation' %} selected{% endif %}">Needs reconciliation</option>
+    <option value=""{% if not status %} selected{% endif %}>All</option>
+  </select></label>
+  <label>Watch <select name="watch_id"><option value="">All watches</option>{% for watch in watches %}<option value="{{ watch.watch_id }}"{% if watch_id == watch.watch_id %} selected{% endif %}>{{ watch.watch_id }}</option>{% endfor %}</select></label>
+  <button type="submit">Filter</button>
+</form>
+{% if attempts %}<table><thead><tr><th>Source</th><th>Watch</th><th>Rule</th><th>Status</th><th>Action / failure</th><th>Created</th></tr></thead><tbody>
+{% for attempt in attempts %}<tr><td><a href="/attempts/{{ attempt.attempt_id }}">{{ attempt.source_path }}</a></td><td>{{ attempt.watch_id }}</td><td>{{ attempt.rule_name }}</td><td>{{ attempt.status }}</td><td>{{ attempt.failure_detail }}</td><td>{{ attempt.created_at }}</td></tr>{% endfor %}
+</tbody></table>{% else %}<p>No attempts match these filters.</p>{% endif %}
+{% endblock %}

@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Attempt {{ attempt.attempt_id }}</h1>
+<p><strong>Status:</strong> {{ attempt.status }} | <strong>Watch:</strong> {{ attempt.watch_id }} | <strong>Rule:</strong> {{ attempt.rule_name }}</p>
+<dl><dt>Source</dt><dd>{{ attempt.source_path }}</dd><dt>Fingerprint</dt><dd><code>{{ attempt.source_fingerprint }}</code></dd><dt>Failure</dt><dd>{{ attempt.failure_detail or "None" }}</dd></dl>
+<h2>Planned actions</h2><table><thead><tr><th>Action</th><th>Intended destination</th></tr></thead><tbody>{% for action in attempt.planned_actions %}<tr><td>{{ action.get('kind', '') }}</td><td><code>{{ action.get('target', '') }}</code></td></tr>{% else %}<tr><td colspan="2">None</td></tr>{% endfor %}</tbody></table>
+<h2>Action results</h2><table><thead><tr><th>Action</th><th>Result</th><th>Detail</th><th>Commands</th></tr></thead><tbody>{% for result in attempt.action_results %}<tr><td>{{ result.get('action', result.get('kind', '')) }}</td><td>{{ result.get('result', '') }}</td><td>{{ result.get('detail', '') }}</td><td>{% if result.get('result') == 'UNCERTAIN' %}<form hx-post="/attempts/{{ attempt.attempt_id }}/accept" hx-target="#command-feedback"><input type="hidden" name="action_index" value="{{ loop.index0 }}"><input name="resulting_path" placeholder="Resulting path" required><button>Accept path</button></form>{% endif %}</td></tr>{% endfor %}</tbody></table>
+<h2>Resulting paths</h2><ul>{% for path in attempt.resulting_paths %}<li><code>{{ path }}</code></li>{% else %}<li>None recorded</li>{% endfor %}</ul>
+<h2>Filesystem evidence</h2><table><thead><tr><th>Path</th><th>Exists</th><th>Fingerprint</th><th>Detail</th></tr></thead><tbody>{% for evidence in attempt.filesystem_evidence %}<tr><td>{{ evidence.path }}</td><td>{{ evidence.exists }}</td><td><code>{{ evidence.get('fingerprint', '') }}</code></td><td>{{ evidence.get('error', '') }}</td></tr>{% endfor %}</tbody></table>
+<h2>Commands</h2><div id="command-feedback"></div>
+{% if attempt.status in ['failed', 'needs-reconciliation'] %}<form hx-post="/attempts/{{ attempt.attempt_id }}/retry" hx-target="#command-feedback"><input type="hidden" name="watch_id" value="{{ attempt.watch_id }}"><button>Retry from start</button></form>{% endif %}
+{% if attempt.status == 'abandoned' %}<form hx-post="/attempts/{{ attempt.attempt_id }}/reopen" hx-target="#command-feedback"><input type="hidden" name="watch_id" value="{{ attempt.watch_id }}"><button>Reopen</button></form>{% endif %}
+{% if attempt.status != 'completed' and attempt.status != 'abandoned' %}<form hx-post="/attempts/{{ attempt.attempt_id }}/abandon" hx-target="#command-feedback"><label>Reason <input name="reason" required></label><button>Abandon</button></form>{% endif %}
+<h2>Related attempts</h2><ul>{% for linked in attempt.linked_attempts %}<li><a href="/attempts/{{ linked }}">{{ linked }}</a></li>{% else %}<li>None</li>{% endfor %}</ul>
+{% if attempt.suppressions %}<h2>Suppressions</h2><ul>{% for suppression in attempt.suppressions %}<li>{{ suppression.reason }}: {{ suppression.source_path }}</li>{% endfor %}</ul>{% endif %}
+{% endblock %}

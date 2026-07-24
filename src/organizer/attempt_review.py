@@ -33,6 +33,7 @@ class AttemptReviewDetails:
     status: str
     planned_actions: tuple[dict[str, object], ...]
     action_results: tuple[dict[str, object], ...]
+    filesystem_evidence: tuple[dict[str, object], ...]
     resulting_paths: tuple[str, ...]
     failure_detail: str
     suppressions: tuple[dict[str, object], ...]
@@ -150,6 +151,7 @@ class AttemptReview:
             status=status,
             planned_actions=tuple(json.loads(planned_actions_json or "[]")),
             action_results=tuple(json.loads(action_results_json or "[]")),
+            filesystem_evidence=tuple(self._filesystem_evidence(source_path, resulting_paths_json)),
             resulting_paths=tuple(json.loads(resulting_paths_json or "[]")),
             failure_detail=failure_detail or "",
             suppressions=tuple(suppressions),
@@ -160,6 +162,23 @@ class AttemptReview:
             created_at=started_at or "",
             completed_at=completed_at or "",
         )
+
+    def _filesystem_evidence(self, source_path: str, resulting_paths_json: str | None) -> List[dict[str, object]]:
+        paths = [source_path, *json.loads(resulting_paths_json or "[]")]
+        evidence: list[dict[str, object]] = []
+        for value in dict.fromkeys(str(path) for path in paths if path):
+            path = Path(value)
+            try:
+                exists = path.exists()
+                entry: dict[str, object] = {"path": value, "exists": exists, "is_symlink": path.is_symlink()}
+                if exists and not path.is_symlink():
+                    entry["is_dir"] = path.is_dir()
+                    entry["size"] = path.stat().st_size
+                    entry["fingerprint"] = self._processor._fingerprint(path)
+            except OSError as error:
+                entry = {"path": value, "exists": False, "error": str(error)}
+            evidence.append(entry)
+        return evidence
 
     def command(self, attempt_id: str, command: AttemptReviewCommand) -> CommandResult:
         if isinstance(command, Accept):

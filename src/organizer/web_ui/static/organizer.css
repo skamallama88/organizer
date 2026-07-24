@@ -2,6 +2,7 @@
 body { margin: 0; }
 header, main { max-width: 72rem; margin: auto; padding: 1rem; }
 header { border-bottom: 1px solid #888; font-size: 1.25rem; }
+nav { float: right; font-size: 1rem; }
 table { border-collapse: collapse; width: 100%; }
 th, td { border-bottom: 1px solid #888; padding: .75rem; text-align: left; vertical-align: top; }
 textarea, input { box-sizing: border-box; font: inherit; width: 100%; }
@@ -10,3 +11,8 @@ button { font: inherit; margin-right: .5rem; padding: .4rem .7rem; }
 .feedback { padding: .75rem; }
 .feedback.error { color: #a00000; }
 .feedback.success { color: #006400; }
+.filters { display: flex; gap: 1rem; align-items: end; margin: 1rem 0; }
+.filters label { min-width: 10rem; }
+form { margin: 1rem 0; }
+code { overflow-wrap: anywhere; }
+@media (max-width: 48rem) { .filters { flex-direction: column; align-items: stretch; } table { font-size: .85rem; } th, td { padding: .45rem; } }

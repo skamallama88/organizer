@@ -17,6 +17,7 @@ from organizer.attempt_review import (
     Abandon,
     Accept,
     AttemptFilters,
+    AttemptReviewDetails,
     AttemptReview,
     Reopen,
     RetryFromStart,
@@ -76,6 +77,40 @@ def create_app(
     def _rules_feedback(message: str, *, error: bool = False) -> str:
         css_class = "feedback error" if error else "feedback success"
         return f'<p class="{css_class}">{html.escape(message)}</p>'
+
+    def _attempt_payload(details: AttemptReviewDetails) -> dict[str, object]:
+        return {
+            "attempt_id": details.attempt_id,
+            "watch_id": details.watch_id,
+            "source_path": details.source_path,
+            "source_fingerprint": details.source_fingerprint,
+            "source_size": details.source_size,
+            "source_mtime": details.source_mtime,
+            "rule_name": details.rule_name,
+            "status": details.status,
+            "planned_actions": list(details.planned_actions),
+            "action_results": list(details.action_results),
+            "filesystem_evidence": list(details.filesystem_evidence),
+            "resulting_paths": list(details.resulting_paths),
+            "failure_detail": details.failure_detail,
+            "suppressions": list(details.suppressions),
+            "linked_attempts": list(details.linked_attempts),
+            "processing_lineage": list(details.processing_lineage),
+            "accepted_results": list(details.accepted_results),
+            "abandoned_reason": details.abandoned_reason,
+            "created_at": details.created_at,
+            "completed_at": details.completed_at,
+        }
+
+    def _is_html_request(request: Request) -> bool:
+        return request.headers.get("HX-Request") == "true" or "text/html" in request.headers.get("accept", "")
+
+    def _form_or_json(body: bytes) -> dict[str, object]:
+        try:
+            return dict(json.loads(body))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            from urllib.parse import parse_qs
+            return {key: values[-1] for key, values in parse_qs(body.decode()).items()}
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request) -> HTMLResponse:
@@ -232,11 +267,13 @@ def create_app(
         return {"watch_id": watch_id, "revision": hashlib.sha256(body).hexdigest()}
 
     @app.get("/attempts", response_model=None)
-    def list_attempts(status: str = "", watch_id: str = "") -> list[dict[str, object]] | JSONResponse:
+    def list_attempts(request: Request, status: str = "", watch_id: str = "") -> list[dict[str, object]] | HTMLResponse | JSONResponse:
         if watch_id and _watch_config(watch_id) is None:
             return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
         statuses = tuple(s.strip() for s in status.split(",") if s.strip()) if status else ()
         summaries = review.list(AttemptFilters(statuses=statuses, watch_id=watch_id))
+        if _is_html_request(request):
+            return _fragment(request, "attempt_list.html", attempts=summaries, status=status, watch_id=watch_id, watches=watch_folders or ())
         return [
             {
                 "attempt_id": s.attempt_id,
@@ -253,38 +290,21 @@ def create_app(
         ]
 
     @app.get("/attempts/{attempt_id}", response_model=None)
-    def inspect_attempt(attempt_id: str) -> dict[str, object] | JSONResponse:
+    def inspect_attempt(request: Request, attempt_id: str) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
             details = review.inspect(attempt_id)
         except ValueError as error:
             return JSONResponse(status_code=404, content={"detail": str(error)})
-        return {
-            "attempt_id": details.attempt_id,
-            "watch_id": details.watch_id,
-            "source_path": details.source_path,
-            "source_fingerprint": details.source_fingerprint,
-            "source_size": details.source_size,
-            "source_mtime": details.source_mtime,
-            "rule_name": details.rule_name,
-            "status": details.status,
-            "planned_actions": list(details.planned_actions),
-            "action_results": list(details.action_results),
-            "resulting_paths": list(details.resulting_paths),
-            "failure_detail": details.failure_detail,
-            "suppressions": list(details.suppressions),
-            "linked_attempts": list(details.linked_attempts),
-            "processing_lineage": list(details.processing_lineage),
-            "accepted_results": list(details.accepted_results),
-            "abandoned_reason": details.abandoned_reason,
-            "created_at": details.created_at,
-            "completed_at": details.completed_at,
-        }
+        if _is_html_request(request):
+            config = _watch_config(details.watch_id)
+            return _fragment(request, "attempt_detail.html", attempt=details, watch=config)
+        return _attempt_payload(details)
 
     @app.post("/attempts/{attempt_id}/accept", response_model=None)
-    def accept_attempt(attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | JSONResponse:
+    def accept_attempt(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
-            payload = json.loads(body)
-            action_index = int(payload["action_index"])
+            payload = _form_or_json(body)
+            action_index = int(str(payload["action_index"]))
             resulting_path = str(payload["resulting_path"])
         except (json.JSONDecodeError, KeyError, ValueError) as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
@@ -307,25 +327,29 @@ def create_app(
             )
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
+        if _is_html_request(request):
+            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
         return {"success": result.success, "attempt_id": result.attempt_id, "status": result.status, "detail": result.detail}
 
     @app.post("/attempts/{attempt_id}/abandon", response_model=None)
-    def abandon_attempt(attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | JSONResponse:
+    def abandon_attempt(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
-            payload = json.loads(body)
+            payload = _form_or_json(body)
             reason = str(payload.get("reason", ""))
-        except json.JSONDecodeError as error:
+        except (UnicodeDecodeError, ValueError) as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
         try:
             result = review.command(attempt_id, Abandon(reason=reason))
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
+        if _is_html_request(request):
+            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
         return {"success": result.success, "attempt_id": result.attempt_id, "status": result.status, "detail": result.detail}
 
     @app.post("/attempts/{attempt_id}/reopen", response_model=None)
-    def reopen_attempt(attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | JSONResponse:
+    def reopen_attempt(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
-            payload = json.loads(body)
+            payload = _form_or_json(body)
             watch_id = str(payload["watch_id"])
         except (json.JSONDecodeError, KeyError, ValueError) as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
@@ -336,6 +360,8 @@ def create_app(
             result = review.command(attempt_id, Reopen(watch_root=config.watch_root, rules_path=config.rules_path, boundary_policy=config.boundary_policy))
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
+        if _is_html_request(request):
+            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
         return {
             "success": result.success,
             "attempt_id": result.attempt_id,
@@ -345,9 +371,9 @@ def create_app(
         }
 
     @app.post("/attempts/{attempt_id}/retry", response_model=None)
-    def retry_attempt(attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | JSONResponse:
+    def retry_attempt(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
-            payload = json.loads(body)
+            payload = _form_or_json(body)
             watch_id = str(payload["watch_id"])
         except (json.JSONDecodeError, KeyError, ValueError) as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
@@ -358,6 +384,8 @@ def create_app(
             result = review.command(attempt_id, RetryFromStart(watch_root=config.watch_root, rules_path=config.rules_path, boundary_policy=config.boundary_policy))
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
+        if _is_html_request(request):
+            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
         return {
             "success": result.success,
             "attempt_id": result.attempt_id,
@@ -368,15 +396,26 @@ def create_app(
 
     @app.get("/logs", response_model=None)
     def get_logs(
+        request: Request,
         watch: str = "",
         level: str = "",
         limit: int = 1000,
-    ) -> list[dict[str, object]]:
+        start: str = "",
+        end: str = "",
+    ) -> list[dict[str, object]] | HTMLResponse:
         if log_sink is None:
             return []
-        log_level = LogLevel(level) if level else None
-        entries = log_sink.read_recent(limit=limit, watch=watch, level=log_level)
-        return [
+        try:
+            log_level = LogLevel(level) if level else None
+        except ValueError:
+            raise HTTPException(status_code=422, detail="invalid log level")
+        entries = log_sink.read_recent(limit=None, watch=watch, level=log_level)
+        if start:
+            entries = [entry for entry in entries if entry.timestamp[:10] >= start]
+        if end:
+            entries = [entry for entry in entries if entry.timestamp[:10] <= end]
+        entries = entries[-limit:]
+        payload: list[dict[str, object]] = [
             {
                 "timestamp": entry.timestamp,
                 "level": entry.level.value,
@@ -389,6 +428,9 @@ def create_app(
             }
             for entry in entries
         ]
+        if _is_html_request(request):
+            return _fragment(request, "log_viewer.html", entries=payload, watch=watch, level=level, start=start, end=end, watches=watch_folders or ())
+        return payload
 
     @app.get("/health", response_model=None)
     def get_health() -> dict[str, object]:

@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Log viewer</h1>
+<form method="get" action="/logs" class="filters"><label>Level <select name="level"><option value="">All</option>{% for option in ['INFO', 'WARN', 'ERROR', 'DRYRUN'] %}<option{% if level == option %} selected{% endif %}>{{ option }}</option>{% endfor %}</select></label><label>Watch <input name="watch" value="{{ watch }}"></label><label>From <input type="date" name="start" value="{{ start }}"></label><label>To <input type="date" name="end" value="{{ end }}"></label><button>Filter</button></form>
+{% if entries %}<table><thead><tr><th>Timestamp</th><th>Level</th><th>Watch</th><th>Rule</th><th>Action</th><th>Item</th><th>Result</th><th>Detail</th></tr></thead><tbody>{% for entry in entries %}<tr>{% for key in ['timestamp', 'level', 'watch', 'rule', 'action', 'item', 'result', 'detail'] %}<td>{{ entry[key] }}</td>{% endfor %}</tr>{% endfor %}</tbody></table>{% else %}<p>No log entries match these filters.</p>{% endif %}
+{% endblock %}

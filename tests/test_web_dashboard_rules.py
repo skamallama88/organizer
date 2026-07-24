@@ -54,7 +54,7 @@ def test_dashboard_renders_watch_health_rule_count_and_recent_activity(tmp_path:
     assert "1 rule" in response.text
     assert "Archive" in response.text
     assert 'href="/watches/downloads/rules"' in response.text
-    assert 'href="/watches/downloads/logs"' in response.text
+    assert 'href="/logs?watch=downloads"' in response.text
 
 
 def test_rule_editor_renders_current_document_and_revision(tmp_path: Path) -> None:
@@ -151,3 +151,18 @@ def test_rule_editor_save_returns_conflict_feedback_without_overwriting(tmp_path
     assert response.status_code == 409
     assert "conflict" in response.text
     assert rules_path.read_bytes() == original
+
+
+def test_attempt_and_log_pages_render_html(tmp_path: Path) -> None:
+    client, rules_path, log_sink = make_client(tmp_path)
+    item = tmp_path / "downloads" / "movie.txt"
+    item.write_text("movie")
+    log_sink.write(LogEntry.create(level=LogLevel.INFO, watch="downloads", rule="Archive", action="move", item=str(item), result=LogResult.OK))
+
+    attempts = client.get("/attempts", headers={"accept": "text/html"})
+    logs = client.get("/logs", headers={"accept": "text/html"})
+
+    assert attempts.status_code == 200
+    assert "Processing attempts" in attempts.text
+    assert logs.status_code == 200
+    assert "Log viewer" in logs.text

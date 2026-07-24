@@ -11,3 +11,7 @@
 - [ ] Implement log viewer template: filter by level (INFO/WARN/ERROR/DRYRUN) and watch_id, shows structured log entries with timestamp, level, watch, rule, action, item, result, detail
 - [ ] Wire template routes into FastAPI app (`GET /attempts` → list, `GET /attempts/{attempt_id}` → detail, `GET /logs` → viewer)
 - [ ] Tests: template rendering, HTMX command interactions (accept, abandon, retry, reopen), log filtering
+
+## Implementation note
+
+The repository's agreed `AttemptReview` interface currently exposes `accept`, `abandon`, `retry from start`, and `reopen`, but no retry-remaining or mark-action-applied command. This ticket wires the existing commands through HTMX and does not invent a new recovery operation outside that interface. Adding retry-remaining requires a separate application-module decision and implementation seam.

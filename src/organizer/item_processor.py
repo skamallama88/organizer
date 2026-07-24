@@ -38,6 +38,7 @@ class BoundaryPolicy:
     watch_roots: tuple[Path, ...] = ()
     allowed_destinations: tuple[Path, ...] = ()
     case_sensitive: bool | None = None
+    quarantine_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,9 @@ class Plan:
     source_fingerprint: str = ""
     ruleset_revision: str = ""
     rules_path: Path | None = None
+    watch_root: Path | None = None
+    allow_hard_link_removal: bool = False
+    source_link_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -131,9 +135,10 @@ class ItemProcessor:
             raise ValueError("rules must be a list")
 
         invalid_earlier: list[str] = []
+        rule_level_settings: tuple[bool, bool] = (False, False)
         for index, rule in enumerate(rules):
             try:
-                name, conditions, actions = self._validate_rule(rule)
+                name, conditions, actions, allow_direct_deletion, allow_hard_link_removal = self._validate_rule(rule)
                 candidate_matches = {
                     condition_name: re.search(pattern, self._match_value(field, item))
                     for condition_name, (field, pattern) in conditions.items()
@@ -146,6 +151,7 @@ class ItemProcessor:
                     }
                     self._validate_action_references(actions, typed_matches)
                     matching_rule = (name, actions, typed_matches)
+                    rule_level_settings = (allow_direct_deletion, allow_hard_link_removal)
                     break
             except (TypeError, ValueError, re.error) as error:
                 invalid_earlier.append(f"rule {index + 1} invalid: {error}")
@@ -158,6 +164,7 @@ class ItemProcessor:
             diagnostics[0] = f"disabled earlier rule 1: {diagnostics[0]}"
 
         rule_name, action_specs, matches = matching_rule
+        allow_direct_deletion, allow_hard_link_removal = rule_level_settings
         planned: list[PlannedAction] = []
         current = item
         for action in action_specs:
@@ -180,7 +187,24 @@ class ItemProcessor:
             if kind == "delete":
                 if action is not action_specs[-1]:
                     raise ValueError(f"rule {rule_name} delete result cannot accept a later action")
-                planned.append(PlannedAction(kind="delete", target=current))
+                delete_mode = action.get("delete", {})
+                if not isinstance(delete_mode, dict):
+                    raise ValueError(f"rule {rule_name} delete action must be a mapping")
+                mode = delete_mode.get("mode")
+                if mode == "quarantine":
+                    quarantine_root = policy.quarantine_root if policy else None
+                    if not quarantine_root:
+                        raise ValueError(f"rule {rule_name} quarantine requires a configured quarantine root")
+                    quarantine_root = self._canonical_path(quarantine_root)
+                    target = quarantine_root / request.watch_id
+                    planned.append(PlannedAction(kind="quarantine", target=target))
+                    current = target
+                elif mode == "direct":
+                    if not allow_direct_deletion:
+                        raise ValueError(f"rule {rule_name} direct deletion requires allow_direct_deletion: true")
+                    planned.append(PlannedAction(kind="delete", target=current))
+                else:
+                    raise ValueError(f"rule {rule_name} delete mode must be 'direct' or 'quarantine'")
                 continue
             if kind not in {"move", "copy"} or not isinstance(action.get(kind), dict):
                 raise ValueError(f"rule {rule_name} has unsupported action")
@@ -212,11 +236,22 @@ class ItemProcessor:
             diagnostics=tuple(diagnostics),
             ruleset_revision=ruleset_revision,
             rules_path=request.rules_path,
+            watch_root=watch_root,
+            allow_hard_link_removal=allow_hard_link_removal,
+            source_link_count=stat.st_nlink,
         )
+
+    def _has_destructive_action(self, plan: Plan) -> bool:
+        return any(action.kind in ("delete", "quarantine") for action in plan.actions)
+
+    def _validate_plan_source(self, plan: Plan) -> None:
+        has_destructive = self._has_destructive_action(plan)
+        if not has_destructive:
+            self._validate_source(plan)
 
     def execute(self, plan: Plan, mode: ExecutionMode = ExecutionMode.APPLY, retry_of_attempt_id: str | None = None) -> ExecutionReport:
         if mode is ExecutionMode.DRY_RUN:
-            self._validate_source(plan)
+            self._validate_plan_source(plan)
             if plan.rules_path is not None and self._ruleset_revision(plan.rules_path) != plan.ruleset_revision:
                 raise ValueError("stale plan: ruleset revision changed")
             dry_run_results = tuple(
@@ -227,7 +262,7 @@ class ItemProcessor:
                 self._emit(plan, result)
             return ExecutionReport(status="dry-run", dry_run=True, actions=dry_run_results)
 
-        self._validate_source(plan)
+        self._validate_plan_source(plan)
         if plan.rules_path is not None and self._ruleset_revision(plan.rules_path) != plan.ruleset_revision:
             raise ValueError("stale plan: ruleset revision changed")
         if not self.acquire_lease(plan.watch_id, plan.source, plan.source_fingerprint):
@@ -239,12 +274,42 @@ class ItemProcessor:
             source = plan.source
             try:
                 for action in plan.actions:
-                    if action.kind == "delete":
+                    if action.kind in ("delete", "quarantine"):
+                        needs_reconcile = False
                         if source.is_dir():
-                            shutil.rmtree(source)
+                            current_fp = self._fingerprint(source)
+                            if current_fp != plan.source_fingerprint:
+                                needs_reconcile = True
                         else:
-                            source.unlink()
-                        result = ActionResult(action.kind, action.target, "OK", source=source)
+                            if source.stat().st_nlink > 1 and not plan.allow_hard_link_removal:
+                                raise OSError(f"hard-link removal requires allow_hard_link_removal: true ({source.stat().st_nlink} links)")
+                            current_fp = self._fingerprint(source)
+                            if current_fp != plan.source_fingerprint:
+                                needs_reconcile = True
+                        if needs_reconcile:
+                            result = ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed", source=source)
+                            self._finish_attempt(attempt_id, "needs-reconciliation", results + [result])
+                            self._emit(plan, result)
+                            return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [result]))
+                        if action.kind == "delete":
+                            if source.is_dir():
+                                shutil.rmtree(source)
+                            else:
+                                source.unlink()
+                            result = ActionResult("delete", action.target, "OK", source=source)
+                        else:
+                            quarantine_base = action.target
+                            relative = plan.source.relative_to(plan.watch_root) if plan.watch_root else Path(source.name)
+                            actual_target = quarantine_base / attempt_id / relative
+                            actual_target.parent.mkdir(parents=True, exist_ok=True)
+                            if source.is_dir():
+                                shutil.copytree(source, actual_target)
+                                shutil.rmtree(source)
+                            else:
+                                shutil.copy2(source, actual_target)
+                                source.unlink()
+                            result = ActionResult("quarantine", action.target, "OK", source=source, resulting_path=actual_target)
+                            source = actual_target
                     elif action.kind == "copy":
                         staging = self._copy_to_staging(source, action.target)
                         try:
@@ -402,7 +467,7 @@ class ItemProcessor:
         staging.rename(target)
 
     @staticmethod
-    def _validate_rule(rule: object) -> tuple[str, dict[str, tuple[str, str]], list[dict[str, Any]]]:
+    def _validate_rule(rule: object) -> tuple[str, dict[str, tuple[str, str]], list[dict[str, Any]], bool, bool]:
         if not isinstance(rule, dict):
             raise ValueError("rule must be a mapping")
         name = rule.get("name")
@@ -431,7 +496,9 @@ class ItemProcessor:
             parsed_conditions[condition_name] = (field, pattern)
         if not isinstance(actions, list) or not actions:
             raise ValueError("actions are required")
-        return name, parsed_conditions, actions
+        allow_direct_deletion = bool(rule.get("allow_direct_deletion", False))
+        allow_hard_link_removal = bool(rule.get("allow_hard_link_removal", False))
+        return name, parsed_conditions, actions, allow_direct_deletion, allow_hard_link_removal
 
     @staticmethod
     def _ruleset_revision(path: Path) -> str:
@@ -753,8 +820,12 @@ class ItemProcessor:
         results: list[BatchItemResult] = []
         diagnostics_set: set[str] = set()
         has_deferred = False
+        quarantine_root = boundary_policy.quarantine_root if boundary_policy else None
         for snapshot in snapshots:
             canonical = self._canonical_path(snapshot.path)
+            if quarantine_root and self._is_within(canonical, self._canonical_path(quarantine_root)):
+                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.SKIPPED, detail="organizer-managed path"))
+                continue
             if not self.is_stable(watch_id, snapshot, now=current_time, stability_interval=stability_interval):
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.DEFERRED, detail="unstable item"))
                 has_deferred = True

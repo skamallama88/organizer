@@ -60,6 +60,8 @@ rules:
     actions:
       - <action_type>:
           <action_params>
+    allow_direct_deletion: false            # optional; required for delete mode: direct
+    allow_hard_link_removal: false           # optional; required to delete items with multiple hard links
 ```
 
 Rules are evaluated in order within a watch folder; **first match wins** — the first rule whose match condition fires has its actions executed, and evaluation stops for that item. A named match condition's numbered (`\\1`) and named (`\\g<name>`) captures must be valid references in all action parameters. Invalid references disable that rule and produce a visible disabled-earlier-rule warning when a later rule matches.
@@ -89,10 +91,50 @@ Copies the matched item through private destination staging, then publishes it w
 ### Delete
 
 ```yaml
-- delete: {}
+- delete:
+    mode: direct         # required: "direct" or "quarantine"
 ```
 
-Permanently deletes the matched item. No confirmation.
+Permanently deletes the matched item. Direct deletion requires `allow_direct_deletion: true` on the rule. Direct deletion of a folder verifies a stable tree fingerprint immediately before removal; an uncertain fingerprint produces a `needs-reconciliation` attempt rather than proceeding.
+
+```yaml
+rules:
+  - name: Clean up temp files
+    match:
+      field: file_name
+      pattern: '\.tmp$'
+    actions:
+      - delete:
+          mode: direct
+    allow_direct_deletion: true
+```
+
+### Quarantine
+
+```yaml
+- delete:
+    mode: quarantine
+```
+
+Recoverable removal to an Organizer-managed, attempt-specific directory under a configured quarantine root (`BoundaryPolicy.quarantine_root`). The quarantine path preserves the original relative path from the watch root and records the resulting path on the attempt.
+
+```yaml
+rules:
+  - name: Quarantine unknown files
+    match:
+      field: file_name
+      pattern: '\.unknown$'
+    actions:
+      - delete:
+          mode: quarantine
+```
+
+The quarantine root must be configured in the boundary policy. Quarantined paths are excluded from ordinary discovery and rule planning.
+
+Deletion (both modes) enforces:
+- **Fingerprint check**: the source's current fingerprint must match the planned fingerprint immediately before mutation. A mismatch enters `needs-reconciliation`.
+- **Stable-tree check for folders**: folder deletion re-verifies the tree fingerprint before removal.
+- **Hard-link removal opt-in**: files with multiple hard-link directory entries require `allow_hard_link_removal: true` on the rule. Without it, the action fails.
 
 ### Rename
 

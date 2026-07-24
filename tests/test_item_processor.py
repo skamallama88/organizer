@@ -18,6 +18,37 @@ from organizer.item_processor import (
 )
 
 
+def write_delete_direct_rules(path: Path) -> Path:
+    path.write_text(
+        """rules:
+  - name: delete
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - delete:
+          mode: direct
+    allow_direct_deletion: true
+"""
+    )
+    return path
+
+
+def write_quarantine_rules(path: Path) -> Path:
+    path.write_text(
+        """rules:
+  - name: quarantine
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - delete:
+          mode: quarantine
+"""
+    )
+    return path
+
+
 def make_request(
     watch_root: Path,
     item: Path,
@@ -32,6 +63,265 @@ def make_request(
         rules_path=rules,
         boundary_policy=policy,
     )
+
+
+def test_delete_rejects_empty_mode(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: delete
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - delete: {}
+"""
+    )
+
+    with pytest.raises(ValueError, match="mode"):
+        ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+
+def test_delete_direct_requires_opt_in(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: delete
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - delete:
+          mode: direct
+"""
+    )
+
+    with pytest.raises(ValueError, match="direct deletion"):
+        ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+
+def test_delete_quarantine_requires_quarantine_root(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_quarantine_rules(watch_root / "rules.yaml")
+
+    with pytest.raises(ValueError, match="quarantine"):
+        ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+
+def test_delete_direct_executes_with_opt_in(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_delete_direct_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    assert report.status == "completed"
+    assert not item.exists()
+
+
+def test_quarantine_moves_item_to_quarantine_root(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    quarantine_root = tmp_path / "quarantine"
+    watch_root.mkdir()
+    quarantine_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_quarantine_rules(watch_root / "rules.yaml")
+    policy = BoundaryPolicy(quarantine_root=quarantine_root)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules, policy=policy)))
+
+    assert report.status == "completed"
+    assert not item.exists()
+    attempts = processor.attempts()
+    resulting_paths = attempts[0]["resulting_paths"]
+    assert len(resulting_paths) == 1
+    quarantined = Path(resulting_paths[0])
+    assert str(quarantine_root) in str(quarantined)
+    assert quarantined.name == "movie.mkv"
+    assert quarantined.read_text() == "movie"
+
+
+def test_quarantine_preserves_relative_path(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    quarantine_root = tmp_path / "quarantine"
+    (watch_root / "subdir").mkdir(parents=True)
+    quarantine_root.mkdir()
+    item = watch_root / "subdir" / "doc.pdf"
+    item.write_text("pdf")
+    rules = write_quarantine_rules(watch_root / "rules.yaml")
+    policy = BoundaryPolicy(quarantine_root=quarantine_root)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules, policy=policy)))
+
+    assert report.status == "completed"
+    assert not item.exists()
+    attempts = processor.attempts()
+    resulting_paths = attempts[0]["resulting_paths"]
+    quarantined = Path(resulting_paths[0])
+    assert "subdir" in quarantined.parts
+    assert quarantined.name == "doc.pdf"
+
+
+def test_quarantine_with_prior_rename_preserves_original_path(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    quarantine_root = tmp_path / "quarantine"
+    watch_root.mkdir()
+    quarantine_root.mkdir()
+    item = watch_root / "old_name.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: chain
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - rename:
+          name: new_name.mkv
+      - delete:
+          mode: quarantine
+"""
+    )
+    policy = BoundaryPolicy(quarantine_root=quarantine_root)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules, policy=policy)))
+
+    assert report.status == "completed"
+    assert not (watch_root / "old_name.mkv").exists()
+    assert not (watch_root / "new_name.mkv").exists()
+    # Quarantine should use the original source path relative to watch root
+    attempts = processor.attempts()
+    resulting_paths = attempts[0]["resulting_paths"]
+    assert len(resulting_paths) == 2
+    quarantined = Path(resulting_paths[-1])
+    assert quarantined.name == "old_name.mkv"
+
+
+def test_quarantine_dry_run_reports_intended_action(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    quarantine_root = tmp_path / "quarantine"
+    watch_root.mkdir()
+    quarantine_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_quarantine_rules(watch_root / "rules.yaml")
+    policy = BoundaryPolicy(quarantine_root=quarantine_root)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    plan = processor.plan(make_request(watch_root, item, rules, policy=policy))
+    report = processor.execute(plan, ExecutionMode.DRY_RUN)
+
+    assert report.dry_run is True
+    assert report.actions[0].kind == "quarantine"
+    assert report.actions[0].result == "DRY_RUN"
+    assert item.exists()
+
+
+def test_delete_refuses_when_source_fingerprint_changes(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_delete_direct_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    item.write_text("changed")
+
+    report = processor.execute(plan)
+
+    assert report.status == "needs-reconciliation"
+    assert item.read_text() == "changed"
+
+
+def test_delete_folder_requires_stable_tree(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    folder = watch_root / "subdir"
+    folder.mkdir()
+    (folder / "file.txt").write_text("content")
+    rules = write_delete_direct_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, folder, rules))
+    (folder / "new_file.txt").write_text("new_content")
+
+    report = processor.execute(plan)
+
+    assert report.status == "needs-reconciliation"
+    assert folder.exists()
+
+
+def test_delete_hard_link_requires_opt_in(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    link_path = watch_root / "link.mkv"
+    link_path.hardlink_to(item)
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: delete
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - delete:
+          mode: direct
+    allow_direct_deletion: true
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+
+    report = processor.execute(plan)
+
+    assert report.status == "failed"
+    assert "hard-link" in report.actions[-1].detail
+    assert item.exists()
+
+
+def test_quarantine_is_excluded_from_discovery(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    quarantine_root = tmp_path / "quarantine"
+    watch_root.mkdir()
+    quarantine_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_quarantine_rules(watch_root / "rules.yaml")
+    policy = BoundaryPolicy(quarantine_root=quarantine_root)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    processor.execute(processor.plan(make_request(watch_root, item, rules, policy=policy)))
+
+    quarantined_paths = list(quarantine_root.rglob("*"))
+    assert len(quarantined_paths) > 0
+
+    # process_batch should skip quarantine paths
+    batch = processor.process_batch(
+        "downloads", quarantine_root, rules, [ItemSnapshot(path=p, size=p.stat().st_size, mtime=p.stat().st_mtime) for p in quarantined_paths if p.is_file()],
+        stability_interval=0.0, now=1000.0, boundary_policy=policy,
+    )
+    # All quarantine items should be failed or skipped, not executed
+    for result in batch.items:
+        assert result.status in ("failed", "skipped") or "outside" in result.status
 
 
 def test_plans_first_matching_move_as_immutable_preview(tmp_path: Path) -> None:
@@ -546,7 +836,9 @@ def test_action_chain_uses_primary_result_and_stops_after_failure(tmp_path: Path
           destination: ../videos
       - rename:
           name: renamed.mkv
-      - delete: {}
+      - delete:
+          mode: direct
+    allow_direct_deletion: true
 """
     )
     processor = ItemProcessor(tmp_path / "attempts.db")
@@ -573,9 +865,11 @@ def test_invalid_action_chain_is_rejected_at_planning(tmp_path: Path) -> None:
       field: file_name
       pattern: '.*'
     actions:
-      - delete: {}
+      - delete:
+          mode: direct
       - rename:
           name: renamed.mkv
+    allow_direct_deletion: true
 """
     )
 

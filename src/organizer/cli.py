@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import typer
@@ -12,7 +14,7 @@ from organizer.attempt_review import (
 )
 from organizer.config import OrganizerConfig, WatchFolderConfig, load_config
 from organizer.daemon import create_daemon
-from organizer.item_processor import ItemProcessor, ItemSnapshot, PlanRequest
+from organizer.item_processor import ItemProcessor, ItemSnapshot
 
 app = typer.Typer(no_args_is_help=True)
 review_app = typer.Typer(no_args_is_help=True)
@@ -61,20 +63,58 @@ def check(
 @app.command()
 def run(
     config_path: Path = Path("/config/organizer.yaml"),
-    attempts_path: Path = Path("/config/organizer.db"),
 ) -> None:
     """Start Organizer's web server, filesystem watcher, and periodic scanner."""
-    config = load_config(config_path)
-    processor = ItemProcessor(attempts_path=attempts_path)
-    daemon = create_daemon(config, processor)
-    daemon.start()
-    try:
-        import uvicorn
-        from organizer.web import create_app
+    import asyncio
+    import logging
 
-        uvicorn.run(create_app(processor, watch_folders=config.watches, db_path=attempts_path), host="127.0.0.1", port=8000)
-    finally:
-        daemon.stop()
+    import uvicorn
+    from organizer.operational_health import OperationalHealth
+    from organizer.runtime import RuntimeSettings, log_startup_diagnostics
+    from organizer.structured_log import LogLevel, MemoryLogSink, RotatingFileLogSink, StdoutLogSink, StructuredLogger
+    from organizer.web import create_app
+
+    config = load_config(config_path)
+
+    log_level = LogLevel(config.log_level)
+    log_sink = MemoryLogSink(limit=1000)
+    logger = StructuredLogger(
+        sinks=[
+            StdoutLogSink(),
+            RotatingFileLogSink(config.log_path, retention_days=config.retention_days),
+            log_sink,
+        ],
+        level=log_level,
+    )
+    health_checker = OperationalHealth()
+    processor = ItemProcessor(
+        attempts_path=config.database_path,
+        logger=logger,
+        health_checker=health_checker,
+    )
+    daemon = create_daemon(config, processor)
+    app = create_app(
+        processor,
+        log_sink=log_sink,
+        health_checker=health_checker,
+        watch_folders=config.watches,
+        db_path=config.database_path,
+    )
+    settings = RuntimeSettings.from_environment()
+    log_startup_diagnostics(settings, logging.getLogger("organizer"))
+
+    async def _run_server() -> None:
+        daemon.start()
+        server = uvicorn.Server(uvicorn.Config(app, host=settings.host, port=settings.port))
+        try:
+            await server.serve()
+        finally:
+            await daemon.stop_async()
+
+    try:
+        asyncio.run(_run_server())
+    except KeyboardInterrupt:
+        pass
 
 
 @review_app.command("list")

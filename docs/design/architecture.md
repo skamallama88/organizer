@@ -403,9 +403,14 @@ the Tracking DB, and logs under `/config`, separately from watched content under
 error if neither `unrar` nor `unar` is available, and affected RAR inputs remain
 available for review.
 
-The standalone web process binds to `127.0.0.1:8000` by default. The container binds
-to `0.0.0.0:8000` so Docker forwarding works; the supplied Compose configuration
-publishes it only on the host's loopback interface. `ORGANIZER_HOST` and
-`ORGANIZER_PORT` may override the container bind for a trusted deployment boundary.
-Any non-loopback host emits a prominent warning because the administrative UI is
-unauthenticated.
+The production daemon (`organizer run`) starts the web server, filesystem watcher,
+and periodic scanner as one process. The container binds to `0.0.0.0:8000` so Docker
+forwarding works; the supplied Compose configuration publishes it only on the host's
+loopback interface. `ORGANIZER_HOST` and `ORGANIZER_PORT` may override the container
+bind for a trusted deployment boundary. Any non-loopback host emits a prominent
+warning because the administrative UI is unauthenticated.
+
+The web server and background services share a single `ItemProcessor`, database
+connection, health checker, structured logger, and log sinks. `organizer run`
+creates these shared components once and passes them to both the daemon and the
+web application.

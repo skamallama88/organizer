@@ -19,4 +19,4 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 VOLUME ["/config", "/data"]
 EXPOSE 8000
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["organizer-web"]
+CMD ["organizer", "run"]

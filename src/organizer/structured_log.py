@@ -16,6 +16,10 @@ class LogLevel(StrEnum):
     ERROR = "ERROR"
     DRYRUN = "DRYRUN"
 
+    @property
+    def priority(self) -> int:
+        return {"INFO": 0, "WARN": 1, "ERROR": 2, "DRYRUN": -1}[self.value]
+
 
 class LogResult(StrEnum):
     OK = "OK"
@@ -172,9 +176,11 @@ class RotatingFileLogSink:
 
 
 class StructuredLogger:
-    def __init__(self, sinks: Sequence[LogSink] = ()) -> None:
+    def __init__(self, sinks: Sequence[LogSink] = (), level: LogLevel = LogLevel.INFO) -> None:
         self._sinks = list(sinks)
+        self._level = level
 
     def log(self, entry: LogEntry) -> None:
-        for sink in self._sinks:
-            sink.write(entry)
+        if entry.level.priority >= self._level.priority:
+            for sink in self._sinks:
+                sink.write(entry)

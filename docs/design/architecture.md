@@ -201,10 +201,11 @@ The attempt state transitions are:
 ```text
 started -> completed
         -> failed
-        -> needs-reconciliation
+        -> needs-reconciliation -> abandoned
+                                -> accepted (via accepted action results)
 ```
 
-`completed` means every planned action succeeded and resulting paths were recorded. `failed` means the attempt requires explicit retry or review. `needs-reconciliation` means filesystem effects may exist but completion cannot be established safely.
+`completed` means every planned action succeeded and resulting paths were recorded. `failed` means the attempt requires explicit retry or review. `needs-reconciliation` means filesystem effects may exist but completion cannot be established safely. `abandoned` is a terminal state created by explicit administrator action with a recorded reason and a suppression; reopening creates a fresh plan while preserving history. Accepted action results are immutable records of administrator-confirmed resulting paths for uncertain actions during reconciliation.
 
 A password-protected archive is a known input failure, not a process-wide failure. Organizer records a `password_protected_archive` failure for that item, leaves the archive in place, exposes it for review, and continues processing other discovered items.
 

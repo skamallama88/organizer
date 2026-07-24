@@ -533,6 +533,19 @@ class ItemProcessor:
                     connection.execute(f"ALTER TABLE processing_attempts ADD COLUMN {col} TEXT")
                 except sqlite3.OperationalError:
                     pass
+            for col_sql in (
+                "planned_actions TEXT NOT NULL DEFAULT '[]'",
+                "source_size INTEGER NOT NULL DEFAULT 0",
+                "source_mtime REAL NOT NULL DEFAULT 0.0",
+                "started_at TEXT NOT NULL DEFAULT ''",
+                "completed_at TEXT NOT NULL DEFAULT ''",
+                "accepted_results TEXT NOT NULL DEFAULT '[]'",
+                "abandoned_reason TEXT NOT NULL DEFAULT ''",
+            ):
+                try:
+                    connection.execute(f"ALTER TABLE processing_attempts ADD COLUMN {col_sql}")
+                except sqlite3.OperationalError:
+                    pass
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS processing_leases (
                 watch_id TEXT NOT NULL,
@@ -566,10 +579,12 @@ class ItemProcessor:
             )
 
     def _start_attempt(self, attempt_id: str, plan: Plan, retry_of_attempt_id: str | None = None) -> None:
+        planned_actions = json.dumps([{"kind": action.kind, "target": str(action.target)} for action in plan.actions])
+        started_at = str(time.time())
         with sqlite3.connect(self._attempts_path) as connection:
             connection.execute(
-                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance, source_fingerprint, retry_of_attempt_id, processing_lineage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None, plan.source_fingerprint, retry_of_attempt_id, json.dumps(list(plan.processing_lineage))),
+                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance, source_fingerprint, retry_of_attempt_id, processing_lineage, planned_actions, source_size, source_mtime, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None, plan.source_fingerprint, retry_of_attempt_id, json.dumps(list(plan.processing_lineage)), planned_actions, plan.source_size, plan.source_mtime, started_at),
             )
 
     def _finish_attempt(self, attempt_id: str, status: str, results: list[ActionResult], processing_lineage: tuple[str, ...] = ()) -> None:
@@ -577,10 +592,11 @@ class ItemProcessor:
         provenance = next((json.dumps({"source": str(result.source), "result": str(result.resulting_path)}) for result in results if result.kind == "copy" and result.result == "OK"), None)
         action_results = json.dumps([{"kind": result.kind, "target": str(result.target), "result": result.result, "detail": result.detail, "source": str(result.source) if result.source else None, "resulting_path": str(result.resulting_path) if result.resulting_path else None} for result in results])
         failure_detail = results[-1].detail if status == "failed" and results else ""
+        completed_at = str(time.time())
         with sqlite3.connect(self._attempts_path) as connection:
             connection.execute(
-                "UPDATE processing_attempts SET status = ?, resulting_paths = ?, copy_provenance = ?, action_results = ?, failure_detail = ?, processing_lineage = ? WHERE attempt_id = ?",
-                (status, json.dumps(paths), provenance, action_results, failure_detail, json.dumps(list(processing_lineage)), attempt_id),
+                "UPDATE processing_attempts SET status = ?, resulting_paths = ?, copy_provenance = ?, action_results = ?, failure_detail = ?, processing_lineage = ?, completed_at = ? WHERE attempt_id = ?",
+                (status, json.dumps(paths), provenance, action_results, failure_detail, json.dumps(list(processing_lineage)), completed_at, attempt_id),
             )
 
     def _emit(self, plan: Plan, result: ActionResult) -> None:
@@ -1178,8 +1194,8 @@ class ItemProcessor:
                     self._create_suppression(watch_id, canonical, fingerprint, attempt_id, "collision")
                     with sqlite3.connect(self._attempts_path) as connection:
                         connection.execute(
-                            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, action_results, source_fingerprint, failure_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (attempt_id, watch_id, str(canonical), "unknown", "failed", "[]", "[]", fingerprint, str(error)),
+                            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, action_results, source_fingerprint, failure_detail, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (attempt_id, watch_id, str(canonical), "unknown", "failed", "[]", "[]", fingerprint, str(error), str(time.time())),
                         )
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
             except OSError as error:

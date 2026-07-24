@@ -3,13 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-import pytest
-
-from organizer.operational_health import (
-    OperationalHealth,
-    PersistenceHealth,
-    WatchFolderHealth,
-)
+from organizer.operational_health import OperationalHealth
 
 
 def test_watch_folder_health_is_accessible_when_root_exists(tmp_path: Path) -> None:

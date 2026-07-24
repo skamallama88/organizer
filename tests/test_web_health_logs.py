@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from organizer.item_processor import ItemProcessor
 from organizer.operational_health import OperationalHealth
 from organizer.structured_log import LogEntry, LogLevel, LogResult, MemoryLogSink, StructuredLogger
-from organizer.web import create_app
+from organizer.web import WatchFolderConfig, create_app
 
 
 def test_logs_endpoint_returns_recent_entries(tmp_path: Path) -> None:
@@ -135,7 +135,7 @@ def test_health_endpoint_returns_overall_status(tmp_path: Path) -> None:
     app = create_app(
         processor,
         health_checker=health_checker,
-        watch_folders=[("downloads", watch_root)],
+        watch_folders=[WatchFolderConfig("downloads", watch_root, watch_root / "rules.yaml")],
         db_path=db_path,
     )
     client = TestClient(app)
@@ -161,7 +161,10 @@ def test_health_endpoint_reports_unhealthy_watch_folder(tmp_path: Path) -> None:
     app = create_app(
         processor,
         health_checker=health_checker,
-        watch_folders=[("downloads", watch_root), ("broken", broken_root)],
+        watch_folders=[
+            WatchFolderConfig("downloads", watch_root, watch_root / "rules.yaml"),
+            WatchFolderConfig("broken", broken_root, broken_root / "rules.yaml"),
+        ],
         db_path=db_path,
     )
     client = TestClient(app)
@@ -184,7 +187,7 @@ def test_health_endpoint_reports_unhealthy_persistence(tmp_path: Path) -> None:
     app = create_app(
         processor,
         health_checker=health_checker,
-        watch_folders=[("downloads", watch_root)],
+        watch_folders=[WatchFolderConfig("downloads", watch_root, watch_root / "rules.yaml")],
         db_path=db_path,
     )
     client = TestClient(app)

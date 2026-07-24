@@ -93,12 +93,16 @@ def review_accept(
     attempt_id: str,
     action_index: int,
     resulting_path: str,
+    watch_root: Path,
     attempts_path: Path = Path("/config/organizer.db"),
 ) -> None:
     """Accept an uncertain action result during reconciliation."""
     processor = ItemProcessor(attempts_path=attempts_path)
     review = AttemptReview(processor)
-    result = review.command(attempt_id, Accept(action_index=action_index, resulting_path=resulting_path))
+    result = review.command(
+        attempt_id,
+        Accept(action_index=action_index, resulting_path=resulting_path, watch_root=watch_root),
+    )
     typer.echo(f"Accepted: {result.detail}")
 
 

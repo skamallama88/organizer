@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import sys
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
+from pathlib import Path
 from typing import IO, Protocol, Sequence
 
 
@@ -105,6 +107,68 @@ class StdoutLogSink:
 
     def write(self, entry: LogEntry) -> None:
         self._stream.write(entry.format_line() + "\n")
+
+
+class RotatingFileLogSink:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        max_size: int = 10 * 1024 * 1024,
+        retention_days: int = 7,
+        max_backup_files: int = 10,
+    ) -> None:
+        self._path = path
+        self._max_size = max_size
+        self._retention_days = retention_days
+        self._max_backup_files = max_backup_files
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._cleanup_old_files()
+
+    def _backup_files(self) -> list[Path]:
+        if not self._path.parent.exists():
+            return []
+        return sorted(
+            p for p in self._path.parent.iterdir()
+            if p != self._path and p.name.startswith(self._path.name)
+        )
+
+    def _cleanup_old_files(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self._retention_days)
+        backups = self._backup_files()
+        for backup in backups:
+            try:
+                mtime = datetime.fromtimestamp(backup.stat().st_mtime, tz=timezone.utc)
+                if mtime < cutoff:
+                    backup.unlink()
+            except OSError:
+                pass
+        backups = self._backup_files()
+        while len(backups) > self._max_backup_files:
+            try:
+                backups.pop(0).unlink()
+            except OSError:
+                break
+
+    def _rotate(self) -> None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        backup = self._path.parent / f"{self._path.name}.{timestamp}"
+        try:
+            self._path.rename(backup)
+        except OSError:
+            pass
+        self._cleanup_old_files()
+
+    def write(self, entry: LogEntry) -> None:
+        line = entry.format_line() + "\n"
+        encoded = line.encode("utf-8")
+        current_size = self._path.stat().st_size if self._path.exists() else 0
+        if current_size + len(encoded) > self._max_size:
+            self._rotate()
+        with self._path.open("a", encoding="utf-8") as stream:
+            stream.write(line)
+            stream.flush()
+            os.fsync(stream.fileno())
 
 
 class StructuredLogger:

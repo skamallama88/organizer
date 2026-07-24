@@ -63,6 +63,8 @@ class CommandResult:
 class Accept:
     action_index: int
     resulting_path: str
+    watch_root: Path
+    boundary_policy: BoundaryPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -179,10 +181,44 @@ class AttemptReview:
         for existing in details.accepted_results:
             if existing.get("action_index") == command.action_index:
                 raise ValueError(f"action {command.action_index} already accepted")
+        planned_actions = list(details.planned_actions)
+        action_results = list(details.action_results)
+        planned_action = planned_actions[command.action_index]
+        action_result = action_results[command.action_index]
+        planned_target = self._processor._canonical_path(Path(str(planned_action.get("target", ""))))
+        submitted_path = self._processor._canonical_path(Path(command.resulting_path))
+        if submitted_path != planned_target:
+            raise ValueError(f"unexpected resulting path: {command.resulting_path}")
+        policy = command.boundary_policy or BoundaryPolicy()
+        self._validate_accepted_path_boundaries(submitted_path, policy)
+        is_delete = str(planned_action.get("kind", "")) == "delete"
+        if is_delete:
+            if submitted_path.exists():
+                raise ValueError(f"delete result path must not exist: {command.resulting_path}")
+            fingerprint = ""
+        else:
+            if not submitted_path.exists():
+                raise ValueError(f"resulting path does not exist: {command.resulting_path}")
+            if submitted_path.is_symlink():
+                raise ValueError(f"resulting path is a symlink: {command.resulting_path}")
+            fingerprint = self._processor._fingerprint(submitted_path)
+            if str(planned_action.get("kind", "")) in ("move", "copy", "rename"):
+                source_path_str = str(action_result.get("source") or "")
+                if source_path_str:
+                    source_path = self._processor._canonical_path(Path(source_path_str))
+                    if source_path.exists() and not source_path.is_symlink():
+                        expected_fingerprint = self._processor._fingerprint(source_path)
+                    else:
+                        expected_fingerprint = details.source_fingerprint if command.action_index == 0 else ""
+                else:
+                    expected_fingerprint = details.source_fingerprint if command.action_index == 0 else ""
+                if expected_fingerprint and fingerprint != expected_fingerprint:
+                    raise ValueError("fingerprint mismatch: resulting path does not match expected identity")
         accepted_entry: dict[str, object] = {
             "action_index": command.action_index,
             "resulting_path": command.resulting_path,
             "accepted_at": str(time.time()),
+            "fingerprint": fingerprint,
         }
         new_accepted = list(details.accepted_results) + [accepted_entry]
         with sqlite3.connect(self._attempts_path) as connection:
@@ -196,6 +232,20 @@ class AttemptReview:
             status=details.status,
             detail=f"accepted action {command.action_index} resulting path: {command.resulting_path}",
         )
+
+    def _validate_accepted_path_boundaries(self, path: Path, policy: BoundaryPolicy) -> None:
+        if policy.config_root and self._processor._is_within(path, self._processor._canonical_path(policy.config_root)):
+            raise ValueError("accepted path is within the config volume")
+        if policy.data_roots and not any(
+            self._processor._is_within(path, self._processor._canonical_path(root))
+            for root in policy.data_roots
+        ):
+            raise ValueError("accepted path is outside data volumes")
+        if policy.allowed_destinations and not any(
+            self._processor._is_within(path, self._processor._canonical_path(root))
+            for root in policy.allowed_destinations
+        ):
+            raise ValueError("accepted path is outside allowed destination roots")
 
     def _abandon(self, attempt_id: str, command: Abandon) -> CommandResult:
         details = self.inspect(attempt_id)
@@ -224,7 +274,6 @@ class AttemptReview:
         if details.status != "abandoned":
             raise ValueError(f"attempt {attempt_id} is not abandoned: {details.status}")
         source = self._processor._canonical_path(Path(details.source_path))
-        self._processor.clear_suppression(details.watch_id, source, details.source_fingerprint)
         request = PlanRequest(
             watch_id=details.watch_id,
             watch_root=self._processor._canonical_path(command.watch_root),
@@ -233,7 +282,9 @@ class AttemptReview:
             boundary_policy=command.boundary_policy,
         )
         plan = self._processor.plan(request)
-        self._processor.execute(plan, retry_of_attempt_id=attempt_id)
+        report = self._processor.execute(plan, retry_of_attempt_id=attempt_id)
+        if report.status == "completed":
+            self._processor.clear_suppression(details.watch_id, source, details.source_fingerprint)
         with sqlite3.connect(self._attempts_path) as connection:
             row = connection.execute(
                 "SELECT attempt_id FROM processing_attempts WHERE retry_of_attempt_id = ? ORDER BY started_at DESC LIMIT 1",
@@ -253,7 +304,6 @@ class AttemptReview:
         if details.status not in ("failed", "needs-reconciliation"):
             raise ValueError(f"attempt {attempt_id} is not retryable: {details.status}")
         source = self._processor._canonical_path(Path(details.source_path))
-        self._processor.clear_suppression(details.watch_id, source, details.source_fingerprint)
         request = PlanRequest(
             watch_id=details.watch_id,
             watch_root=self._processor._canonical_path(command.watch_root),
@@ -262,7 +312,9 @@ class AttemptReview:
             boundary_policy=command.boundary_policy,
         )
         plan = self._processor.plan(request)
-        self._processor.execute(plan, retry_of_attempt_id=attempt_id)
+        report = self._processor.execute(plan, retry_of_attempt_id=attempt_id)
+        if report.status == "completed":
+            self._processor.clear_suppression(details.watch_id, source, details.source_fingerprint)
         with sqlite3.connect(self._attempts_path) as connection:
             row = connection.execute(
                 "SELECT attempt_id FROM processing_attempts WHERE retry_of_attempt_id = ? ORDER BY started_at DESC LIMIT 1",

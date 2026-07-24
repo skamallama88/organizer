@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import io
-from datetime import datetime, timezone
+from pathlib import Path
 
 from organizer.structured_log import (
     LogEntry,
     LogLevel,
     LogResult,
     MemoryLogSink,
+    RotatingFileLogSink,
     StdoutLogSink,
     StructuredLogger,
 )
@@ -230,3 +231,63 @@ def test_dry_run_log_level_is_dedicated() -> None:
 
     assert entry.level == LogLevel.DRYRUN
     assert entry.result == LogResult.DRY_RUN
+
+
+def test_rotating_file_sink_creates_log_file(tmp_path: Path) -> None:
+    path = tmp_path / "organizer.log"
+    sink = RotatingFileLogSink(path)
+    entry = LogEntry.create(
+        level=LogLevel.INFO,
+        watch="downloads",
+        rule="videos",
+        action="move",
+        item="/data/downloads/movie.mkv",
+        result=LogResult.OK,
+    )
+
+    sink.write(entry)
+
+    assert path.exists()
+    assert "downloads" in path.read_text()
+
+
+def test_rotating_file_sink_rotates_when_size_exceeded(tmp_path: Path) -> None:
+    path = tmp_path / "organizer.log"
+    sink = RotatingFileLogSink(path, max_size=1)
+    entry = LogEntry.create(
+        level=LogLevel.INFO,
+        watch="downloads",
+        rule="videos",
+        action="move",
+        item="/data/downloads/movie.mkv",
+        result=LogResult.OK,
+    )
+
+    sink.write(entry)
+    sink.write(entry)
+
+    assert path.exists()
+    backups = list(tmp_path.glob("organizer.log.*"))
+    assert len(backups) >= 1
+
+
+def test_rotating_file_sink_removes_old_backups(tmp_path: Path) -> None:
+    path = tmp_path / "organizer.log"
+    backup = tmp_path / "organizer.log.old"
+    backup.write_text("old")
+    old_mtime = 1.0
+    import os
+    os.utime(backup, (old_mtime, old_mtime))
+
+    sink = RotatingFileLogSink(path, retention_days=1)
+    entry = LogEntry.create(
+        level=LogLevel.INFO,
+        watch="downloads",
+        rule="videos",
+        action="move",
+        item="/data/downloads/movie.mkv",
+        result=LogResult.OK,
+    )
+    sink.write(entry)
+
+    assert not backup.exists()

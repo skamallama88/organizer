@@ -1,16 +1,17 @@
 from pathlib import Path
+import errno
 import hashlib
 import os
 import sqlite3
 import zipfile
 import py7zr
-import rarfile
+import rarfile  # type: ignore[import-untyped]
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from organizer.cli import app
-from organizer.web import create_app
+from organizer.web import WatchFolderConfig, create_app
 import pytest
 
 from organizer.item_processor import (
@@ -67,6 +68,12 @@ def make_request(
         rules_path=rules,
         boundary_policy=policy,
     )
+
+
+def _resulting_paths(attempts: list[dict[str, object]], index: int = 0) -> list[str]:
+    from typing import cast
+
+    return cast(list[str], attempts[index]["resulting_paths"])
 
 
 def test_delete_rejects_empty_mode(tmp_path: Path) -> None:
@@ -153,7 +160,7 @@ def test_quarantine_moves_item_to_quarantine_root(tmp_path: Path) -> None:
     assert report.status == "completed"
     assert not item.exists()
     attempts = processor.attempts()
-    resulting_paths = attempts[0]["resulting_paths"]
+    resulting_paths = _resulting_paths(attempts)
     assert len(resulting_paths) == 1
     quarantined = Path(resulting_paths[0])
     assert str(quarantine_root) in str(quarantined)
@@ -177,7 +184,7 @@ def test_quarantine_preserves_relative_path(tmp_path: Path) -> None:
     assert report.status == "completed"
     assert not item.exists()
     attempts = processor.attempts()
-    resulting_paths = attempts[0]["resulting_paths"]
+    resulting_paths = _resulting_paths(attempts)
     quarantined = Path(resulting_paths[0])
     assert "subdir" in quarantined.parts
     assert quarantined.name == "doc.pdf"
@@ -214,7 +221,7 @@ def test_quarantine_with_prior_rename_preserves_original_path(tmp_path: Path) ->
     assert not (watch_root / "new_name.mkv").exists()
     # Quarantine should use the original source path relative to watch root
     attempts = processor.attempts()
-    resulting_paths = attempts[0]["resulting_paths"]
+    resulting_paths = _resulting_paths(attempts)
     assert len(resulting_paths) == 2
     quarantined = Path(resulting_paths[-1])
     assert quarantined.name == "old_name.mkv"
@@ -460,6 +467,106 @@ def test_move_never_overwrites_destination_created_after_preflight(tmp_path: Pat
 
     assert report.status == "failed"
     assert target.read_text() == "existing"
+    assert item.read_text() == "source"
+
+
+def test_cross_filesystem_move_uses_staged_copy_and_removes_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("source")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    target = destination / item.name
+    original_link = os.link
+    cross_device_calls = 0
+
+    def raise_cross_device_once(source: str | Path, destination_path: str | Path, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None, follow_symlinks: bool = True) -> None:
+        nonlocal cross_device_calls
+        cross_device_calls += 1
+        if cross_device_calls == 1:
+            raise OSError(errno.EXDEV, "cross-device link")
+        original_link(source, destination_path, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "link", raise_cross_device_once)
+
+    report = processor.execute(plan)
+
+    assert report.status == "completed"
+    assert target.read_text() == "source"
+    assert not item.exists()
+    assert not list(destination.glob(".organizer-staging-*"))
+
+
+def test_cross_filesystem_move_never_overwrites_destination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("source")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    target = destination / item.name
+    target.write_text("existing")
+    original_link = os.link
+    cross_device_calls = 0
+
+    def raise_cross_device_once(source: str | Path, destination_path: str | Path, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None, follow_symlinks: bool = True) -> None:
+        nonlocal cross_device_calls
+        cross_device_calls += 1
+        if cross_device_calls == 1:
+            raise OSError(errno.EXDEV, "cross-device link")
+        original_link(source, destination_path, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "link", raise_cross_device_once)
+
+    report = processor.execute(plan)
+
+    assert report.status == "failed"
+    assert target.read_text() == "existing"
+    assert item.read_text() == "source"
+    assert not list(destination.glob(".organizer-staging-*"))
+
+
+def test_cross_filesystem_move_retains_both_paths_when_source_removal_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("source")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(attempts_path=tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    target = destination / item.name
+    original_link = os.link
+    original_unlink = os.unlink
+    cross_device_calls = 0
+
+    def raise_cross_device_once(source: str | Path, destination_path: str | Path, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None, follow_symlinks: bool = True) -> None:
+        nonlocal cross_device_calls
+        cross_device_calls += 1
+        if cross_device_calls == 1:
+            raise OSError(errno.EXDEV, "cross-device link")
+        original_link(source, destination_path, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks)
+
+    def fail_source_unlink(path: str | Path, *, dir_fd: int | None = None) -> None:
+        if Path(path) == item:
+            raise OSError(errno.EPERM, "permission denied")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "link", raise_cross_device_once)
+    monkeypatch.setattr(os, "unlink", fail_source_unlink)
+
+    report = processor.execute(plan)
+
+    assert report.status == "needs-reconciliation"
+    assert target.read_text() == "source"
     assert item.read_text() == "source"
 
 
@@ -1019,6 +1126,34 @@ def test_archive_creates_named_file_and_records_result(tmp_path: Path) -> None:
     assert processor.attempts()[0]["resulting_paths"] == [str(archive)]
 
 
+def test_zip_archive_preserves_empty_directories_and_symlinks(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "season"
+    item.mkdir()
+    (item / "episode.txt").write_text("episode")
+    empty = item / "empty"
+    empty.mkdir()
+    (item / "link").symlink_to("episode.txt")
+    rules = write_archive_rules(watch_root / "rules.yaml", "../archives", preserve_original=False)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    archive = destination / "season.zip"
+    assert report.status == "completed"
+    assert not item.exists()
+    assert archive.exists()
+    with zipfile.ZipFile(archive, "r") as zip_file:
+        names = zip_file.namelist()
+        assert "empty/" in names
+        assert "link" in names
+        link_info = zip_file.getinfo("link")
+        assert (link_info.external_attr >> 16) & 0o170000 == 0o120000
+
+
 def test_archive_folders_and_removes_original_when_not_preserved(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     destination = tmp_path / "archives"
@@ -1050,6 +1185,26 @@ def test_archive_rejects_destination_collision(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="collision"):
         ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+
+def test_archive_output_name_strips_only_recognized_suffix_once(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    watch_root.mkdir()
+    destination.mkdir()
+    item_zip = watch_root / "backup.ZIP"
+    item_zip.write_text("zip")
+    item_tar_gz = watch_root / "bundle.tar.gz"
+    item_tar_gz.write_text("tar.gz")
+    rules_zip = write_archive_rules(watch_root / "rules_zip.yaml", "../archives")
+    rules_tgz = write_archive_rules(watch_root / "rules_tgz.yaml", "../archives")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    plan_zip = processor.plan(make_request(watch_root, item_zip, rules_zip))
+    plan_tgz = processor.plan(make_request(watch_root, item_tar_gz, rules_tgz))
+
+    assert plan_zip.actions[0].target == destination / "backup.zip"
+    assert plan_tgz.actions[0].target == destination / "bundle.tar.gz.zip"
 
 
 def test_archive_creates_7z_and_preserves_original(tmp_path: Path) -> None:
@@ -1241,15 +1396,26 @@ def test_unarchive_rejects_zip_symlink_entry(tmp_path: Path) -> None:
 
 def test_ui_rule_save_uses_compare_and_swap_revision(tmp_path: Path) -> None:
     processor = ItemProcessor(tmp_path / "attempts.db")
-    client = TestClient(create_app(processor))
     rules = tmp_path / "rules.yaml"
     rules.write_text("rules: []\n")
     revision = hashlib.sha256(rules.read_bytes()).hexdigest()
+    client = TestClient(create_app(
+        processor,
+        watch_folders=[WatchFolderConfig("downloads", tmp_path, rules)],
+    ))
 
     response = client.put(
         "/watches/downloads/rules",
-        params={"rules_path": rules, "expected_revision": revision},
-        content="rules:\n  - name: videos\n",
+        params={"expected_revision": revision},
+        content="""rules:
+  - name: videos
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move:
+          destination: ../videos
+""",
     )
 
     assert response.status_code == 200
@@ -1257,11 +1423,51 @@ def test_ui_rule_save_uses_compare_and_swap_revision(tmp_path: Path) -> None:
 
     conflict = client.put(
         "/watches/downloads/rules",
-        params={"rules_path": rules, "expected_revision": revision},
+        params={"expected_revision": revision},
         content="rules: []\n",
     )
 
     assert conflict.status_code == 409
+
+
+def test_ui_rule_save_rejects_invalid_rules(tmp_path: Path) -> None:
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("rules: []\n")
+    revision = hashlib.sha256(rules.read_bytes()).hexdigest()
+    client = TestClient(create_app(
+        processor,
+        watch_folders=[WatchFolderConfig("downloads", tmp_path, rules)],
+    ))
+
+    response = client.put(
+        "/watches/downloads/rules",
+        params={"expected_revision": revision},
+        content="rules:\n  - name: videos\n",
+    )
+
+    assert response.status_code == 422
+    assert rules.read_text() == "rules: []\n"
+
+
+def test_ui_rule_save_rejects_unknown_watch_id(tmp_path: Path) -> None:
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("rules: []\n")
+    revision = hashlib.sha256(rules.read_bytes()).hexdigest()
+    client = TestClient(create_app(
+        processor,
+        watch_folders=[WatchFolderConfig("downloads", tmp_path, rules)],
+    ))
+
+    response = client.put(
+        "/watches/other/rules",
+        params={"expected_revision": revision},
+        content="rules: []\n",
+    )
+
+    assert response.status_code == 404
+    assert rules.read_text() == "rules: []\n"
 
 
 def test_acquire_lease_succeeds_for_new_source_identity(tmp_path: Path) -> None:
@@ -1978,6 +2184,26 @@ def test_nested_extraction_with_zero_depth_does_not_extract_inner_archives(tmp_p
     assert report.status == "completed"
     assert (watch_root / "outer" / "inner.zip").exists()
     assert not (watch_root / "outer" / "inner").is_dir()
+
+
+def test_nested_extraction_fails_when_extraction_root_already_exists(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    inner_zip = tmp_path / "inner.zip"
+    make_zip(inner_zip, {"file.txt": "content"})
+    outer_zip = watch_root / "outer.zip"
+    with zipfile.ZipFile(outer_zip, "w") as archive:
+        archive.writestr("inner/placeholder.txt", "placeholder")
+        archive.write(inner_zip, "inner.zip")
+    rules = write_unarchive_rules(watch_root / "rules.yaml", max_depth=1)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, outer_zip, rules)))
+
+    assert report.status == "failed"
+    assert "collision" in report.actions[-1].detail.lower()
+    assert not (watch_root / "outer").exists()
+    assert outer_zip.exists()
 
 
 def test_cross_watch_handoff_records_processing_lineage_in_attempt(tmp_path: Path) -> None:

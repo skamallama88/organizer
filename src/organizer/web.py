@@ -1,6 +1,9 @@
+from dataclasses import dataclass
 from pathlib import Path
 import hashlib
 import json
+import os
+import uuid
 import yaml
 
 from fastapi import Body, FastAPI
@@ -14,9 +17,17 @@ from organizer.attempt_review import (
     Reopen,
     RetryFromStart,
 )
-from organizer.item_processor import ExecutionMode, ItemProcessor, PlanRequest
+from organizer.item_processor import BoundaryPolicy, ExecutionMode, ItemProcessor, PlanRequest
 from organizer.operational_health import OperationalHealth
 from organizer.structured_log import LogLevel, MemoryLogSink
+
+
+@dataclass(frozen=True)
+class WatchFolderConfig:
+    watch_id: str
+    watch_root: Path
+    rules_path: Path
+    boundary_policy: BoundaryPolicy | None = None
 
 
 def create_app(
@@ -24,11 +35,19 @@ def create_app(
     *,
     log_sink: MemoryLogSink | None = None,
     health_checker: OperationalHealth | None = None,
-    watch_folders: list[tuple[str, Path]] | None = None,
+    watch_folders: list[WatchFolderConfig] | None = None,
     db_path: Path | None = None,
 ) -> FastAPI:
     app = FastAPI()
     review = AttemptReview(processor)
+
+    def _watch_config(watch_id: str) -> WatchFolderConfig | None:
+        if watch_folders is None:
+            return None
+        for config in watch_folders:
+            if config.watch_id == watch_id:
+                return config
+        return None
 
     @app.get("/watches/{watch_id}/dry-run", response_class=HTMLResponse)
     def dry_run(watch_id: str, watch_root: Path, item: Path, rules_path: Path) -> str:
@@ -41,18 +60,39 @@ def create_app(
 
     @app.put("/watches/{watch_id}/rules", response_model=None)
     def save_rules(
-        watch_id: str, rules_path: Path, expected_revision: str, body: bytes = Body(...)
+        watch_id: str, expected_revision: str, body: bytes = Body(...)
     ) -> dict[str, str] | JSONResponse:
+        config = _watch_config(watch_id)
+        if config is None:
+            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
+        rules_path = config.rules_path
+        try:
+            processor._resolve_destination(rules_path)
+        except ValueError as error:
+            return JSONResponse(status_code=500, content={"detail": f"unsafe rules path: {error}"})
         loaded = yaml.safe_load(body) or {}
         if not isinstance(loaded, dict) or not isinstance(loaded.get("rules", []), list):
             return JSONResponse(status_code=422, content={"detail": "invalid rules document"})
-        current_revision = hashlib.sha256(rules_path.read_bytes()).hexdigest()
-        if current_revision != expected_revision:
-            return JSONResponse(
-                status_code=409,
-                content={"detail": "ruleset revision conflict", "revision": current_revision},
-            )
-        rules_path.write_bytes(body)
+        temp_path = rules_path.with_suffix(f"{rules_path.suffix}.tmp-{uuid.uuid4().hex}")
+        try:
+            temp_path.write_bytes(body)
+            diagnostics = processor.validate_rules_document(temp_path)
+            if diagnostics:
+                return JSONResponse(status_code=422, content={"detail": "; ".join(diagnostics)})
+            try:
+                current_revision = hashlib.sha256(rules_path.read_bytes()).hexdigest()
+            except OSError as error:
+                return JSONResponse(status_code=500, content={"detail": f"cannot read current rules: {error}"})
+            if current_revision != expected_revision:
+                return JSONResponse(
+                    status_code=409,
+                    content={"detail": "ruleset revision conflict", "revision": current_revision},
+                )
+            rules_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(temp_path, rules_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
         return {"watch_id": watch_id, "revision": hashlib.sha256(body).hexdigest()}
 
     @app.get("/attempts", response_model=None)
@@ -111,7 +151,22 @@ def create_app(
         except (json.JSONDecodeError, KeyError, ValueError) as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
         try:
-            result = review.command(attempt_id, Accept(action_index=action_index, resulting_path=resulting_path))
+            details = review.inspect(attempt_id)
+        except ValueError as error:
+            return JSONResponse(status_code=404, content={"detail": str(error)})
+        config = _watch_config(details.watch_id)
+        if config is None:
+            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
+        try:
+            result = review.command(
+                attempt_id,
+                Accept(
+                    action_index=action_index,
+                    resulting_path=resulting_path,
+                    watch_root=config.watch_root,
+                    boundary_policy=config.boundary_policy,
+                ),
+            )
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
         return {"success": result.success, "attempt_id": result.attempt_id, "status": result.status, "detail": result.detail}
@@ -201,7 +256,8 @@ def create_app(
                 "watch_folder_healths": [],
                 "persistence_health": {"tracking_db_writable": True, "detail": ""},
             }
-        overall = health_checker.check_all(watch_folders=watch_folders, db_path=db_path)
+        folder_tuples = [(config.watch_id, config.watch_root) for config in watch_folders]
+        overall = health_checker.check_all(watch_folders=folder_tuples, db_path=db_path)
         return {
             "all_healthy": overall.all_healthy,
             "watch_folder_healths": [

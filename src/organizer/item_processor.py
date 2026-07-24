@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import hashlib
 import os
 import re
@@ -138,6 +139,10 @@ class DiscoveryBatch:
     watch_id: str
     items: tuple[BatchItemResult, ...]
     diagnostics: tuple[str, ...]
+
+
+class NeedsReconciliationError(Exception):
+    """Raised when an action has published output but source cleanup is uncertain."""
 
 
 class ItemProcessor:
@@ -479,7 +484,14 @@ class ItemProcessor:
                         action_source = source
                         self._validate_destination_item(action.target)
                         if action.target != source:
-                            self._move_without_overwrite(source, action.target)
+                            try:
+                                self._move_without_overwrite(source, action.target)
+                            except NeedsReconciliationError as error:
+                                result = ActionResult(action.kind, action.target, "UNCERTAIN", str(error), source=action_source, resulting_path=action.target)
+                                results.append(result)
+                                self._finish_attempt(attempt_id, "needs-reconciliation", results, plan.processing_lineage)
+                                self._emit(plan, result)
+                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results))
                         source = action.target
                         result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
                     results.append(result)
@@ -663,10 +675,25 @@ class ItemProcessor:
         with zipfile.ZipFile(staging, "x", compression=zipfile.ZIP_DEFLATED) as archive:
             if source.is_dir():
                 for child in sorted(source.rglob("*")):
-                    if child.is_file() and not child.is_symlink():
-                        archive.write(child, child.relative_to(source))
+                    relative = child.relative_to(source)
+                    if child.is_dir():
+                        if not any(child.iterdir()):
+                            archive.writestr(f"{relative}/", "")
+                    elif child.is_symlink():
+                        info = zipfile.ZipInfo(str(relative))
+                        info.create_system = 3
+                        info.external_attr = (0o120777 << 16) | 0o777
+                        archive.writestr(info, os.readlink(child))
+                    elif child.is_file():
+                        archive.write(child, relative)
             else:
-                archive.write(source, source.name)
+                if source.is_symlink():
+                    info = zipfile.ZipInfo(source.name)
+                    info.create_system = 3
+                    info.external_attr = (0o120777 << 16) | 0o777
+                    archive.writestr(info, os.readlink(source))
+                else:
+                    archive.write(source, source.name)
         return staging
 
     def preview(self, plan: Plan) -> ArchivePreview | None:
@@ -740,6 +767,8 @@ class ItemProcessor:
         )
         for archive_path in nested:
             extraction_root = archive_path.parent / self._archive_output_name(archive_path, "")
+            if extraction_root.exists():
+                raise FileExistsError(f"nested extraction root collision: {extraction_root}")
             nested_staging = self._unarchive_to_staging(archive_path, extraction_root, limits, max_depth - current_depth)
             extraction_root.parent.mkdir(parents=True, exist_ok=True)
             nested_staging.rename(extraction_root)
@@ -805,7 +834,7 @@ class ItemProcessor:
 
     @staticmethod
     def _archive_output_name(source: Path, extension: str) -> str:
-        recognized = {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz"}
+        recognized = {".zip", ".7z", ".rar"}
         suffix = source.suffix.lower()
         stem = source.name[:-len(suffix)] if suffix in recognized else source.name
         return stem + extension
@@ -848,11 +877,61 @@ class ItemProcessor:
             os.link(source, target)
         except FileExistsError as error:
             raise FileExistsError(f"destination already exists: {target}") from error
+        except OSError as error:
+            if getattr(error, "errno", None) != errno.EXDEV:
+                raise
+            staging = target.parent / f".organizer-staging-{uuid.uuid4()}"
+            try:
+                if source.is_dir():
+                    shutil.copytree(source, staging)
+                else:
+                    shutil.copy2(source, staging)
+                ItemProcessor._publish_staged(staging, target)
+            except FileExistsError as error:
+                ItemProcessor._remove_tree(staging)
+                raise FileExistsError(f"destination already exists: {target}") from error
         try:
-            source.unlink()
-        except OSError:
-            target.unlink(missing_ok=True)
-            raise
+            if source.is_dir():
+                shutil.rmtree(source)
+            else:
+                source.unlink()
+        except OSError as error:
+            raise NeedsReconciliationError(f"source removal uncertain: {error}") from error
+
+    @classmethod
+    def validate_rules_document(cls, rules_path: Path) -> list[str]:
+        """Validate a rules document without requiring an item match.
+
+        Returns a list of diagnostics; an empty list means the document is valid.
+        """
+        diagnostics: list[str] = []
+        try:
+            loaded = yaml.safe_load(rules_path.read_text()) or {}
+        except (OSError, yaml.YAMLError) as error:
+            return [f"invalid rules document: {error}"]
+        if not isinstance(loaded, dict):
+            return ["rules document must be a mapping"]
+        rules = loaded.get("rules", [])
+        if not isinstance(rules, list):
+            return ["rules must be a list"]
+        for index, rule in enumerate(rules):
+            rule_name = rule.get("name") if isinstance(rule, dict) else "unknown"
+            rule_name = rule_name if isinstance(rule_name, str) else "unknown"
+            try:
+                name, conditions, actions, _, _ = cls._validate_rule(rule)
+                typed_matches: dict[str, re.Match[str]] = {}
+                for condition_name, (field, pattern) in conditions.items():
+                    sample = "sample" if field != "full_path" else "/data/sample"
+                    match = re.search(pattern, sample)
+                    if match is None:
+                        match = re.match(".*", "sample")
+                    if match is None:
+                        raise ValueError(f"could not create sample match for condition {condition_name}")
+                    typed_matches[condition_name] = match
+                cls._validate_action_references(actions, typed_matches)
+            except (TypeError, ValueError, re.error) as error:
+                diagnostics.append(f"rule {index + 1} ({rule_name}) invalid: {error}")
+        return diagnostics
 
     @staticmethod
     def _validate_rule(rule: object) -> tuple[str, dict[str, tuple[str, str]], list[dict[str, Any]], bool, bool]:

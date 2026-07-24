@@ -115,7 +115,7 @@ def test_retention_cleans_old_failed_attempts_without_suppressions(tmp_path: Pat
     old_time = now - 86400 * 10
     recent_time = now - 86400
 
-    old_attempt = _create_failed_attempt(db_path, "downloads", old_time)
+    _create_failed_attempt(db_path, "downloads", old_time)
     _create_failed_attempt(db_path, "downloads", recent_time)
 
     retention = Retention(db_path)

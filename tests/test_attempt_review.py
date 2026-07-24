@@ -51,6 +51,23 @@ def write_delete_direct_rules(path: Path) -> Path:
     return path
 
 
+def write_archive_rules(path: Path, destination: str, preserve_original: bool = True) -> Path:
+    path.write_text(
+        f"""rules:
+  - name: archive
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - archive:
+          destination: {destination}
+          extension: .zip
+          preserve_originals: {str(preserve_original).lower()}
+"""
+    )
+    return path
+
+
 def _create_needs_reconciliation_attempt(tmp_path: Path) -> tuple[ItemProcessor, str, Path, Path, Path]:
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()
@@ -75,6 +92,42 @@ def _create_needs_reconciliation_attempt(tmp_path: Path) -> tuple[ItemProcessor,
             ("needs-reconciliation",),
         ).fetchone()
     return processor, row[0], watch_root, rules, item
+
+
+def _create_uncertain_archive_attempt(tmp_path: Path) -> tuple[ItemProcessor, str, Path, Path, Path]:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_archive_rules(watch_root / "rules.yaml", "../archives", preserve_original=False)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(
+        __import__("organizer.item_processor", fromlist=["PlanRequest"]).PlanRequest(
+            watch_id="downloads",
+            watch_root=watch_root,
+            item=item,
+            rules_path=rules,
+        )
+    )
+    original_publish = processor._publish_staged
+
+    def publish_then_change(staging: Path, target: Path) -> None:
+        original_publish(staging, target)
+        item.write_text("changed")
+
+    processor._publish_staged = publish_then_change  # type: ignore[method-assign]
+    report = processor.execute(plan)
+    assert report.status == "needs-reconciliation"
+    archive_path = destination / "movie.mkv.zip"
+    assert archive_path.exists()
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        row = conn.execute(
+            "SELECT attempt_id FROM processing_attempts WHERE status = ?",
+            ("needs-reconciliation",),
+        ).fetchone()
+    return processor, row[0], watch_root, rules, archive_path
 
 
 def _create_failed_collision_attempt(tmp_path: Path) -> tuple[ItemProcessor, str, Path, Path]:
@@ -192,11 +245,14 @@ def test_inspect_raises_for_unknown_attempt(tmp_path: Path) -> None:
 
 
 def test_accept_creates_immutable_accepted_result(tmp_path: Path) -> None:
-    processor, attempt_id, _, _, item = _create_needs_reconciliation_attempt(tmp_path)
+    processor, attempt_id, watch_root, _, archive_path = _create_uncertain_archive_attempt(tmp_path)
     review = AttemptReview(processor)
-    resulting_path = str(item)
+    resulting_path = str(archive_path)
 
-    result = review.command(attempt_id, Accept(action_index=0, resulting_path=resulting_path))
+    result = review.command(
+        attempt_id,
+        Accept(action_index=0, resulting_path=resulting_path, watch_root=watch_root),
+    )
 
     assert result.success is True
     assert result.attempt_id == attempt_id
@@ -204,33 +260,46 @@ def test_accept_creates_immutable_accepted_result(tmp_path: Path) -> None:
     assert len(details.accepted_results) == 1
     assert details.accepted_results[0]["action_index"] == 0
     assert details.accepted_results[0]["resulting_path"] == resulting_path
+    assert details.accepted_results[0].get("fingerprint", "") != ""
 
 
 def test_accept_is_immutable(tmp_path: Path) -> None:
-    processor, attempt_id, _, _, item = _create_needs_reconciliation_attempt(tmp_path)
+    processor, attempt_id, watch_root, _, archive_path = _create_uncertain_archive_attempt(tmp_path)
     review = AttemptReview(processor)
-    resulting_path = str(item)
+    resulting_path = str(archive_path)
 
-    review.command(attempt_id, Accept(action_index=0, resulting_path=resulting_path))
+    review.command(
+        attempt_id,
+        Accept(action_index=0, resulting_path=resulting_path, watch_root=watch_root),
+    )
 
     with pytest.raises(ValueError, match="already accepted"):
-        review.command(attempt_id, Accept(action_index=0, resulting_path="/different/path"))
+        review.command(
+            attempt_id,
+            Accept(action_index=0, resulting_path="/different/path", watch_root=watch_root),
+        )
 
 
 def test_accept_rejects_for_non_reconciling_attempt(tmp_path: Path) -> None:
-    processor, attempt_id, _, _ = _create_failed_collision_attempt(tmp_path)
+    processor, attempt_id, watch_root, rules = _create_failed_collision_attempt(tmp_path)
     review = AttemptReview(processor)
 
     with pytest.raises(ValueError, match="needs-reconciliation"):
-        review.command(attempt_id, Accept(action_index=0, resulting_path="/some/path"))
+        review.command(
+            attempt_id,
+            Accept(action_index=0, resulting_path="/some/path", watch_root=watch_root),
+        )
 
 
 def test_accept_rejects_invalid_action_index(tmp_path: Path) -> None:
-    processor, attempt_id, _, _, item = _create_needs_reconciliation_attempt(tmp_path)
+    processor, attempt_id, watch_root, _, archive_path = _create_uncertain_archive_attempt(tmp_path)
     review = AttemptReview(processor)
 
     with pytest.raises(ValueError, match="action index"):
-        review.command(attempt_id, Accept(action_index=99, resulting_path=str(item)))
+        review.command(
+            attempt_id,
+            Accept(action_index=99, resulting_path=str(archive_path), watch_root=watch_root),
+        )
 
 
 def test_abandon_creates_terminal_state_and_suppression(tmp_path: Path) -> None:
@@ -313,6 +382,21 @@ def test_reopen_preserves_abandoned_history(tmp_path: Path) -> None:
     assert new_details.status in ("completed", "failed", "needs-reconciliation", "started")
 
 
+def test_reopen_preserves_suppression_when_planning_fails(tmp_path: Path) -> None:
+    processor, attempt_id, watch_root, _, item = _create_needs_reconciliation_attempt(tmp_path)
+    review = AttemptReview(processor)
+    details = review.inspect(attempt_id)
+    review.command(attempt_id, Abandon(reason="test"))
+    assert processor.has_suppressed_attempt("downloads", item, details.source_fingerprint) is True
+    # Remove the source so planning fails
+    item.unlink()
+
+    with pytest.raises((ValueError, OSError)):
+        review.command(attempt_id, Reopen(watch_root=watch_root, rules_path=watch_root / "rules.yaml"))
+
+    assert processor.has_suppressed_attempt("downloads", item, details.source_fingerprint) is True
+
+
 def test_reopen_rejects_non_abandoned_attempt(tmp_path: Path) -> None:
     processor, attempt_id, _, _, _ = _create_needs_reconciliation_attempt(tmp_path)
     review = AttemptReview(processor)
@@ -349,6 +433,21 @@ def test_retry_from_start_clears_suppression(tmp_path: Path) -> None:
     review.command(attempt_id, RetryFromStart(watch_root=watch_root, rules_path=rules))
 
     assert processor.has_suppressed_attempt("downloads", item, fingerprint) is False
+
+
+def test_retry_from_start_preserves_suppression_when_planning_fails(tmp_path: Path) -> None:
+    processor, attempt_id, watch_root, rules = _create_failed_collision_attempt(tmp_path)
+    review = AttemptReview(processor)
+    item = watch_root / "movie.mkv"
+    fingerprint = processor._fingerprint(item)
+    assert processor.has_suppressed_attempt("downloads", item, fingerprint) is True
+    item.unlink()
+    (watch_root.parent / "videos" / "movie.mkv").unlink()
+
+    with pytest.raises((ValueError, OSError)):
+        review.command(attempt_id, RetryFromStart(watch_root=watch_root, rules_path=rules))
+
+    assert processor.has_suppressed_attempt("downloads", item, fingerprint) is True
 
 
 def test_retry_from_start_rejects_completed_attempt(tmp_path: Path) -> None:
@@ -399,10 +498,81 @@ def test_inspect_shows_processing_lineage(tmp_path: Path) -> None:
 
 
 def test_command_result_includes_detail(tmp_path: Path) -> None:
-    processor, attempt_id, _, _, item = _create_needs_reconciliation_attempt(tmp_path)
+    processor, attempt_id, watch_root, _, archive_path = _create_uncertain_archive_attempt(tmp_path)
     review = AttemptReview(processor)
 
-    result = review.command(attempt_id, Accept(action_index=0, resulting_path=str(item)))
+    result = review.command(
+        attempt_id,
+        Accept(action_index=0, resulting_path=str(archive_path), watch_root=watch_root),
+    )
 
     assert result.success is True
     assert result.detail != ""
+
+
+def test_accept_rejects_missing_resulting_path(tmp_path: Path) -> None:
+    processor, attempt_id, watch_root, _, _ = _create_uncertain_archive_attempt(tmp_path)
+    review = AttemptReview(processor)
+    (tmp_path / "archives" / "movie.mkv.zip").unlink()
+
+    with pytest.raises(ValueError, match="does not exist"):
+        review.command(
+            attempt_id,
+            Accept(
+                action_index=0,
+                resulting_path=str(tmp_path / "archives" / "movie.mkv.zip"),
+                watch_root=watch_root,
+            ),
+        )
+
+
+def test_accept_rejects_unexpected_resulting_path(tmp_path: Path) -> None:
+    processor, attempt_id, watch_root, _, archive_path = _create_uncertain_archive_attempt(tmp_path)
+    review = AttemptReview(processor)
+    other = tmp_path / "archives" / "other.zip"
+    other.write_text("other")
+
+    with pytest.raises(ValueError, match="unexpected resulting path"):
+        review.command(
+            attempt_id,
+            Accept(action_index=0, resulting_path=str(other), watch_root=watch_root),
+        )
+
+
+def test_accept_rejects_path_outside_data_volumes(tmp_path: Path) -> None:
+    processor, attempt_id, watch_root, _, archive_path = _create_uncertain_archive_attempt(tmp_path)
+    review = AttemptReview(processor)
+    policy = __import__("organizer.item_processor", fromlist=["BoundaryPolicy"]).BoundaryPolicy(
+        data_roots=(tmp_path / "downloads",),
+    )
+
+    with pytest.raises(ValueError, match="outside data"):
+        review.command(
+            attempt_id,
+            Accept(
+                action_index=0,
+                resulting_path=str(archive_path),
+                watch_root=watch_root,
+                boundary_policy=policy,
+            ),
+        )
+
+
+def test_accept_rejects_path_outside_allowed_destinations(tmp_path: Path) -> None:
+    processor, attempt_id, watch_root, _, archive_path = _create_uncertain_archive_attempt(tmp_path)
+    review = AttemptReview(processor)
+    policy = __import__("organizer.item_processor", fromlist=["BoundaryPolicy"]).BoundaryPolicy(
+        data_roots=(tmp_path,),
+        allowed_destinations=(tmp_path / "other",),
+    )
+
+    with pytest.raises(ValueError, match="allowed destination"):
+        review.command(
+            attempt_id,
+            Accept(
+                action_index=0,
+                resulting_path=str(archive_path),
+                watch_root=watch_root,
+                boundary_policy=policy,
+            ),
+        )

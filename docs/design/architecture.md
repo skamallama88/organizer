@@ -79,6 +79,8 @@ Rules are loaded from the watch folder's `rules.yaml` file. Invalid YAML, invali
 
 Moves the matched file or folder to `destination`. If the destination directory doesn't exist, it is created. An existing destination item is a collision and is never overwritten.
 
+Same-filesystem moves publish via a hard link followed by source removal. Cross-filesystem moves use staged-copy semantics: a private staged copy is created on the destination filesystem, published without overwriting, the resulting path is recorded, and only then is the source removed. If source removal fails after publication, both paths are retained and the attempt enters `needs-reconciliation`; Organizer never deletes published output.
+
 ### Copy
 
 ```yaml
@@ -157,7 +159,7 @@ Renames the matched file or folder within its current parent directory. `name` c
 
 This renames `Alice Costume [cosplay].zip` to `Alice Costume.zip`. An invalid capture reference or a name that is invalid for the host filesystem fails validation and disables the rule.
 
-Plans include a SHA-256 ruleset revision. Applying a plan after the rules file changes is rejected as stale. UI rule saves compare the submitted revision with the current file revision and return a conflict rather than overwriting concurrent edits.
+Plans include a SHA-256 ruleset revision. Applying a plan after the rules file changes is rejected as stale. UI rule saves resolve the watch identifier to the configured rules file path, validate the complete rule semantics before an atomic compare-and-swap write, and return a conflict rather than overwriting concurrent edits. Invalid rules, including malformed YAML, invalid regex, unknown fields or actions, missing required parameters, and invalid capture references, are rejected before any file change.
 
 ### Unarchive
 
@@ -261,8 +263,8 @@ The batch reports a deduplicated diagnostic when any items are deferred. Batch p
 
 ## Logging
 
-- **Output**: structured text to stdout (for `docker logs`) and a rotating log file at `/config/logs/organizer.log`.
-- **Rotation**: configurable retention and size limits. Initial values are 7 days and 10MB per log file.
+- **Output**: structured text to stdout (for `docker logs`), a rotating log file at `/config/logs/organizer.log`, and an in-memory buffer for the web log viewer.
+- **Rotation**: configurable retention and size limits. Initial values are 7 days and 10MB per log file. The sink persists each entry with `fsync`, rotates when the current file would exceed the size limit, and removes backup files older than the retention period or beyond the configured backup count.
 - **Format** per line:
 
 ```
@@ -282,6 +284,10 @@ A page under each watch folder showing recent log entries for that watch. Suppor
 The initial reconciliation UI is server-rendered and uses HTMX actions. An attempt list shows failed and `needs-reconciliation` attempts with their watch folder, source item, rule, action, status, failure category, and created time. An attempt detail view shows the source fingerprint, planned actions, per-action results, intended destinations, resulting paths, filesystem evidence, failure detail, and related retry attempts.
 
 The UI supports explicit commands for retry, accepting resulting paths, marking an action applied, retrying remaining actions, retrying from the start, and abandoning an attempt. Command handlers delegate to an attempt-review application module; they do not manipulate files or Tracking DB records directly. Every command and result is recorded. Ambiguous evidence requires explicit confirmation, and retrying from the start always creates a new processing attempt.
+
+Accepting a resulting path requires filesystem evidence, a configured destination policy, a match against the planned action target, and a recorded fingerprint. Missing items, unsafe paths, unexpected paths, and fingerprint mismatches are rejected.
+
+`retry from the start` and `reopen` first create a fresh plan, then execute a new attempt, and only clear the source identity suppression if the new attempt reaches `completed`. A planning failure or failed execution report preserves the suppression so automatic processing does not resume.
 
 The attempt-review module has one application-facing interface:
 

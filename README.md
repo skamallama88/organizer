@@ -16,6 +16,12 @@ Build and start the included Compose deployment:
 docker compose up --build
 ```
 
+To stop it without removing persistent volumes:
+
+```sh
+docker compose down
+```
+
 The web UI is available at `http://127.0.0.1:8000`. The Compose configuration keeps
 the published port on host loopback while the container listens on `0.0.0.0`, which
 is required for Docker port forwarding.
@@ -23,6 +29,37 @@ is required for Docker port forwarding.
 On first start, the image creates `/config/organizer.yaml` and `/config/rules.yaml`
 in an empty config volume. Edit those files to configure watch folders and rules;
 existing files are never overwritten on restart.
+
+Inspect or edit the generated files with a temporary container:
+
+```sh
+docker compose run --rm organizer cat /config/organizer.yaml
+docker compose run --rm organizer sh -c 'vi /config/organizer.yaml'
+```
+
+The generated configuration watches `/data` using `/config/rules.yaml`. Add or
+replace entries under `watches` when using multiple data directories. Each watch
+must have a unique `id`, an absolute `root` inside a configured `data_roots` path,
+and a `rules` path. For example:
+
+```yaml
+data_roots:
+  - /data
+quarantine_root: /data/.quarantine
+watches:
+  - id: downloads
+    root: /data/Downloads
+    rules: /config/rules-downloads.yaml
+```
+
+After editing configuration, restart the service:
+
+```sh
+docker compose restart organizer
+```
+
+The default rules file contains no rules, so Organizer starts safely without
+modifying files. Add rules through the web UI or edit the configured YAML file.
 
 For Unraid, replace the named volumes in `docker-compose.yml` with host paths, for
 example:

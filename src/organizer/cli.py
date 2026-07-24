@@ -12,7 +12,7 @@ from organizer.attempt_review import (
 )
 from organizer.config import OrganizerConfig, WatchFolderConfig, load_config
 from organizer.daemon import create_daemon
-from organizer.item_processor import ExecutionMode, ItemProcessor, PlanRequest
+from organizer.item_processor import ItemProcessor, ItemSnapshot, PlanRequest
 
 app = typer.Typer(no_args_is_help=True)
 review_app = typer.Typer(no_args_is_help=True)
@@ -35,10 +35,27 @@ def check(
     config = load_config(config_path)
     watch = _watch(config, watch_id)
     processor = ItemProcessor(attempts_path=attempts_path)
-    plan = processor.plan(PlanRequest(watch_id, watch.watch_root, item, watch.rules_path, watch.boundary_policy))
-    report = processor.execute(plan, ExecutionMode.DRY_RUN)
-    for result in report.actions:
-        typer.echo(f"{plan.rule_name}: {result.kind} {plan.source} -> {result.target}")
+    try:
+        stat = item.stat()
+    except OSError as error:
+        typer.echo(f"cannot stat item: {error}")
+        raise typer.Exit(code=1) from error
+    snapshot = ItemSnapshot(path=item, size=stat.st_size, mtime=stat.st_mtime)
+    batch = processor.process_batch(
+        watch_id=watch_id,
+        watch_root=watch.watch_root,
+        rules_path=watch.rules_path,
+        snapshots=[snapshot],
+        stability_interval=0.0,
+        boundary_policy=watch.boundary_policy,
+        dry_run=True,
+    )
+    for batch_item in batch.items:
+        if batch_item.report:
+            for action in batch_item.report.actions:
+                typer.echo(f"{action.kind}: {action.source} -> {action.target}")
+        else:
+            typer.echo(f"{batch_item.status.value}: {batch_item.source}: {batch_item.detail}")
 
 
 @app.command()

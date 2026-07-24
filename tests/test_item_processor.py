@@ -1791,6 +1791,60 @@ def test_process_batch_deduplicates_deferred_diagnostics(tmp_path: Path) -> None
     assert len(deferred_diags) <= 1
 
 
+def test_process_batch_dry_run_returns_preview_without_mutation(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    mtime = item.stat().st_mtime
+    snapshot = ItemSnapshot(path=item, size=5, mtime=mtime)
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, [snapshot],
+        stability_interval=0.0, now=1000.0, dry_run=True,
+    )
+
+    assert len(batch.items) == 1
+    assert batch.items[0].status == "executed"
+    assert batch.items[0].report is not None
+    assert batch.items[0].report.dry_run is True
+    assert batch.items[0].report.status == "dry-run"
+    assert (destination / "movie.mkv").exists() is False
+    assert item.exists() is True
+
+
+def test_process_batch_dry_run_reports_no_match(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "nomatch.txt"
+    item.write_text("no matching rule")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: videos
+    match:
+      field: file_name
+      pattern: '\\.mkv$'
+    actions:
+      - move:
+          destination: ../videos
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshot = ItemSnapshot(path=item, size=16, mtime=item.stat().st_mtime)
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, [snapshot],
+        stability_interval=0.0, now=1000.0, dry_run=True,
+    )
+
+    assert batch.items[0].status == "failed"
+    assert "no valid rule" in batch.items[0].detail
+
+
 def test_recover_stale_leases_moves_started_attempt_to_reconciliation(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()
@@ -2367,3 +2421,164 @@ def test_cross_watch_handoff_records_resulting_path_handoff(tmp_path: Path) -> N
     assert len(handoffs) == 1
     assert handoffs[0].watch_id == "videos"
     assert handoffs[0].resulting_path == watch_b / "movie.mkv"
+
+
+def test_cli_check_uses_process_batch_and_reports_outcomes(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: videos
+    match:
+      field: file_name
+      pattern: '\\.mkv$'
+    actions:
+      - move:
+          destination: ../videos
+"""
+    )
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        f"config_root: {tmp_path / 'config'}\ndata_roots: [{tmp_path}]\nwatches:\n  - id: downloads\n    root: {watch_root}\n    rules: {rules}\n"
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "check",
+            "downloads",
+            str(item),
+            "--config-path",
+            str(config_path),
+            "--attempts-path",
+            str(tmp_path / "attempts.db"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "move" in result.stdout
+    assert "videos" in result.stdout or str(watch_root) in result.stdout
+    assert item.exists()
+
+
+def test_cli_check_reports_no_match_through_batch(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "nomatch.txt"
+    item.write_text("no match")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: videos
+    match:
+      field: file_name
+      pattern: '\\.mkv$'
+    actions:
+      - move:
+          destination: ../videos
+"""
+    )
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        f"config_root: {tmp_path / 'config'}\ndata_roots: [{tmp_path}]\nwatches:\n  - id: downloads\n    root: {watch_root}\n    rules: {rules}\n"
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "check",
+            "downloads",
+            str(item),
+            "--config-path",
+            str(config_path),
+            "--attempts-path",
+            str(tmp_path / "attempts.db"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "failed" in result.stdout
+    assert "no valid rule" in result.stdout
+
+
+def test_web_dry_run_uses_process_batch_and_reports_outcomes(tmp_path: Path) -> None:
+    from organizer.operational_health import OperationalHealth
+    from organizer.structured_log import MemoryLogSink
+
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        """rules:
+  - name: videos
+    match:
+      field: file_name
+      pattern: '\\.mkv$'
+    actions:
+      - move:
+          destination: ../videos
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    log_sink = MemoryLogSink()
+    config = WatchFolderConfig(
+        watch_id="downloads",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        boundary_policy=BoundaryPolicy(data_roots=(tmp_path,), allowed_destinations=(tmp_path,), watch_roots=(watch_root,)),
+    )
+    client = TestClient(create_app(processor, log_sink=log_sink, watch_folders=[config], db_path=tmp_path / "attempts.db"))
+
+    response = client.get(f"/watches/downloads/dry-run?item={item}")
+
+    assert response.status_code == 200, response.text
+    assert "Dry run" in response.text
+    assert "move" in response.text
+    assert str(item) in response.text
+    assert item.exists() is True
+
+
+def test_web_dry_run_via_editor_uses_process_batch(tmp_path: Path) -> None:
+    from organizer.operational_health import OperationalHealth
+    from organizer.structured_log import MemoryLogSink
+
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        """rules:
+  - name: videos
+    match:
+      field: file_name
+      pattern: '\\.mkv$'
+    actions:
+      - move:
+          destination: ../videos
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    log_sink = MemoryLogSink()
+    config = WatchFolderConfig(
+        watch_id="downloads",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        boundary_policy=BoundaryPolicy(data_roots=(tmp_path,), allowed_destinations=(tmp_path,), watch_roots=(watch_root,)),
+    )
+    client = TestClient(create_app(processor, log_sink=log_sink, watch_folders=[config], db_path=tmp_path / "attempts.db"))
+
+    response = client.post(
+        "/watches/downloads/rules/dry-run",
+        data={"item": str(item), "rules": rules_path.read_text()},
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert "Dry run" in response.text or "move" in response.text
+    assert item.exists() is True

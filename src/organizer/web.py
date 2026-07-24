@@ -23,7 +23,7 @@ from organizer.attempt_review import (
     RetryFromStart,
 )
 from organizer.config import WatchFolderConfig
-from organizer.item_processor import ExecutionMode, ItemProcessor, PlanRequest
+from organizer.item_processor import ExecutionMode, ItemProcessor, ItemSnapshot, PlanRequest
 from organizer.operational_health import OperationalHealth
 from organizer.structured_log import LogLevel, MemoryLogSink
 
@@ -168,22 +168,36 @@ def create_app(
             diagnostics = processor.validate_rules_document(temp_path)
             if diagnostics:
                 return HTMLResponse(_rules_feedback("; ".join(diagnostics), error=True), status_code=422)
-            plan = processor.plan(PlanRequest(watch_id, config.watch_root, item, temp_path, config.boundary_policy))
-            report = processor.execute(plan, ExecutionMode.DRY_RUN)
-        except ValueError as error:
-            if str(error) == "no valid rule matched item":
-                return HTMLResponse(_rules_feedback("Dry run: No rule matched."))
-            return HTMLResponse(_rules_feedback(str(error), error=True), status_code=422)
+            try:
+                stat = item.stat()
+            except OSError as error:
+                return HTMLResponse(_rules_feedback(str(error), error=True), status_code=422)
+            snapshot = ItemSnapshot(path=item, size=stat.st_size, mtime=stat.st_mtime)
+            batch = processor.process_batch(
+                watch_id=watch_id,
+                watch_root=config.watch_root,
+                rules_path=temp_path,
+                snapshots=[snapshot],
+                stability_interval=0.0,
+                boundary_policy=config.boundary_policy,
+                dry_run=True,
+            )
         finally:
             if temp_path.exists():
                 temp_path.unlink()
-        if not report.actions:
+        if not batch.items:
+            return HTMLResponse(_rules_feedback("No items processed."))
+        batch_item = batch.items[0]
+        if batch_item.report and batch_item.report.actions:
+            rows = "".join(
+                f"<li>{html.escape(action.kind)}: {html.escape(str(action.source))} to {html.escape(str(action.target))}</li>"
+                for action in batch_item.report.actions
+            )
+            return HTMLResponse(f"<section class=\"preview\"><h2>Dry run</h2><ul>{rows}</ul></section>")
+        detail = batch_item.detail
+        if "no valid rule matched" in detail:
             return HTMLResponse(_rules_feedback("Dry run: No rule matched."))
-        rows = "".join(
-            f"<li>{html.escape(action.kind)}: {html.escape(str(action.source))} to {html.escape(str(action.target))}</li>"
-            for action in report.actions
-        )
-        return HTMLResponse(f"<section class=\"preview\"><h2>Dry run</h2><ul>{rows}</ul></section>")
+        return HTMLResponse(_rules_feedback(f"Dry run: {html.escape(detail)}"))
 
     @app.post("/watches/{watch_id}/rules/save", response_class=HTMLResponse)
     def editor_save(
@@ -222,12 +236,29 @@ def create_app(
         config = _watch_config(watch_id)
         if config is None:
             return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
-        plan = processor.plan(PlanRequest(watch_id, config.watch_root, item, config.rules_path, config.boundary_policy))
-        report = processor.execute(plan, ExecutionMode.DRY_RUN)
-        rows = "".join(
-            f"<li>{plan.rule_name}: {action.kind} {plan.source} to {action.target}</li>" for action in report.actions
+        try:
+            stat = item.stat()
+        except OSError as error:
+            return JSONResponse(status_code=422, content={"detail": str(error)})
+        snapshot = ItemSnapshot(path=item, size=stat.st_size, mtime=stat.st_mtime)
+        batch = processor.process_batch(
+            watch_id=watch_id,
+            watch_root=config.watch_root,
+            rules_path=config.rules_path,
+            snapshots=[snapshot],
+            stability_interval=0.0,
+            boundary_policy=config.boundary_policy,
+            dry_run=True,
         )
-        return f"<h1>Dry run: {watch_id}</h1><ul>{rows}</ul>"
+        if not batch.items:
+            return "<h1>Dry run: no items processed</h1>"
+        batch_item = batch.items[0]
+        if batch_item.report and batch_item.report.actions:
+            rows = "".join(
+                f"<li>{action.kind}: {action.source} to {action.target}</li>" for action in batch_item.report.actions
+            )
+            return f"<h1>Dry run: {watch_id}</h1><ul>{rows}</ul>"
+        return f"<h1>Dry run: {watch_id}</h1><p>{html.escape(batch_item.detail)}</p>"
 
     @app.put("/watches/{watch_id}/rules", response_model=None)
     def save_rules(

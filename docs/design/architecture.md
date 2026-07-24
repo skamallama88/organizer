@@ -35,6 +35,7 @@ class ItemProcessor(Protocol):
         stability_interval: float = 0.0,
         boundary_policy: BoundaryPolicy | None = None,
         now: float | None = None,
+        dry_run: bool = False,
     ) -> DiscoveryBatch:
         """Process a discovery snapshot and return per-item outcomes."""
 

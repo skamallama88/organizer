@@ -11,26 +11,41 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from organizer.config import OrganizerConfig, WatchFolderConfig
-from organizer.item_processor import ExecutionMode, ItemProcessor, PlanRequest
+from organizer.item_processor import (
+    DiscoveryBatch,
+    ItemProcessor,
+    ItemSnapshot,
+)
 
 
 class BatchProcessor(Protocol):
-    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> None: ...
+    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None: ...
 
 
 class ProcessorBatchAdapter:
     def __init__(self, processor: ItemProcessor) -> None:
         self.processor = processor
 
-    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> None:
+    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+        snapshots: list[ItemSnapshot] = []
         for item in items:
             if not item.exists() or not item.is_relative_to(watch.watch_root):
                 continue
             try:
-                plan = self.processor.plan(PlanRequest(watch.watch_id, watch.watch_root, item, watch.rules_path, watch.boundary_policy))
-                self.processor.execute(plan, ExecutionMode.APPLY)
-            except (OSError, ValueError):
+                stat = item.stat()
+            except OSError:
                 continue
+            snapshots.append(ItemSnapshot(path=item, size=stat.st_size, mtime=stat.st_mtime))
+        if not snapshots:
+            return None
+        return self.processor.process_batch(
+            watch_id=watch.watch_id,
+            watch_root=watch.watch_root,
+            rules_path=watch.rules_path,
+            snapshots=snapshots,
+            stability_interval=0.0,
+            boundary_policy=watch.boundary_policy,
+        )
 
 
 class WatcherService:

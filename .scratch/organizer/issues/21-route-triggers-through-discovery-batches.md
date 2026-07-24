@@ -6,7 +6,7 @@
 
 **Status:** ready-for-agent
 
-- [ ] Watcher and scanner submit `ItemSnapshot` observations through the shared batch-processing contract.
-- [ ] Immediate CLI and web processing expose the same discovery-batch outcomes and diagnostics as watcher and scanner processing.
-- [ ] Concurrent triggers do not duplicate work and report deferred, skipped, outside-snapshot, failed, and executed outcomes correctly.
-- [ ] Integration tests prove equivalent behavior across watcher, scanner, CLI, and web-triggered processing.
+- [x] Watcher and scanner submit `ItemSnapshot` observations through the shared batch-processing contract.
+- [x] Immediate CLI and web processing expose the same discovery-batch outcomes and diagnostics as watcher and scanner processing.
+- [x] Concurrent triggers do not duplicate work and report deferred, skipped, outside-snapshot, failed, and executed outcomes correctly.
+- [x] Integration tests prove equivalent behavior across watcher, scanner, CLI, and web-triggered processing.

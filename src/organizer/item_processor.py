@@ -1282,6 +1282,7 @@ class ItemProcessor:
         stability_interval: float = 0.0,
         boundary_policy: BoundaryPolicy | None = None,
         now: float | None = None,
+        dry_run: bool = False,
     ) -> DiscoveryBatch:
         current_time = now if now is not None else time.time()
         results: list[BatchItemResult] = []
@@ -1316,7 +1317,8 @@ class ItemProcessor:
             )
             try:
                 plan = self.plan(request)
-                report = self.execute(plan)
+                mode = ExecutionMode.DRY_RUN if dry_run else ExecutionMode.APPLY
+                report = self.execute(plan, mode)
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.EXECUTED, report=report))
             except ValueError as error:
                 is_collision = "collision" in str(error).lower()

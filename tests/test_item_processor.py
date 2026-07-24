@@ -854,6 +854,60 @@ def test_copy_refuses_when_source_changes_before_publication(tmp_path: Path, mon
     assert item.read_text() == "changed"
 
 
+def test_copy_removes_directory_staging_when_source_changes_before_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "season"
+    item.mkdir()
+    (item / "episode.txt").write_text("episode")
+    rules = write_copy_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    original_copy = processor._copy_to_staging
+
+    def mutate_source(source: Path, target: Path) -> Path:
+        staging = original_copy(source, target)
+        (item / "new.txt").write_text("changed")
+        return staging
+
+    monkeypatch.setattr(processor, "_copy_to_staging", mutate_source)
+
+    report = processor.execute(plan)
+
+    assert report.status == "failed"
+    assert not (destination / item.name).exists()
+    assert not list(destination.glob(".organizer-staging-*"))
+
+
+def test_copy_never_overwrites_destination_created_during_staged_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("source")
+    rules = write_copy_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    target = destination / item.name
+    original_link = os.link
+
+    def create_target_before_publish(source: str | Path, destination_path: str | Path, *, src_dir_fd: int | None = None, dst_dir_fd: int | None = None, follow_symlinks: bool = True) -> None:
+        if Path(destination_path) == target:
+            target.write_text("existing")
+        original_link(source, destination_path, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "link", create_target_before_publish)
+
+    report = processor.execute(plan)
+
+    assert report.status == "failed"
+    assert target.read_text() == "existing"
+    assert item.read_text() == "source"
+
+
 def test_action_chain_uses_primary_result_and_stops_after_failure(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     destination = tmp_path / "videos"

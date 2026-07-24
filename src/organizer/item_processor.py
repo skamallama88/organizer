@@ -439,7 +439,7 @@ class ItemProcessor:
                         try:
                             self._validate_source(plan)
                         except ValueError as error:
-                            staging.unlink(missing_ok=True)
+                            self._remove_tree(staging)
                             raise OSError(str(error)) from error
                         self._publish_staged(staging, action.target)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
@@ -812,7 +812,7 @@ class ItemProcessor:
 
     @staticmethod
     def _remove_staging(staging: Path) -> None:
-        staging.unlink(missing_ok=True)
+        ItemProcessor._remove_tree(staging)
 
     @staticmethod
     def _remove_source(source: Path) -> None:
@@ -824,13 +824,22 @@ class ItemProcessor:
     @staticmethod
     def _publish_staged(staging: Path, target: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
+        try:
             if staging.is_dir():
-                shutil.rmtree(staging)
+                os.mkdir(target)
+                try:
+                    for child in staging.iterdir():
+                        child.rename(target / child.name)
+                    staging.rmdir()
+                except OSError:
+                    ItemProcessor._remove_tree(target)
+                    raise
             else:
-                staging.unlink(missing_ok=True)
-            raise FileExistsError(f"destination already exists: {target}")
-        staging.rename(target)
+                os.link(staging, target)
+                staging.unlink()
+        except FileExistsError as error:
+            ItemProcessor._remove_tree(staging)
+            raise FileExistsError(f"destination already exists: {target}") from error
 
     @staticmethod
     def _move_without_overwrite(source: Path, target: Path) -> None:

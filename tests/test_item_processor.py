@@ -892,6 +892,99 @@ def write_copy_rules(path: Path, destination: str) -> Path:
     return path
 
 
+def write_archive_rules(path: Path, destination: str, extension: str = ".zip", preserve_original: bool = True) -> Path:
+    path.write_text(
+        f"""rules:
+  - name: archive
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - archive:
+          destination: {destination}
+          extension: {extension}
+          preserve_originals: {str(preserve_original).lower()}
+"""
+    )
+    return path
+
+
+def test_archive_creates_named_file_and_records_result(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_archive_rules(watch_root / "rules.yaml", "../archives")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    archive = destination / "movie.mkv.zip"
+    assert report.status == "completed"
+    assert item.exists()
+    assert archive.exists()
+    assert processor.attempts()[0]["resulting_paths"] == [str(archive)]
+
+
+def test_archive_folders_and_removes_original_when_not_preserved(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "season"
+    item.mkdir()
+    (item / "episode.txt").write_text("episode")
+    rules = write_archive_rules(watch_root / "rules.yaml", "../archives", preserve_original=False)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    archive = destination / "season.zip"
+    assert report.status == "completed"
+    assert not item.exists()
+    assert archive.exists()
+
+
+def test_archive_rejects_destination_collision(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    (destination / "movie.mkv.zip").write_text("existing")
+    rules = write_archive_rules(watch_root / "rules.yaml", "../archives")
+
+    with pytest.raises(ValueError, match="collision"):
+        ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+
+def test_archive_refuses_publication_and_removal_when_source_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_archive_rules(watch_root / "rules.yaml", "../archives", preserve_original=False)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    original = processor._archive_to_staging
+
+    def mutate_source(source: Path, target: Path) -> Path:
+        staging = original(source, target)
+        item.write_text("changed")
+        return staging
+
+    monkeypatch.setattr(processor, "_archive_to_staging", mutate_source)
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    assert report.status == "failed"
+    assert not (destination / "movie.zip").exists()
+    assert item.read_text() == "changed"
+
+
 def test_ui_rule_save_uses_compare_and_swap_revision(tmp_path: Path) -> None:
     processor = ItemProcessor(tmp_path / "attempts.db")
     client = TestClient(create_app(processor))

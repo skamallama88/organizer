@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -54,6 +55,7 @@ class PlanRequest:
 class PlannedAction:
     kind: str
     target: Path
+    preserve_original: bool = True
 
 
 @dataclass(frozen=True)
@@ -206,6 +208,29 @@ class ItemProcessor:
                 else:
                     raise ValueError(f"rule {rule_name} delete mode must be 'direct' or 'quarantine'")
                 continue
+            if kind == "archive" and isinstance(action.get(kind), dict):
+                archive = action[kind]
+                destination = archive.get("destination")
+                extension = archive.get("extension", ".zip")
+                preserve_original = archive.get("preserve_originals", True)
+                if not isinstance(destination, str) or not destination:
+                    raise ValueError(f"rule {rule_name} archive destination is required")
+                if not isinstance(extension, str) or not extension.startswith(".") or Path(extension).name != extension:
+                    raise ValueError(f"rule {rule_name} archive extension is invalid")
+                if not isinstance(preserve_original, bool):
+                    raise ValueError(f"rule {rule_name} archive preserve_original must be boolean")
+                root = Path(destination)
+                if not root.is_absolute():
+                    root = watch_root / root
+                destination_root = self._resolve_destination(root)
+                self._validate_destination(policy, watch_root, current, destination_root)
+                target = destination_root / self._archive_output_name(current, extension)
+                self._validate_destination_item(target)
+                if target.exists() or self._case_collision(target, policy):
+                    raise ValueError(f"destination collision: {target}")
+                planned.append(PlannedAction(kind="archive", target=target, preserve_original=preserve_original))
+                current = target
+                continue
             if kind not in {"move", "copy"} or not isinstance(action.get(kind), dict):
                 raise ValueError(f"rule {rule_name} has unsupported action")
             destination = action[kind].get("destination")
@@ -318,6 +343,22 @@ class ItemProcessor:
                             staging.unlink(missing_ok=True)
                             raise OSError(str(error)) from error
                         self._publish_staged(staging, action.target)
+                        result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
+                    elif action.kind == "archive":
+                        staging = self._archive_to_staging(source, action.target)
+                        try:
+                            self._validate_source(plan)
+                        except ValueError as error:
+                            self._remove_staging(staging)
+                            raise OSError(str(error)) from error
+                        self._publish_staged(staging, action.target)
+                        if not action.preserve_original:
+                            if self._fingerprint(source) != plan.source_fingerprint:
+                                result = ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)
+                                self._finish_attempt(attempt_id, "needs-reconciliation", results + [result])
+                                self._emit(plan, result)
+                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [result]))
+                            self._remove_source(source)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
                     else:
                         action_source = source
@@ -454,6 +495,36 @@ class ItemProcessor:
             staging.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, staging)
         return staging
+
+    def _archive_to_staging(self, source: Path, target: Path) -> Path:
+        staging = self._attempts_path.parent / "staging" / f".organizer-staging-{uuid.uuid4()}.zip"
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(staging, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+            if source.is_dir():
+                for child in sorted(source.rglob("*")):
+                    if child.is_file() and not child.is_symlink():
+                        archive.write(child, child.relative_to(source))
+            else:
+                archive.write(source, source.name)
+        return staging
+
+    @staticmethod
+    def _archive_output_name(source: Path, extension: str) -> str:
+        recognized = {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz"}
+        suffix = source.suffix.lower()
+        stem = source.name[:-len(suffix)] if suffix in recognized else source.name
+        return stem + extension
+
+    @staticmethod
+    def _remove_staging(staging: Path) -> None:
+        staging.unlink(missing_ok=True)
+
+    @staticmethod
+    def _remove_source(source: Path) -> None:
+        if source.is_dir():
+            shutil.rmtree(source)
+        else:
+            source.unlink()
 
     @staticmethod
     def _publish_staged(staging: Path, target: Path) -> None:

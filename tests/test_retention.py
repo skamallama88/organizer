@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from pathlib import Path
 
 from organizer.retention import Retention
+from organizer.structured_log import LogEntry, LogLevel, LogResult, MemoryLogSink, StructuredLogger
 
 
 def _initialize_db(db_path: Path) -> None:
@@ -238,3 +240,164 @@ def test_retention_respects_watch_filter(tmp_path: Path) -> None:
         rows = conn.execute("SELECT watch_id FROM processing_attempts").fetchall()
     assert len(rows) == 1
     assert rows[0][0] == "inbox"
+
+
+def _create_staging_dir(parent: Path, name: str, mtime: float) -> Path:
+    path = parent / name
+    path.mkdir(parents=True, exist_ok=True)
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_retention_cleans_old_staging_artifacts(tmp_path: Path) -> None:
+    db_path = tmp_path / "organizer.db"
+    staging_root = tmp_path / "staging"
+    staging_root.mkdir()
+    now = 1000000.0
+
+    old_staging = _create_staging_dir(staging_root, ".organizer-staging-old-uuid", now - 86400 * 10)
+    recent_staging = _create_staging_dir(staging_root, ".organizer-staging-recent-uuid", now - 86400)
+
+    retention = Retention(db_path)
+    cleaned = retention.clean_staging_artifacts(older_than=now - 86400 * 7)
+
+    assert cleaned == 1
+    assert not old_staging.exists()
+    assert recent_staging.exists()
+
+
+def test_retention_cleans_old_staging_files(tmp_path: Path) -> None:
+    db_path = tmp_path / "organizer.db"
+    staging_root = tmp_path / "staging"
+    staging_root.mkdir()
+    now = 1000000.0
+
+    old_file = staging_root / ".organizer-staging-old-uuid.zip"
+    old_file.write_text("old")
+    os.utime(old_file, (now - 86400 * 10, now - 86400 * 10))
+
+    retention = Retention(db_path)
+    cleaned = retention.clean_staging_artifacts(older_than=now - 86400 * 7)
+
+    assert cleaned == 1
+    assert not old_file.exists()
+
+
+def test_retention_staging_skips_non_staging_entries(tmp_path: Path) -> None:
+    db_path = tmp_path / "organizer.db"
+    staging_root = tmp_path / "staging"
+    staging_root.mkdir()
+    now = 1000000.0
+
+    unrelated = _create_staging_dir(staging_root, "unrelated-dir", now - 86400 * 30)
+
+    retention = Retention(db_path)
+    cleaned = retention.clean_staging_artifacts(older_than=now - 86400 * 7)
+
+    assert cleaned == 0
+    assert unrelated.exists()
+
+
+def test_retention_staging_handles_missing_staging_dir(tmp_path: Path) -> None:
+    db_path = tmp_path / "organizer.db"
+
+    retention = Retention(db_path)
+    cleaned = retention.clean_staging_artifacts(older_than=1000000.0)
+
+    assert cleaned == 0
+
+
+def test_retention_run_retention_returns_summary(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    staging_root = tmp_path / "staging"
+    staging_root.mkdir()
+    now = 1000000.0
+    old_time = now - 86400 * 10
+
+    _create_completed_attempt(db_path, "downloads", old_time)
+    _create_failed_attempt(db_path, "downloads", old_time)
+    _create_staging_dir(staging_root, ".organizer-staging-old", now - 86400 * 10)
+
+    retention = Retention(db_path)
+    result = retention.retention_run(retention_days=7, now=now)
+
+    assert result["completed"] == 1
+    assert result["failed"] == 1
+    assert result["staging"] == 1
+    assert result["total"] == 3
+
+
+def test_retention_run_preserves_recovery_evidence(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    staging_root = tmp_path / "staging"
+    staging_root.mkdir()
+    now = 1000000.0
+    old_time = now - 86400 * 10
+
+    _create_needs_reconciliation_attempt(db_path, "downloads", old_time)
+    _create_abandoned_attempt(db_path, "downloads", old_time)
+
+    retention = Retention(db_path)
+    result = retention.retention_run(retention_days=7, now=now)
+
+    assert result["completed"] == 0
+    assert result["failed"] == 0
+    assert result["total"] == 0
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT status FROM processing_attempts").fetchall()
+    assert len(rows) == 2
+
+
+def test_retention_logs_activity_when_logger_provided(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    staging_root = tmp_path / "staging"
+    staging_root.mkdir()
+    now = 1000000.0
+    old_time = now - 86400 * 10
+
+    _create_completed_attempt(db_path, "downloads", old_time)
+    _create_failed_attempt(db_path, "downloads", old_time)
+    _create_staging_dir(staging_root, ".organizer-staging-old", now - 86400 * 10)
+
+    log_sink = MemoryLogSink()
+    logger = StructuredLogger(sinks=[log_sink])
+    retention = Retention(db_path, logger=logger)
+
+    result = retention.retention_run(retention_days=7, now=now)
+
+    assert result["total"] == 3
+    entries = log_sink.read_recent()
+    summary_entries = [e for e in entries if e.action == "retention" and e.detail.startswith("completed=")]
+    assert len(summary_entries) >= 1
+    entry = summary_entries[-1]
+    assert entry.level == LogLevel.INFO
+    assert entry.result == LogResult.OK
+    assert "completed=1" in entry.detail
+    assert "failed=1" in entry.detail
+    assert "staging=1" in entry.detail
+
+
+def test_retention_logs_error_when_cleanup_fails(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    now = 1000000.0
+    old_time = now - 86400 * 10
+
+    _create_completed_attempt(db_path, "downloads", old_time)
+
+    log_sink = MemoryLogSink()
+    logger = StructuredLogger(sinks=[log_sink])
+
+    class BrokenRetention(Retention):
+        def clean_completed(self, older_than: float, watch_id: str = "") -> int:
+            msg = "simulated failure"
+            raise OSError(msg)
+
+    retention = BrokenRetention(db_path, logger=logger)
+    result = retention.retention_run(retention_days=7, now=now)
+
+    assert result["total"] == 0
+    entries = log_sink.read_recent()
+    error_entries = [e for e in entries if e.level == LogLevel.ERROR and e.action == "retention"]
+    assert len(error_entries) >= 1
+    assert "retention" in error_entries[0].action
+    assert LogResult.FAILED in (error_entries[0].result,)

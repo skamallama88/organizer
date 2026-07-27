@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict
 
 from organizer.item_processor import BoundaryPolicy
 
@@ -30,6 +30,7 @@ class OrganizerConfig(BaseModel):
     scan_interval: int
     log_level: str
     retention_days: int
+    retention_interval: int
     data_roots: tuple[Path, ...]
     quarantine_root: Path
     watches: tuple[WatchFolderConfig, ...]
@@ -57,6 +58,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
     quarantine_root = _path(document, "quarantine_root", config_root / "quarantine", config_path.parent)
     scan_interval = _positive_int(document.get("scan_interval", 300), "scan_interval")
     retention_days = _positive_int(document.get("retention_days", 7), "retention_days")
+    retention_interval = _positive_int(document.get("retention_interval", 3600), "retention_interval")
     log_level = document.get("log_level", "INFO")
     if not isinstance(log_level, str) or log_level.upper() not in {"DEBUG", "INFO", "WARN", "ERROR"}:
         raise ConfigError("log_level must be DEBUG, INFO, WARN, or ERROR")
@@ -123,6 +125,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
         scan_interval=scan_interval,
         log_level=log_level.upper(),
         retention_days=retention_days,
+        retention_interval=retention_interval,
         data_roots=tuple(data_roots),
         quarantine_root=quarantine_root,
         watches=watches,

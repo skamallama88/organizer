@@ -25,7 +25,7 @@ from organizer.attempt_review import (
     RetryRemaining,
 )
 from organizer.config import WatchFolderConfig
-from organizer.item_processor import ExecutionMode, ItemProcessor, ItemSnapshot, PlanRequest
+from organizer.item_processor import ItemProcessor, ItemSnapshot
 from organizer.operational_health import OperationalHealth
 from organizer.structured_log import LogLevel, MemoryLogSink
 

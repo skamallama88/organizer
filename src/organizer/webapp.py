@@ -1,4 +1,3 @@
-from pathlib import Path
 import logging
 
 from organizer.item_processor import ItemProcessor
@@ -12,7 +11,7 @@ config = load_config()
 db_path = config.database_path
 log_path = config.log_path
 log_sink = MemoryLogSink(limit=1000)
-logger = StructuredLogger(sinks=[StdoutLogSink(), RotatingFileLogSink(log_path), log_sink])
+logger = StructuredLogger(sinks=[StdoutLogSink(), RotatingFileLogSink(log_path, retention_days=config.retention_days), log_sink])
 health_checker = OperationalHealth()
 
 app = create_app(

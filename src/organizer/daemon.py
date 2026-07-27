@@ -16,6 +16,7 @@ from organizer.item_processor import (
     ItemProcessor,
     ItemSnapshot,
 )
+from organizer.retention import Retention
 
 
 class BatchProcessor(Protocol):
@@ -141,17 +142,42 @@ class PeriodicScanner:
         self._stop_event.set()
 
 
+class RetentionService:
+    def __init__(self, retention: Retention, retention_days: int, interval_seconds: float = 3600) -> None:
+        self._retention = retention
+        self._retention_days = retention_days
+        self._interval_seconds = interval_seconds
+        self._stop_event = asyncio.Event()
+
+    async def run(self, *, now: float | None = None) -> None:
+        while not self._stop_event.is_set():
+            self._retention.retention_run(self._retention_days, now=now)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self._interval_seconds)
+            except asyncio.TimeoutError:
+                pass
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop_event.is_set()
+
+
 @dataclass
 class OrganizerDaemon:
     watches: tuple[WatchFolderConfig, ...]
     processor: BatchProcessor
     scanner_interval: float = 300
+    retention: RetentionService | None = None
 
     def __post_init__(self) -> None:
         self.watcher = WatcherService(self.watches, self.processor)
         self.scanner = PeriodicScanner(self.watches, self.processor, self.scanner_interval)
         self._scanner_task: asyncio.Task[None] | None = None
         self._flush_task: asyncio.Task[None] | None = None
+        self._retention_task: asyncio.Task[None] | None = None
         self._stopped = False
 
     @property
@@ -162,6 +188,8 @@ class OrganizerDaemon:
         self.watcher.start()
         self._scanner_task = asyncio.create_task(self.scanner.run())
         self._flush_task = asyncio.create_task(self._flush_watcher())
+        if self.retention is not None:
+            self._retention_task = asyncio.create_task(self.retention.run())
 
     async def _flush_watcher(self) -> None:
         while not self._stopped:
@@ -171,22 +199,49 @@ class OrganizerDaemon:
     async def stop_async(self) -> None:
         self.watcher.stop()
         self.scanner.stop()
+        if self.retention is not None:
+            self.retention.stop()
         if self._scanner_task is not None:
             await self._scanner_task
             self._scanner_task = None
         if self._flush_task is not None:
             self._flush_task.cancel()
             self._flush_task = None
+        if self._retention_task is not None:
+            await self._retention_task
+            self._retention_task = None
         self._stopped = True
 
     def stop(self) -> None:
         self.watcher.stop()
         self.scanner.stop()
+        if self.retention is not None:
+            self.retention.stop()
         if self._flush_task is not None:
             self._flush_task.cancel()
             self._flush_task = None
+        if self._retention_task is not None:
+            self._retention_task.cancel()
+            self._retention_task = None
         self._stopped = True
 
 
-def create_daemon(config: OrganizerConfig, processor: ItemProcessor) -> OrganizerDaemon:
-    return OrganizerDaemon(config.watches, ProcessorBatchAdapter(processor), config.scan_interval)
+def create_daemon(
+    config: OrganizerConfig,
+    processor: ItemProcessor,
+    retention_days: int | None = None,
+    retention_interval: float | None = None,
+) -> OrganizerDaemon:
+    retention_service: RetentionService | None = None
+    if retention_days is not None and retention_days > 0:
+        retention_service = RetentionService(
+            Retention(processor._attempts_path, logger=processor._logger),
+            retention_days=retention_days,
+            interval_seconds=retention_interval or 3600,
+        )
+    return OrganizerDaemon(
+        config.watches,
+        ProcessorBatchAdapter(processor),
+        config.scan_interval,
+        retention=retention_service,
+    )

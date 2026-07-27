@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
 from organizer.config import WatchFolderConfig
-from organizer.daemon import OrganizerDaemon, PeriodicScanner, ProcessorBatchAdapter, WatcherService
+from organizer.daemon import OrganizerDaemon, PeriodicScanner, ProcessorBatchAdapter, RetentionService, WatcherService
 from organizer.item_processor import (
     BatchItemStatus,
     BoundaryPolicy,
@@ -14,6 +15,7 @@ from organizer.item_processor import (
     ItemProcessor,
     ItemSnapshot,
 )
+from organizer.retention import Retention
 
 
 class RecordingProcessor:
@@ -285,3 +287,90 @@ def test_concurrent_triggers_do_not_duplicate_work(tmp_path: Path) -> None:
     assert batch_a.items[0].status == "executed"
     assert batch_b.items[0].status == "skipped"
     assert item.exists()
+
+
+def _init_attempts_db_for_retention(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS processing_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            watch_id TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            rule_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            resulting_paths TEXT NOT NULL,
+            source_fingerprint TEXT NOT NULL DEFAULT '',
+            started_at TEXT NOT NULL DEFAULT '',
+            completed_at TEXT NOT NULL DEFAULT '',
+            abandoned_reason TEXT NOT NULL DEFAULT '',
+            failure_detail TEXT NOT NULL DEFAULT ''
+            )"""
+        )
+
+
+def _create_old_completed(db_path: Path, watch_id: str, timestamp: float) -> str:
+    _init_attempts_db_for_retention(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, source_fingerprint, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("old-completed", watch_id, f"/data/{watch_id}/old.txt", "rule", "completed", "[]", "fp", str(timestamp - 1), str(timestamp)),
+        )
+    return "old-completed"
+
+
+def test_retention_service_cleans_old_attempts_on_interval(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    now = 1000000.0
+    old_time = now - 86400 * 10
+
+    _create_old_completed(db_path, "downloads", old_time)
+
+    retention = Retention(db_path)
+    service = RetentionService(retention, retention_days=7, interval_seconds=0.01)
+
+    async def run() -> None:
+        task = asyncio.create_task(service.run(now=now))
+        await asyncio.sleep(0.03)
+        service.stop()
+        await task
+
+    asyncio.run(run())
+
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT attempt_id FROM processing_attempts").fetchall()
+    assert len(rows) == 0
+
+
+def test_retention_service_preserves_recent_attempts(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    now = 1000000.0
+    old_time = now - 86400
+
+    _create_old_completed(db_path, "downloads", old_time)
+
+    retention = Retention(db_path)
+    service = RetentionService(retention, retention_days=30, interval_seconds=0.01)
+
+    async def run() -> None:
+        task = asyncio.create_task(service.run(now=now))
+        await asyncio.sleep(0.03)
+        service.stop()
+        await task
+
+    asyncio.run(run())
+
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT attempt_id FROM processing_attempts").fetchall()
+    assert len(rows) == 1
+
+
+def test_retention_service_stops_gracefully(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    retention = Retention(db_path)
+    service = RetentionService(retention, retention_days=7, interval_seconds=3600)
+
+    async def run() -> None:
+        service.stop()
+        assert service._stop_event.is_set()
+
+    asyncio.run(run())

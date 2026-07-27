@@ -28,6 +28,7 @@ watches:
     assert config.scan_interval == 30
     assert config.log_level == "DEBUG"
     assert config.retention_days == 14
+    assert config.retention_interval == 3600
     assert config.watches[0].rules_path == (tmp_path / "rules/downloads.yaml").resolve()
     assert config.watches[0].boundary_policy.data_roots == (Path("/data"),)
     assert config.watches[0].boundary_policy.quarantine_root == Path("/data/.quarantine")

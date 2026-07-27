@@ -1082,6 +1082,218 @@ def test_invalid_action_chain_is_rejected_at_planning(tmp_path: Path) -> None:
         ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
 
 
+def test_validate_rules_document_rejects_invalid_yaml(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("not: valid: yaml: [")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert len(diagnostics) >= 1
+    assert "invalid" in diagnostics[0]
+
+
+def test_validate_rules_document_rejects_missing_action_destination(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move: {}
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert any("destination" in d for d in diagnostics)
+
+
+def test_validate_rules_document_rejects_invalid_delete_mode(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - delete:
+          mode: shred
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert any("mode" in d for d in diagnostics)
+
+
+def test_validate_rules_document_rejects_direct_delete_without_opt_in(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - delete:
+          mode: direct
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert any("direct deletion" in d for d in diagnostics)
+
+
+def test_validate_rules_document_rejects_delete_before_other_actions(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - delete:
+          mode: direct
+      - rename:
+          name: newname.txt
+    allow_direct_deletion: true
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert any("cannot accept" in d or "later action" in d for d in diagnostics)
+
+
+def test_validate_rules_document_rejects_unsupported_action(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - compress: {}
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert any("unsupported" in d for d in diagnostics)
+
+
+def test_validate_rules_document_rejects_invalid_archive_extension(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - archive:
+          destination: /tmp
+          extension: .rar
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert any("extension" in d for d in diagnostics)
+
+
+def test_validate_rules_document_rejects_missing_archive_destination(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - archive: {}
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert any("destination" in d for d in diagnostics)
+
+
+def test_validate_rules_document_rejects_invalid_rename_name(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '(.*)'
+    actions:
+      - rename: {}
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert any("name" in d for d in diagnostics)
+
+
+def test_validate_rules_document_rejects_missing_copy_destination(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - copy: {}
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert any("destination" in d for d in diagnostics)
+
+
+def test_validate_rules_document_rejects_unarchive_negative_max_depth(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: test
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - unarchive:
+          destination: /tmp
+          max_depth: -1
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert any("max_depth" in d for d in diagnostics)
+
+
+def test_validate_rules_document_passes_valid_complex_document(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: videos
+    match:
+      field: file_name
+      pattern: '\\.mkv$'
+    actions:
+      - move:
+          destination: ../videos
+  - name: cleaners
+    match:
+      field: file_name
+      pattern: '\\.tmp$'
+    actions:
+      - delete:
+          mode: direct
+    allow_direct_deletion: true
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert not diagnostics
+
+
+def test_validate_rules_document_passes_valid_rename_with_captures(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: tag
+    match:
+      field: file_name
+      pattern: '^(.*) \\[tag\\](\\.\\w+)$'
+    actions:
+      - rename:
+          name: '\\1\\2'
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert not diagnostics
+
+
+def test_validate_rules_document_rejects_invalid_capture_reference(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("""rules:
+  - name: badref
+    match:
+      name: title
+      field: file_name
+      pattern: '(.*)'
+    actions:
+      - rename:
+          name: '\\g<missing>'
+""")
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert any("capture" in d for d in diagnostics)
+
+
 def write_copy_rules(path: Path, destination: str) -> Path:
     path.write_text(
         f"""rules:

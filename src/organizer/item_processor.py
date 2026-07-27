@@ -1006,10 +1006,12 @@ class ItemProcessor:
             raise NeedsReconciliationError(f"source removal uncertain: {error}") from error
 
     @classmethod
-    def validate_rules_document(cls, rules_path: Path) -> list[str]:
+    def validate_rules_document(cls, rules_path: Path, policy: BoundaryPolicy | None = None, watch_root: Path | None = None) -> list[str]:
         """Validate a rules document without requiring an item match.
 
-        Returns a list of diagnostics; an empty list means the document is valid.
+        When *policy* and *watch_root* are provided, destination-boundary
+        validation is also performed.  Returns a list of diagnostics; an empty
+        list means the document is valid.
         """
         diagnostics: list[str] = []
         try:
@@ -1025,20 +1027,117 @@ class ItemProcessor:
             rule_name = rule.get("name") if isinstance(rule, dict) else "unknown"
             rule_name = rule_name if isinstance(rule_name, str) else "unknown"
             try:
-                name, conditions, actions, _, _ = cls._validate_rule(rule)
-                typed_matches: dict[str, re.Match[str]] = {}
-                for condition_name, (field, pattern) in conditions.items():
-                    sample = "sample" if field != "full_path" else "/data/sample"
-                    match = re.search(pattern, sample)
-                    if match is None:
-                        match = re.match(".*", "sample")
-                    if match is None:
-                        raise ValueError(f"could not create sample match for condition {condition_name}")
-                    typed_matches[condition_name] = match
-                cls._validate_action_references(actions, typed_matches)
+                name, conditions, actions, allow_direct_deletion, _ = cls._validate_rule(rule)
+                cls._validate_action_params(actions, name, allow_direct_deletion)
+                cls._validate_capture_references_pattern(actions, conditions)
+                if policy is not None and watch_root is not None:
+                    cls._validate_rule_destinations(actions, name, policy, watch_root)
             except (TypeError, ValueError, re.error) as error:
                 diagnostics.append(f"rule {index + 1} ({rule_name}) invalid: {error}")
         return diagnostics
+
+    @staticmethod
+    def _validate_action_params(actions: list[dict[str, Any]], rule_name: str, allow_direct_deletion: bool) -> None:
+        if not isinstance(actions, list) or not actions:
+            raise ValueError("actions are required")
+        for i, action in enumerate(actions):
+            if not isinstance(action, dict):
+                raise ValueError("each action must be a mapping")
+            if len(action) != 1:
+                raise ValueError("each action must have exactly one key")
+            kind = next(iter(action))
+            params = action[kind]
+            if not isinstance(params, dict):
+                raise ValueError("action params must be a mapping")
+            if kind == "rename":
+                name = params.get("name")
+                if not isinstance(name, str) or not name:
+                    raise ValueError("rename name is required")
+            elif kind == "delete":
+                if i != len(actions) - 1:
+                    raise ValueError("delete result cannot accept a later action")
+                mode = params.get("mode")
+                if mode == "direct":
+                    if not allow_direct_deletion:
+                        raise ValueError("direct deletion requires allow_direct_deletion: true")
+                elif mode == "quarantine":
+                    pass
+                else:
+                    raise ValueError("delete mode must be 'direct' or 'quarantine'")
+            elif kind == "archive":
+                destination = params.get("destination")
+                if not isinstance(destination, str) or not destination:
+                    raise ValueError("archive destination is required")
+                extension = params.get("extension", ".zip")
+                if not isinstance(extension, str) or not extension.startswith("."):
+                    raise ValueError("archive extension is invalid")
+                if extension.lower() not in {".zip", ".7z"}:
+                    raise ValueError("archive extension is unsupported")
+                if "preserve_originals" in params and not isinstance(params["preserve_originals"], bool):
+                    raise ValueError("archive preserve_originals must be boolean")
+            elif kind == "unarchive":
+                destination = params.get("destination", ".")
+                if not isinstance(destination, str) or not destination:
+                    raise ValueError("unarchive destination is required")
+                if "preserve_original" in params and not isinstance(params["preserve_original"], bool):
+                    raise ValueError("unarchive preserve_original must be boolean")
+                if "max_depth" in params:
+                    max_depth = params["max_depth"]
+                    if not isinstance(max_depth, int) or max_depth < 0:
+                        raise ValueError("unarchive max_depth must be non-negative integer")
+            elif kind in ("move", "copy"):
+                destination = params.get("destination")
+                if not isinstance(destination, str) or not destination:
+                    raise ValueError("action destination is required")
+            else:
+                raise ValueError(f"unsupported action: {kind}")
+
+    @staticmethod
+    def _validate_capture_references_pattern(actions: list[dict[str, Any]], conditions: dict[str, tuple[str, str]]) -> None:
+        condition_patterns: dict[str, re.Pattern[str]] = {}
+        for condition_name, (field, pattern_str) in conditions.items():
+            condition_patterns[condition_name] = re.compile(pattern_str)
+        for action in actions:
+            if set(action) == {"rename"} and isinstance(action["rename"], dict):
+                name = action["rename"].get("name")
+                if not isinstance(name, str) or not name:
+                    raise ValueError("rename name is required")
+                for reference in re.findall(r"\\(?:[1-9][0-9]*|g<[^>]+>)", name):
+                    condition_name, capture = ItemProcessor._split_capture_reference(reference)
+                    compiled = condition_patterns.get(condition_name)
+                    if compiled is None:
+                        raise ValueError(f"condition '{condition_name}' not found for capture reference")
+                    if "g<" in capture:
+                        group_name = capture.split("g<", 1)[1].rstrip(">")
+                        if group_name not in compiled.groupindex:
+                            raise ValueError(f"invalid capture reference: group '{group_name}' does not exist in pattern")
+                    else:
+                        group_num = int(capture.lstrip("\\"))
+                        if group_num < 1 or group_num > compiled.groups:
+                            raise ValueError(f"invalid capture reference: group {group_num} does not exist in pattern")
+
+    @classmethod
+    def _validate_rule_destinations(cls, actions: list[dict[str, Any]], rule_name: str, policy: BoundaryPolicy, watch_root: Path) -> None:
+        for action in actions:
+            kind = next(iter(action))
+            params = action[kind]
+            if kind == "archive":
+                destination = params.get("destination", "")
+                cls._check_destination_str(destination, watch_root, policy, rule_name)
+            elif kind == "unarchive":
+                destination = params.get("destination", ".")
+                cls._check_destination_str(destination, watch_root, policy, rule_name)
+            elif kind in ("move", "copy"):
+                destination = params.get("destination", "")
+                cls._check_destination_str(destination, watch_root, policy, rule_name)
+
+    @classmethod
+    def _check_destination_str(cls, destination: str, watch_root: Path, policy: BoundaryPolicy, rule_name: str) -> None:
+        root = Path(destination)
+        if not root.is_absolute():
+            root = watch_root / root
+        destination_root = cls._resolve_destination(root)
+        cls._validate_destination_root(policy, destination_root)
 
     @staticmethod
     def _validate_rule(rule: object) -> tuple[str, dict[str, tuple[str, str]], list[dict[str, Any]], bool, bool]:

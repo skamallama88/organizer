@@ -125,7 +125,7 @@ def create_app(
             watches.append({
                 "id": config.watch_id,
                 "root": config.watch_root,
-                "healthy": accessible and not processor.validate_rules_document(config.rules_path),
+                "healthy": accessible and not processor.validate_rules_document(config.rules_path, policy=config.boundary_policy, watch_root=config.watch_root),
                 "health_detail": detail,
                 "rule_count": _rule_count(config.rules_path),
                 "recent_activity": entries[-1] if entries else None,
@@ -152,7 +152,7 @@ def create_app(
         temp_path = config.rules_path.with_suffix(f"{config.rules_path.suffix}.validate-{uuid.uuid4().hex}")
         try:
             temp_path.write_text(rules)
-            diagnostics = processor.validate_rules_document(temp_path)
+            diagnostics = processor.validate_rules_document(temp_path, policy=config.boundary_policy, watch_root=config.watch_root)
         finally:
             if temp_path.exists():
                 temp_path.unlink()
@@ -168,7 +168,7 @@ def create_app(
         temp_path = config.rules_path.with_suffix(f"{config.rules_path.suffix}.preview-{uuid.uuid4().hex}")
         try:
             temp_path.write_text(rules)
-            diagnostics = processor.validate_rules_document(temp_path)
+            diagnostics = processor.validate_rules_document(temp_path, policy=config.boundary_policy, watch_root=config.watch_root)
             if diagnostics:
                 return HTMLResponse(_rules_feedback("; ".join(diagnostics), error=True), status_code=422)
             try:
@@ -217,7 +217,7 @@ def create_app(
         try:
             with _RULE_SAVE_LOCK:
                 temp_path.write_text(rules)
-                diagnostics = processor.validate_rules_document(temp_path)
+                diagnostics = processor.validate_rules_document(temp_path, policy=config.boundary_policy, watch_root=config.watch_root)
                 if diagnostics:
                     return HTMLResponse(_rules_feedback("; ".join(diagnostics), error=True), status_code=422)
                 try:
@@ -281,7 +281,7 @@ def create_app(
         temp_path = rules_path.with_suffix(f"{rules_path.suffix}.tmp-{uuid.uuid4().hex}")
         try:
             temp_path.write_bytes(body)
-            diagnostics = processor.validate_rules_document(temp_path)
+            diagnostics = processor.validate_rules_document(temp_path, policy=config.boundary_policy, watch_root=config.watch_root)
             if diagnostics:
                 return JSONResponse(status_code=422, content={"detail": "; ".join(diagnostics)})
             try:

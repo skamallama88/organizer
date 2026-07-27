@@ -36,7 +36,7 @@ def make_client(tmp_path: Path) -> tuple[TestClient, Path, MemoryLogSink]:
 
 def test_dashboard_renders_watch_health_rule_count_and_recent_activity(tmp_path: Path) -> None:
     client, rules_path, log_sink = make_client(tmp_path)
-    rules_path.write_text("rules:\n  - name: Archive\n    match: {field: file_name, pattern: .+}\n    actions: [{archive: {format: zip, destination: /tmp}}]\n")
+    rules_path.write_text("rules:\n  - name: Archive\n    match: {field: file_name, pattern: .+}\n    actions: [{move: {destination: ../archives}}]\n")
     log_sink.write(LogEntry.create(
         level=LogLevel.INFO,
         watch="downloads",

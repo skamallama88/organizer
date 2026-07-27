@@ -268,7 +268,7 @@ def status(
     health_checker = OperationalHealth()
     processor = ItemProcessor(attempts_path=attempts_path)
     for watch in config.watches:
-        rules = processor.validate_rules_document(watch.rules_path) if watch.rules_path.exists() else ["rules file missing"]
+        rules = processor.validate_rules_document(watch.rules_path, policy=watch.boundary_policy, watch_root=watch.watch_root) if watch.rules_path.exists() else ["rules file missing"]
         rule_count = _rule_count(watch.rules_path)
         health_result = health_checker.check_watch_folder(watch.watch_id, watch.watch_root)
         health = "healthy" if health_result.accessible and not rules else "unhealthy"

@@ -6,8 +6,8 @@
 
 **Status:** ready-for-agent
 
-- [ ] Make `ruff check src tests` pass and keep pytest and mypy green.
-- [ ] Measure fingerprint cost for large files and folders across planning, execution, and batch processing.
-- [ ] Avoid unnecessary duplicate fingerprint I/O where safety invariants permit caching or reuse.
-- [ ] Reduce duplicated action execution and staging logic where doing so makes safety behavior easier to audit.
-- [ ] Add regression tests proving no-overwrite, source consistency, reconciliation, and completion-skipping invariants remain intact after refactoring.
+- [x] Make `ruff check src tests` pass and keep pytest and mypy green.
+- [x] Measure fingerprint cost for large files and folders across planning, execution, and batch processing.
+- [x] Avoid unnecessary duplicate fingerprint I/O where safety invariants permit caching or reuse.
+- [x] Reduce duplicated action execution and staging logic where doing so makes safety behavior easier to audit.
+- [x] Add regression tests proving no-overwrite, source consistency, reconciliation, and completion-skipping invariants remain intact after refactoring.

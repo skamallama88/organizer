@@ -4,7 +4,6 @@ import asyncio
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
 
 from organizer.config import WatchFolderConfig
 from organizer.daemon import OrganizerDaemon, PeriodicScanner, ProcessorBatchAdapter, RetentionService, WatcherService
@@ -13,7 +12,6 @@ from organizer.item_processor import (
     BoundaryPolicy,
     DiscoveryBatch,
     ItemProcessor,
-    ItemSnapshot,
 )
 from organizer.retention import Retention
 

@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from organizer.retention import Retention
-from organizer.structured_log import LogEntry, LogLevel, LogResult, MemoryLogSink, StructuredLogger
+from organizer.structured_log import LogLevel, LogResult, MemoryLogSink, StructuredLogger
 
 
 def _initialize_db(db_path: Path) -> None:

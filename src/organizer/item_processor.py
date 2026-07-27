@@ -444,18 +444,9 @@ class ItemProcessor:
             try:
                 for action in plan.actions:
                     if action.kind in ("delete", "quarantine"):
-                        needs_reconcile = False
-                        if source.is_dir():
-                            current_fp = self._fingerprint(source)
-                            if current_fp != plan.source_fingerprint:
-                                needs_reconcile = True
-                        else:
-                            if source.stat().st_nlink > 1 and not plan.allow_hard_link_removal:
-                                raise OSError(f"hard-link removal requires allow_hard_link_removal: true ({source.stat().st_nlink} links)")
-                            current_fp = self._fingerprint(source)
-                            if current_fp != plan.source_fingerprint:
-                                needs_reconcile = True
-                        if needs_reconcile:
+                        if source.is_file() and source.stat().st_nlink > 1 and not plan.allow_hard_link_removal:
+                            raise OSError(f"hard-link removal requires allow_hard_link_removal: true ({source.stat().st_nlink} links)")
+                        if self._fingerprint(source) != plan.source_fingerprint:
                             result = ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed", source=source)
                             self._finish_attempt(attempt_id, "needs-reconciliation", results + [result], plan.processing_lineage)
                             self._emit(plan, result)
@@ -480,44 +471,31 @@ class ItemProcessor:
                             result = ActionResult("quarantine", action.target, "OK", source=source, resulting_path=actual_target)
                             source = actual_target
                     elif action.kind == "copy":
-                        staging = self._copy_to_staging(source, action.target)
-                        try:
-                            self._validate_source(plan)
-                        except ValueError as error:
-                            self._remove_tree(staging)
-                            raise OSError(str(error)) from error
-                        self._publish_staged(staging, action.target)
+                        self._stage_validate_publish(plan, source, action.target, self._copy_to_staging)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
                     elif action.kind == "archive":
-                        staging = self._archive_to_staging(source, action.target)
-                        try:
-                            self._validate_source(plan)
-                        except ValueError as error:
-                            self._remove_staging(staging)
-                            raise OSError(str(error)) from error
-                        self._publish_staged(staging, action.target)
+                        self._stage_validate_publish(plan, source, action.target, self._archive_to_staging)
                         if not action.preserve_original:
-                            if self._fingerprint(source) != plan.source_fingerprint:
-                                result = ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)
-                                self._finish_attempt(attempt_id, "needs-reconciliation", results + [result], plan.processing_lineage)
-                                self._emit(plan, result)
-                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [result]))
+                            try:
+                                self._ensure_source_unchanged(plan, source, action, results, attempt_id)
+                            except NeedsReconciliationError:
+                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)]))
                             self._remove_source(source)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
                     elif action.kind == "unarchive":
-                        staging = self._unarchive_to_staging(source, action.target, action.limits, action.max_depth)
-                        try:
-                            self._validate_source(plan)
-                        except ValueError as error:
-                            self._remove_tree(staging)
-                            raise OSError(str(error)) from error
-                        self._publish_staged(staging, action.target)
+                        self._stage_validate_publish(
+                            plan,
+                            source,
+                            action.target,
+                            lambda current, target: self._unarchive_to_staging(
+                                current, target, action.limits, action.max_depth
+                            ),
+                        )
                         if not action.preserve_original:
-                            if self._fingerprint(source) != plan.source_fingerprint:
-                                result = ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)
-                                self._finish_attempt(attempt_id, "needs-reconciliation", results + [result], plan.processing_lineage)
-                                self._emit(plan, result)
-                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [result]))
+                            try:
+                                self._ensure_source_unchanged(plan, source, action, results, attempt_id)
+                            except NeedsReconciliationError:
+                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)]))
                             self._remove_source(source)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
                     else:
@@ -553,6 +531,43 @@ class ItemProcessor:
             return ExecutionReport(status="completed", dry_run=False, actions=tuple(results), handoffs=tuple(handoffs))
         finally:
             self._release_lease(plan.watch_id, plan.source, plan.source_fingerprint)
+
+    def _stage_validate_publish(
+        self,
+        plan: Plan,
+        source: Path,
+        target: Path,
+        stage: Any,
+    ) -> None:
+        staging = stage(source, target)
+        try:
+            self._validate_source(plan)
+        except ValueError as error:
+            self._remove_tree(staging)
+            raise OSError(str(error)) from error
+        self._publish_staged(staging, target)
+
+    def _ensure_source_unchanged(
+        self,
+        plan: Plan,
+        source: Path,
+        action: PlannedAction,
+        results: list[ActionResult],
+        attempt_id: str,
+    ) -> None:
+        if self._fingerprint(source) == plan.source_fingerprint:
+            return
+        result = ActionResult(
+            action.kind,
+            action.target,
+            "UNCERTAIN",
+            "source fingerprint changed before removal",
+            source=source,
+            resulting_path=action.target,
+        )
+        self._finish_attempt(attempt_id, "needs-reconciliation", results + [result], plan.processing_lineage)
+        self._emit(plan, result)
+        raise NeedsReconciliationError("source fingerprint changed before removal")
 
     def attempts(self) -> list[dict[str, object]]:
         with sqlite3.connect(self._attempts_path) as connection:

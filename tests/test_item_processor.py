@@ -265,6 +265,34 @@ def test_delete_refuses_when_source_fingerprint_changes(tmp_path: Path) -> None:
     assert item.read_text() == "changed"
 
 
+def test_execute_reuses_planned_fingerprint_for_non_destructive_actions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    fingerprints = 0
+    original_fingerprint = processor._fingerprint
+
+    def count_fingerprints(path: Path) -> str:
+        nonlocal fingerprints
+        fingerprints += 1
+        return original_fingerprint(path)
+
+    monkeypatch.setattr(processor, "_fingerprint", count_fingerprints)
+
+    report = processor.execute(plan)
+
+    assert report.status == "completed"
+    assert fingerprints == 0
+
+
 def test_delete_folder_requires_stable_tree(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()
@@ -2719,7 +2747,6 @@ def test_cli_check_reports_no_match_through_batch(tmp_path: Path) -> None:
 
 
 def test_web_dry_run_uses_process_batch_and_reports_outcomes(tmp_path: Path) -> None:
-    from organizer.operational_health import OperationalHealth
     from organizer.structured_log import MemoryLogSink
 
     watch_root = tmp_path / "downloads"
@@ -2758,7 +2785,6 @@ def test_web_dry_run_uses_process_batch_and_reports_outcomes(tmp_path: Path) -> 
 
 
 def test_web_dry_run_via_editor_uses_process_batch(tmp_path: Path) -> None:
-    from organizer.operational_health import OperationalHealth
     from organizer.structured_log import MemoryLogSink
 
     watch_root = tmp_path / "downloads"

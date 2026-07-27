@@ -340,6 +340,46 @@ class ItemProcessor:
             boundary_policy=policy,
         )
 
+    def continuation_plan(
+        self,
+        plan: Plan,
+        accepted_action_index: int,
+        resulting_path: Path,
+        resulting_fingerprint: str,
+    ) -> Plan:
+        if accepted_action_index < 0 or accepted_action_index >= len(plan.actions):
+            raise ValueError(f"action index {accepted_action_index} out of range")
+        if plan.rules_path is not None and self._ruleset_revision(plan.rules_path) != plan.ruleset_revision:
+            raise ValueError("stale plan: ruleset revision changed")
+        source = self._canonical_path(resulting_path)
+        if not source.exists():
+            raise ValueError("accepted resulting path does not exist")
+        if source.is_symlink() or self._fingerprint(source) != resulting_fingerprint:
+            raise ValueError("accepted resulting identity no longer matches filesystem evidence")
+        actions = plan.actions[accepted_action_index + 1:]
+        if not actions:
+            raise ValueError("no remaining actions to retry")
+        typed_actions: list[PlannedAction] = []
+        for action in actions:
+            typed_actions.append(action)
+        return Plan(
+            watch_id=plan.watch_id,
+            source=source,
+            source_size=source.stat().st_size,
+            source_mtime=source.stat().st_mtime,
+            rule_name=plan.rule_name,
+            actions=tuple(typed_actions),
+            diagnostics=plan.diagnostics,
+            source_fingerprint=resulting_fingerprint,
+            ruleset_revision=plan.ruleset_revision,
+            rules_path=plan.rules_path,
+            watch_root=plan.watch_root,
+            allow_hard_link_removal=plan.allow_hard_link_removal,
+            source_link_count=source.stat().st_nlink,
+            processing_lineage=plan.processing_lineage,
+            boundary_policy=plan.boundary_policy,
+        )
+
     def _build_processing_lineage(self, request: PlanRequest, policy: BoundaryPolicy, watch_root: Path) -> tuple[str, ...]:
         lineage = tuple(request.processing_lineage)
         current_watch = request.watch_id
@@ -563,11 +603,25 @@ class ItemProcessor:
                 "completed_at TEXT NOT NULL DEFAULT ''",
                 "accepted_results TEXT NOT NULL DEFAULT '[]'",
                 "abandoned_reason TEXT NOT NULL DEFAULT ''",
+                "audit_events TEXT NOT NULL DEFAULT '[]'",
             ):
                 try:
                     connection.execute(f"ALTER TABLE processing_attempts ADD COLUMN {col_sql}")
                 except sqlite3.OperationalError:
                     pass
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS item_observations (
+                watch_id TEXT NOT NULL, source_path TEXT NOT NULL, size INTEGER NOT NULL,
+                mtime REAL NOT NULL, first_seen_at REAL NOT NULL,
+                PRIMARY KEY (watch_id, source_path))"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS processing_suppressions (
+                watch_id TEXT NOT NULL, source_path TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL, attempt_id TEXT NOT NULL,
+                suppressed_at TEXT NOT NULL, reason TEXT NOT NULL,
+                PRIMARY KEY (watch_id, source_path, source_fingerprint))"""
+            )
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS processing_leases (
                 watch_id TEXT NOT NULL,
@@ -578,30 +632,50 @@ class ItemProcessor:
                 PRIMARY KEY (watch_id, source_path, source_fingerprint)
                 )"""
             )
+
+    def record_audit_event(self, attempt_id: str, command: str, detail: str) -> None:
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT audit_events FROM processing_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"attempt not found: {attempt_id}")
+            events = json.loads(row[0] or "[]")
+            events.append({"command": command, "detail": detail, "at": str(time.time())})
             connection.execute(
-                """CREATE TABLE IF NOT EXISTS item_observations (
-                watch_id TEXT NOT NULL,
-                source_path TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                mtime REAL NOT NULL,
-                first_seen_at REAL NOT NULL,
-                PRIMARY KEY (watch_id, source_path)
-                )"""
+                "UPDATE processing_attempts SET audit_events = ? WHERE attempt_id = ?",
+                (json.dumps(events), attempt_id),
             )
+
+    def record_accepted_result(self, attempt_id: str, entry: dict[str, object], command: str) -> None:
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT accepted_results, audit_events FROM processing_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"attempt not found: {attempt_id}")
+            accepted = json.loads(row[0] or "[]")
+            accepted.append({**entry, "command": command})
+            events = json.loads(row[1] or "[]")
+            events.append({"command": command, "detail": str(entry.get("resulting_path", "")), "at": str(time.time())})
             connection.execute(
-                """CREATE TABLE IF NOT EXISTS processing_suppressions (
-                watch_id TEXT NOT NULL,
-                source_path TEXT NOT NULL,
-                source_fingerprint TEXT NOT NULL,
-                attempt_id TEXT NOT NULL,
-                suppressed_at TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                PRIMARY KEY (watch_id, source_path, source_fingerprint)
-                )"""
+                "UPDATE processing_attempts SET accepted_results = ?, audit_events = ? WHERE attempt_id = ?",
+                (json.dumps(accepted), json.dumps(events), attempt_id),
             )
 
     def _start_attempt(self, attempt_id: str, plan: Plan, retry_of_attempt_id: str | None = None) -> None:
-        planned_actions = json.dumps([{"kind": action.kind, "target": str(action.target)} for action in plan.actions])
+        planned_actions = json.dumps([
+            {
+                "kind": action.kind,
+                "target": str(action.target),
+                "preserve_original": action.preserve_original,
+                "limits": list(action.limits),
+                "max_depth": action.max_depth,
+            }
+            for action in plan.actions
+        ])
         started_at = str(time.time())
         with sqlite3.connect(self._attempts_path) as connection:
             connection.execute(

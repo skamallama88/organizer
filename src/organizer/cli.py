@@ -9,7 +9,9 @@ from organizer.attempt_review import (
     Accept,
     AttemptFilters,
     AttemptReview,
+    MarkActionApplied,
     Reopen,
+    RetryRemaining,
     RetryFromStart,
 )
 from organizer.config import OrganizerConfig, WatchFolderConfig, load_config
@@ -204,6 +206,20 @@ def review_abandon(
     review = AttemptReview(processor)
     result = review.command(attempt_id, Abandon(reason=reason))
     typer.echo(f"Abandoned: {result.detail}")
+
+
+@review_app.command("mark-action-applied")
+def review_mark_action_applied(attempt_id: str, action_index: int, resulting_path: str, watch_id: str, config_path: Path = Path("/config/organizer.yaml"), attempts_path: Path = Path("/config/organizer.db")) -> None:
+    watch = _watch(load_config(config_path), watch_id)
+    result = AttemptReview(ItemProcessor(attempts_path=attempts_path)).command(attempt_id, MarkActionApplied(action_index, resulting_path, watch.watch_root, watch.boundary_policy))
+    typer.echo(f"Marked applied: {result.detail}")
+
+
+@review_app.command("retry-remaining")
+def review_retry_remaining(attempt_id: str, action_index: int, resulting_path: str, watch_id: str, config_path: Path = Path("/config/organizer.yaml"), attempts_path: Path = Path("/config/organizer.db")) -> None:
+    watch = _watch(load_config(config_path), watch_id)
+    result = AttemptReview(ItemProcessor(attempts_path=attempts_path)).command(attempt_id, RetryRemaining(action_index, resulting_path, watch.watch_root, watch.boundary_policy))
+    typer.echo(f"Retried remaining: {result.detail}")
 
 
 @review_app.command("reopen")

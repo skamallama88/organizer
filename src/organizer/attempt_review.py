@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-from organizer.item_processor import BoundaryPolicy, ItemProcessor, PlanRequest
+from organizer.item_processor import BoundaryPolicy, ItemProcessor, Plan, PlannedAction, PlanRequest
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,8 @@ class AttemptReviewDetails:
     linked_attempts: tuple[str, ...]
     processing_lineage: tuple[str, ...]
     accepted_results: tuple[dict[str, object], ...]
+    audit_events: tuple[dict[str, object], ...]
+    retry_of_attempt_id: str | None
     abandoned_reason: str
     created_at: str
     completed_at: str
@@ -87,7 +89,23 @@ class RetryFromStart:
     boundary_policy: BoundaryPolicy | None = None
 
 
-AttemptReviewCommand = Accept | Abandon | Reopen | RetryFromStart
+@dataclass(frozen=True)
+class MarkActionApplied:
+    action_index: int
+    resulting_path: str
+    watch_root: Path
+    boundary_policy: BoundaryPolicy | None = None
+
+
+@dataclass(frozen=True)
+class RetryRemaining:
+    action_index: int
+    resulting_path: str
+    watch_root: Path
+    boundary_policy: BoundaryPolicy | None = None
+
+
+AttemptReviewCommand = Accept | MarkActionApplied | RetryRemaining | Abandon | Reopen | RetryFromStart
 
 
 class AttemptReview:
@@ -127,7 +145,7 @@ class AttemptReview:
     def inspect(self, attempt_id: str) -> AttemptReviewDetails:
         with sqlite3.connect(self._attempts_path) as connection:
             row = connection.execute(
-                "SELECT attempt_id, watch_id, source_path, source_fingerprint, source_size, source_mtime, rule_name, status, planned_actions, action_results, resulting_paths, failure_detail, processing_lineage, accepted_results, abandoned_reason, started_at, completed_at, retry_of_attempt_id FROM processing_attempts WHERE attempt_id = ?",
+                "SELECT attempt_id, watch_id, source_path, source_fingerprint, source_size, source_mtime, rule_name, status, planned_actions, action_results, resulting_paths, failure_detail, processing_lineage, accepted_results, abandoned_reason, started_at, completed_at, retry_of_attempt_id, audit_events FROM processing_attempts WHERE attempt_id = ?",
                 (attempt_id,),
             ).fetchone()
         if row is None:
@@ -136,7 +154,7 @@ class AttemptReview:
             db_attempt_id, watch_id, source_path, source_fingerprint, source_size, source_mtime,
             rule_name, status, planned_actions_json, action_results_json, resulting_paths_json,
             failure_detail, lineage_json, accepted_json, abandoned_reason, started_at, completed_at,
-            retry_of_attempt_id,
+            retry_of_attempt_id, audit_json,
         ) = row
         suppressions = self._suppressions_for_attempt(attempt_id)
         linked = self._linked_attempts(attempt_id, retry_of_attempt_id)
@@ -158,6 +176,8 @@ class AttemptReview:
             linked_attempts=tuple(linked),
             processing_lineage=tuple(json.loads(lineage_json or "[]")),
             accepted_results=tuple(json.loads(accepted_json or "[]")),
+            audit_events=tuple(json.loads(audit_json or "[]")),
+            retry_of_attempt_id=retry_of_attempt_id or None,
             abandoned_reason=abandoned_reason or "",
             created_at=started_at or "",
             completed_at=completed_at or "",
@@ -183,6 +203,10 @@ class AttemptReview:
     def command(self, attempt_id: str, command: AttemptReviewCommand) -> CommandResult:
         if isinstance(command, Accept):
             return self._accept(attempt_id, command)
+        if isinstance(command, MarkActionApplied):
+            return self._mark_action_applied(attempt_id, command)
+        if isinstance(command, RetryRemaining):
+            return self._retry_remaining(attempt_id, command)
         if isinstance(command, Abandon):
             return self._abandon(attempt_id, command)
         if isinstance(command, Reopen):
@@ -231,7 +255,9 @@ class AttemptReview:
                         expected_fingerprint = details.source_fingerprint if command.action_index == 0 else ""
                 else:
                     expected_fingerprint = details.source_fingerprint if command.action_index == 0 else ""
-                if expected_fingerprint and fingerprint != expected_fingerprint:
+                if not expected_fingerprint:
+                    raise ValueError("missing expected resulting identity")
+                if fingerprint != expected_fingerprint:
                     raise ValueError("fingerprint mismatch: resulting path does not match expected identity")
         accepted_entry: dict[str, object] = {
             "action_index": command.action_index,
@@ -239,18 +265,93 @@ class AttemptReview:
             "accepted_at": str(time.time()),
             "fingerprint": fingerprint,
         }
-        new_accepted = list(details.accepted_results) + [accepted_entry]
-        with sqlite3.connect(self._attempts_path) as connection:
-            connection.execute(
-                "UPDATE processing_attempts SET accepted_results = ? WHERE attempt_id = ?",
-                (json.dumps(new_accepted), attempt_id),
-            )
+        self._processor.record_accepted_result(attempt_id, accepted_entry, "accept")
         return CommandResult(
             success=True,
             attempt_id=attempt_id,
             status=details.status,
             detail=f"accepted action {command.action_index} resulting path: {command.resulting_path}",
         )
+
+    def _mark_action_applied(self, attempt_id: str, command: MarkActionApplied) -> CommandResult:
+        details = self.inspect(attempt_id)
+        if details.status != "needs-reconciliation":
+            raise ValueError(f"attempt {attempt_id} is not in needs-reconciliation: {details.status}")
+        self._validate_accepted(details, command.action_index, command.resulting_path, command.watch_root, command.boundary_policy)
+        entry = self._accepted_entry(details, command.action_index, command.resulting_path)
+        self._processor.record_accepted_result(attempt_id, entry, "mark-action-applied")
+        return CommandResult(True, attempt_id, details.status, f"marked action {command.action_index} applied")
+
+    def _validate_accepted(self, details: AttemptReviewDetails, index: int, path: str, watch_root: Path, policy: BoundaryPolicy | None) -> None:
+        if index < 0 or index >= len(details.action_results):
+            raise ValueError(f"action index {index} out of range")
+        planned = details.planned_actions[index]
+        target = self._processor._canonical_path(Path(str(planned.get("target", ""))))
+        submitted = self._processor._canonical_path(Path(path))
+        if submitted != target:
+            raise ValueError(f"unexpected resulting path: {path}")
+        self._validate_accepted_path_boundaries(submitted, policy or BoundaryPolicy())
+        if str(planned.get("kind", "")) != "delete":
+            if not submitted.exists() or submitted.is_symlink():
+                raise ValueError("resulting path does not provide valid filesystem evidence")
+            expected = self._processor._fingerprint(submitted)
+            action_result = details.action_results[index]
+            recorded = str(action_result.get("resulting_path") or "")
+            if recorded and self._processor._fingerprint(Path(recorded)) != expected:
+                raise ValueError("fingerprint mismatch: resulting path does not match expected identity")
+
+    def _accepted_entry(self, details: AttemptReviewDetails, index: int, path: str) -> dict[str, object]:
+        planned = details.planned_actions[index]
+        is_delete = str(planned.get("kind", "")) == "delete"
+        fingerprint = "" if is_delete else self._processor._fingerprint(Path(path))
+        return {"action_index": index, "resulting_path": path, "accepted_at": str(time.time()), "fingerprint": fingerprint}
+
+    def _retry_remaining(self, attempt_id: str, command: RetryRemaining) -> CommandResult:
+        details = self.inspect(attempt_id)
+        if details.status != "needs-reconciliation":
+            raise ValueError(f"attempt {attempt_id} is not in needs-reconciliation: {details.status}")
+        accepted = next((entry for entry in details.accepted_results if entry.get("action_index") == command.action_index), None)
+        if accepted is None:
+            raise ValueError("retry-remaining requires an accepted action result")
+        accepted_indexes = sorted(int(str(entry["action_index"])) for entry in details.accepted_results)
+        if accepted_indexes != list(range(command.action_index + 1)):
+            raise ValueError("retry-remaining requires contiguous accepted actions")
+        if str(accepted.get("resulting_path")) != command.resulting_path:
+            raise ValueError("accepted resulting path does not match")
+        source = self._processor._canonical_path(Path(command.resulting_path))
+        if not source.exists() or source.is_symlink():
+            raise ValueError("accepted resulting identity no longer matches filesystem evidence")
+        fingerprint = self._processor._fingerprint(source)
+        if fingerprint != accepted.get("fingerprint"):
+            raise ValueError("accepted resulting identity no longer matches filesystem evidence")
+        actions = []
+        for raw in details.planned_actions:
+            try:
+                raw_limits = raw.get("limits", [])
+                if not isinstance(raw_limits, list):
+                    raise ValueError
+                limits = tuple(int(value) for value in raw_limits)
+                if len(limits) != 3:
+                    raise ValueError
+                raw_depth = raw.get("max_depth", 0)
+                if not isinstance(raw_depth, (int, str)):
+                    raise ValueError
+                actions.append(PlannedAction(str(raw["kind"]), Path(str(raw["target"])), bool(raw.get("preserve_original", True)), limits, int(raw_depth)))
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("historical plan is missing executable action metadata") from error
+        historical = Plan(
+            watch_id=details.watch_id, source=source, source_size=source.stat().st_size,
+            source_mtime=source.stat().st_mtime, rule_name=details.rule_name,
+            actions=tuple(actions), diagnostics=(), source_fingerprint=fingerprint,
+            watch_root=self._processor._canonical_path(command.watch_root), boundary_policy=command.boundary_policy,
+        )
+        plan = self._processor.continuation_plan(historical, command.action_index, source, fingerprint)
+        report = self._processor.execute(plan, retry_of_attempt_id=attempt_id)
+        self._processor.record_audit_event(attempt_id, "retry-remaining", report.status)
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute("SELECT attempt_id FROM processing_attempts WHERE retry_of_attempt_id = ? ORDER BY started_at DESC LIMIT 1", (attempt_id,)).fetchone()
+        new_attempt_id = row[0] if row else None
+        return CommandResult(True, attempt_id, report.status, f"retry remaining: new attempt {new_attempt_id or ''}", new_attempt_id)
 
     def _validate_accepted_path_boundaries(self, path: Path, policy: BoundaryPolicy) -> None:
         if policy.config_root and self._processor._is_within(path, self._processor._canonical_path(policy.config_root)):
@@ -281,6 +382,7 @@ class AttemptReview:
         self._processor._create_suppression(
             details.watch_id, source, details.source_fingerprint, attempt_id, "abandoned",
         )
+        self._processor.record_audit_event(attempt_id, "abandon", command.reason)
         return CommandResult(
             success=True,
             attempt_id=attempt_id,
@@ -304,6 +406,7 @@ class AttemptReview:
         report = self._processor.execute(plan, retry_of_attempt_id=attempt_id)
         if report.status == "completed":
             self._processor.clear_suppression(details.watch_id, source, details.source_fingerprint)
+        self._processor.record_audit_event(attempt_id, "reopen", report.status)
         with sqlite3.connect(self._attempts_path) as connection:
             row = connection.execute(
                 "SELECT attempt_id FROM processing_attempts WHERE retry_of_attempt_id = ? ORDER BY started_at DESC LIMIT 1",
@@ -334,6 +437,7 @@ class AttemptReview:
         report = self._processor.execute(plan, retry_of_attempt_id=attempt_id)
         if report.status == "completed":
             self._processor.clear_suppression(details.watch_id, source, details.source_fingerprint)
+        self._processor.record_audit_event(attempt_id, "retry-from-start", report.status)
         with sqlite3.connect(self._attempts_path) as connection:
             row = connection.execute(
                 "SELECT attempt_id FROM processing_attempts WHERE retry_of_attempt_id = ? ORDER BY started_at DESC LIMIT 1",

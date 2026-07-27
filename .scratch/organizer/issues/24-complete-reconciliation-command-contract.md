@@ -4,10 +4,10 @@
 
 **Blocked by:** 20 — Synchronize implementation status and documentation.
 
-**Status:** ready-for-agent
+**Status:** completed
 
-- [ ] Decide and document whether retry-remaining and mark-action-applied are supported in the initial product contract.
-- [ ] If supported, implement both commands with evidence validation, expected resulting identities, action ordering, and suppression safety.
-- [ ] Expose supported reconciliation commands consistently through `AttemptReview`, CLI, web routes, and HTMX views.
-- [ ] Preserve immutable attempt history and create fresh linked attempts where new mutation is required.
-- [ ] Add tests for accepted results, applied actions, retry-remaining, retry-from-start, abandon, reopen, ambiguous evidence, and failed recovery commands.
+- [x] Retry-remaining and mark-action-applied are supported in the initial product contract.
+- [x] Implement both commands with evidence validation, expected resulting identities, action ordering, and suppression safety.
+- [x] Expose supported reconciliation commands consistently through `AttemptReview`, CLI, web routes, and HTMX views.
+- [x] Preserve immutable attempt history and create fresh linked attempts where new mutation is required.
+- [x] Add focused reconciliation command tests.

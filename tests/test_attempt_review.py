@@ -11,7 +11,9 @@ from organizer.attempt_review import (
     AttemptFilters,
     AttemptReview,
     AttemptSummary,
+    MarkActionApplied,
     Reopen,
+    RetryRemaining,
     RetryFromStart,
 )
 from organizer.item_processor import (
@@ -68,6 +70,25 @@ def write_archive_rules(path: Path, destination: str, preserve_original: bool = 
     return path
 
 
+def write_uncertain_then_move_rules(path: Path, destination: str) -> Path:
+    path.write_text(
+        f"""rules:
+  - name: archive then move
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - archive:
+          destination: {destination}
+          extension: .zip
+          preserve_originals: false
+      - move:
+          destination: {destination}
+"""
+    )
+    return path
+
+
 def _create_needs_reconciliation_attempt(tmp_path: Path) -> tuple[ItemProcessor, str, Path, Path, Path]:
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()
@@ -109,6 +130,39 @@ def _create_uncertain_archive_attempt(tmp_path: Path) -> tuple[ItemProcessor, st
             watch_root=watch_root,
             item=item,
             rules_path=rules,
+        )
+    )
+    original_publish = processor._publish_staged
+
+    def publish_then_change(staging: Path, target: Path) -> None:
+        original_publish(staging, target)
+        item.write_text("changed")
+
+    processor._publish_staged = publish_then_change  # type: ignore[method-assign]
+    report = processor.execute(plan)
+    assert report.status == "needs-reconciliation"
+    archive_path = destination / "movie.mkv.zip"
+    assert archive_path.exists()
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        row = conn.execute(
+            "SELECT attempt_id FROM processing_attempts WHERE status = ?",
+            ("needs-reconciliation",),
+        ).fetchone()
+    return processor, row[0], watch_root, rules, archive_path
+
+
+def _create_uncertain_continuation_attempt(tmp_path: Path) -> tuple[ItemProcessor, str, Path, Path, Path]:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_uncertain_then_move_rules(watch_root / "rules.yaml", "../archives")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(
+        __import__("organizer.item_processor", fromlist=["PlanRequest"]).PlanRequest(
+            watch_id="downloads", watch_root=watch_root, item=item, rules_path=rules,
         )
     )
     original_publish = processor._publish_staged
@@ -261,6 +315,71 @@ def test_accept_creates_immutable_accepted_result(tmp_path: Path) -> None:
     assert details.accepted_results[0]["action_index"] == 0
     assert details.accepted_results[0]["resulting_path"] == resulting_path
     assert details.accepted_results[0].get("fingerprint", "") != ""
+
+
+def test_mark_action_applied_records_audit_and_requires_evidence(tmp_path: Path) -> None:
+    processor, attempt_id, watch_root, _, archive_path = _create_uncertain_archive_attempt(tmp_path)
+    review = AttemptReview(processor)
+
+    result = review.command(
+        attempt_id,
+        MarkActionApplied(action_index=0, resulting_path=str(archive_path), watch_root=watch_root),
+    )
+
+    assert result.success is True
+    details = review.inspect(attempt_id)
+    assert details.accepted_results[0]["action_index"] == 0
+    assert details.accepted_results[0]["command"] == "mark-action-applied"
+    assert any(event["command"] == "mark-action-applied" for event in details.audit_events)
+
+
+def test_retry_remaining_executes_only_historical_suffix_and_links_attempt(tmp_path: Path) -> None:
+    processor, attempt_id, watch_root, rules, archive_path = _create_uncertain_continuation_attempt(tmp_path)
+    review = AttemptReview(processor)
+    review.command(
+        attempt_id,
+        Accept(action_index=0, resulting_path=str(archive_path), watch_root=watch_root),
+    )
+
+    result = review.command(
+        attempt_id,
+        RetryRemaining(action_index=0, resulting_path=str(archive_path), watch_root=watch_root),
+    )
+
+    assert result.success is True
+    assert result.new_attempt_id is not None
+    assert (tmp_path / "archives" / "movie.mkv.zip").exists() is True
+    assert (tmp_path / "archives" / "movie.mkv.zip" / "movie.mkv.zip").exists() is False
+    new_details = review.inspect(result.new_attempt_id)
+    assert [action["kind"] for action in new_details.planned_actions] == ["move"]
+    assert new_details.source_path == str(archive_path)
+    assert new_details.retry_of_attempt_id == attempt_id
+    assert review.inspect(attempt_id).status == "needs-reconciliation"
+
+
+def test_retry_remaining_rejects_changed_accepted_identity(tmp_path: Path) -> None:
+    processor, attempt_id, watch_root, _, archive_path = _create_uncertain_continuation_attempt(tmp_path)
+    review = AttemptReview(processor)
+    review.command(attempt_id, Accept(action_index=0, resulting_path=str(archive_path), watch_root=watch_root))
+    archive_path.write_text("changed")
+
+    with pytest.raises(ValueError, match="identity"):
+        review.command(
+            attempt_id,
+            RetryRemaining(action_index=0, resulting_path=str(archive_path), watch_root=watch_root),
+        )
+
+
+def test_retry_remaining_rejects_when_no_actions_remain(tmp_path: Path) -> None:
+    processor, attempt_id, watch_root, _, archive_path = _create_uncertain_archive_attempt(tmp_path)
+    review = AttemptReview(processor)
+    review.command(attempt_id, Accept(action_index=0, resulting_path=str(archive_path), watch_root=watch_root))
+
+    with pytest.raises(ValueError, match="no remaining actions"):
+        review.command(
+            attempt_id,
+            RetryRemaining(action_index=0, resulting_path=str(archive_path), watch_root=watch_root),
+        )
 
 
 def test_accept_is_immutable(tmp_path: Path) -> None:

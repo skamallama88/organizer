@@ -19,8 +19,10 @@ from organizer.attempt_review import (
     AttemptFilters,
     AttemptReviewDetails,
     AttemptReview,
+    MarkActionApplied,
     Reopen,
     RetryFromStart,
+    RetryRemaining,
 )
 from organizer.config import WatchFolderConfig
 from organizer.item_processor import ExecutionMode, ItemProcessor, ItemSnapshot, PlanRequest
@@ -97,6 +99,7 @@ def create_app(
             "linked_attempts": list(details.linked_attempts),
             "processing_lineage": list(details.processing_lineage),
             "accepted_results": list(details.accepted_results),
+            "audit_events": list(details.audit_events),
             "abandoned_reason": details.abandoned_reason,
             "created_at": details.created_at,
             "completed_at": details.completed_at,
@@ -376,6 +379,36 @@ def create_app(
         if _is_html_request(request):
             return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
         return {"success": result.success, "attempt_id": result.attempt_id, "status": result.status, "detail": result.detail}
+
+    @app.post("/attempts/{attempt_id}/mark-action-applied", response_model=None)
+    def mark_action_applied(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
+        try:
+            payload = _form_or_json(body)
+            details = review.inspect(attempt_id)
+            config = _watch_config(details.watch_id)
+            if config is None:
+                return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
+            result = review.command(attempt_id, MarkActionApplied(int(str(payload["action_index"])), str(payload["resulting_path"]), config.watch_root, config.boundary_policy))
+        except (KeyError, ValueError) as error:
+            return JSONResponse(status_code=422, content={"detail": str(error)})
+        if _is_html_request(request):
+            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
+        return {"success": result.success, "attempt_id": result.attempt_id, "status": result.status, "detail": result.detail}
+
+    @app.post("/attempts/{attempt_id}/retry-remaining", response_model=None)
+    def retry_remaining(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
+        try:
+            payload = _form_or_json(body)
+            details = review.inspect(attempt_id)
+            config = _watch_config(details.watch_id)
+            if config is None:
+                return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
+            result = review.command(attempt_id, RetryRemaining(int(str(payload["action_index"])), str(payload["resulting_path"]), config.watch_root, config.boundary_policy))
+        except (KeyError, ValueError) as error:
+            return JSONResponse(status_code=422, content={"detail": str(error)})
+        if _is_html_request(request):
+            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
+        return {"success": result.success, "attempt_id": result.attempt_id, "status": result.status, "detail": result.detail, "new_attempt_id": result.new_attempt_id}
 
     @app.post("/attempts/{attempt_id}/reopen", response_model=None)
     def reopen_attempt(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:

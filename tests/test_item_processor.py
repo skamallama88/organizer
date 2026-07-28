@@ -15,11 +15,13 @@ from organizer.web import WatchFolderConfig, create_app
 import pytest
 
 from organizer.item_processor import (
+    _AttemptStore,
     BatchItemStatus,
     BoundaryPolicy,
     ExecutionMode,
     ItemProcessor,
     ItemSnapshot,
+    Plan,
     PlanRequest,
 )
 from organizer.operational_health import OperationalHealth, PersistenceHealth, WatchFolderHealth
@@ -3141,3 +3143,130 @@ def test_health_recovery_after_restoration_resumes_processing(tmp_path: Path) ->
     assert not any("paused" in d.lower() for d in batch.diagnostics)
     assert len(batch.items) == 1
     assert batch.items[0].status == BatchItemStatus.EXECUTED
+
+
+def _make_test_plan(tmp_path: Path, **overrides: object) -> Plan:
+    params: dict[str, object] = dict(
+        watch_id="test", source=tmp_path / "item.txt", source_size=4,
+        source_mtime=1000.0, rule_name="test", actions=(),
+        source_fingerprint="fp1", diagnostics=(),
+    )
+    params.update(overrides)
+    return Plan(**params)  # type: ignore[arg-type]
+
+
+class TestAttemptStore:
+    """Direct unit tests for the internal _AttemptStore persistence layer."""
+
+    def test_initialize_creates_tables(self, tmp_path: Path) -> None:
+        db = tmp_path / "store.db"
+        store = _AttemptStore(db)
+        store.initialize()
+        with sqlite3.connect(db) as conn:
+            tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+        names = [row[0] for row in tables]
+        assert "processing_attempts" in names
+        assert "processing_suppressions" in names
+        assert "processing_leases" in names
+        assert "item_observations" in names
+
+    def test_initialize_is_idempotent(self, tmp_path: Path) -> None:
+        db = tmp_path / "store.db"
+        store = _AttemptStore(db)
+        store.initialize()
+        store.initialize()
+
+    def test_start_and_finish_attempt(self, tmp_path: Path) -> None:
+        db = tmp_path / "store.db"
+        store = _AttemptStore(db)
+        store.initialize()
+        plan = _make_test_plan(tmp_path)
+        store.start_attempt("att-1", plan)
+        store.finish_attempt("att-1", "completed", [])
+        attempts = store.list_attempts()
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "completed"
+
+    def test_start_attempt_with_retry_link(self, tmp_path: Path) -> None:
+        db = tmp_path / "store.db"
+        store = _AttemptStore(db)
+        store.initialize()
+        plan = _make_test_plan(tmp_path)
+        store.start_attempt("att-1", plan)
+        store.start_attempt("att-2", plan, retry_of_attempt_id="att-1")
+        store.finish_attempt("att-2", "completed", [])
+        attempts = store.list_attempts()
+        assert attempts[1]["retry_of_attempt_id"] == "att-1"
+
+    def test_acquire_and_release_lease(self, tmp_path: Path) -> None:
+        db = tmp_path / "store.db"
+        store = _AttemptStore(db)
+        store.initialize()
+        source = tmp_path / "item.txt"
+        source.write_text("data")
+        assert store.acquire_lease("test", source, "fp1") is True
+        assert store.acquire_lease("test", source, "fp1") is False
+        store.release_lease("test", source, "fp1")
+        assert store.acquire_lease("test", source, "fp1") is True
+
+    def test_has_completed_attempt(self, tmp_path: Path) -> None:
+        db = tmp_path / "store.db"
+        store = _AttemptStore(db)
+        store.initialize()
+        plan = _make_test_plan(tmp_path)
+        assert store.has_completed_attempt("test", plan.source, "fp1") is False
+        store.start_attempt("att-1", plan)
+        store.finish_attempt("att-1", "completed", [])
+        assert store.has_completed_attempt("test", plan.source, "fp1") is True
+
+    def test_suppression_lifecycle(self, tmp_path: Path) -> None:
+        db = tmp_path / "store.db"
+        store = _AttemptStore(db)
+        store.initialize()
+        source = tmp_path / "item.txt"
+        source.write_text("data")
+        assert store.has_suppressed_attempt("test", source, "fp1") is False
+        store.create_suppression("test", source, "fp1", "att-1", "collision")
+        assert store.has_suppressed_attempt("test", source, "fp1") is True
+        suppressions = store.list_suppressions()
+        assert len(suppressions) == 1
+        assert suppressions[0]["reason"] == "collision"
+        store.clear_suppression("test", source, "fp1")
+        assert store.has_suppressed_attempt("test", source, "fp1") is False
+
+    def test_stability_tracking(self, tmp_path: Path) -> None:
+        db = tmp_path / "store.db"
+        store = _AttemptStore(db)
+        store.initialize()
+        snapshot = ItemSnapshot(path=tmp_path / "item.txt", size=4, mtime=1000.0)
+        assert store.is_stable("test", snapshot, now=1000.0, stability_interval=0.0) is True
+        assert store.is_stable("test", snapshot, now=1000.0, stability_interval=5.0) is False
+        assert store.is_stable("test", snapshot, now=1005.0, stability_interval=5.0) is True
+
+    def test_recover_stale_leases(self, tmp_path: Path) -> None:
+        db = tmp_path / "store.db"
+        store = _AttemptStore(db)
+        store.initialize()
+        plan = _make_test_plan(tmp_path)
+        store.start_attempt("stale-1", plan)
+        store.acquire_lease("test", plan.source, "fp1")
+        recovered = store.recover_stale_leases()
+        assert "stale-1" in recovered
+
+    def test_record_audit_and_accepted_results(self, tmp_path: Path) -> None:
+        db = tmp_path / "store.db"
+        store = _AttemptStore(db)
+        store.initialize()
+        plan = _make_test_plan(tmp_path)
+        store.start_attempt("att-1", plan)
+        store.finish_attempt("att-1", "needs-reconciliation", [])
+        store.record_audit_event("att-1", "review", "inspected")
+        store.record_accepted_result("att-1", {"resulting_path": "/tmp/out"}, "accept")
+
+    def test_persistence_check(self, tmp_path: Path) -> None:
+        db = tmp_path / "store.db"
+        store = _AttemptStore(db)
+        store.initialize()
+        assert store.check_writable() is True

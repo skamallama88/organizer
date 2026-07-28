@@ -146,6 +146,299 @@ class NeedsReconciliationError(Exception):
     """Raised when an action has published output but source cleanup is uncertain."""
 
 
+class _AttemptStore:
+    """Internal persistence layer for processing attempts, suppressions, and leases."""
+
+    def __init__(self, attempts_path: Path) -> None:
+        self._attempts_path = attempts_path
+        self.initialize()
+
+    def initialize(self) -> None:
+        self._attempts_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self._attempts_path) as connection:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS processing_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                watch_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                rule_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                resulting_paths TEXT NOT NULL,
+                copy_provenance TEXT,
+                action_results TEXT NOT NULL DEFAULT '[]',
+                source_fingerprint TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            for col in ("retry_of_attempt_id", "failure_detail", "processing_lineage"):
+                try:
+                    connection.execute(f"ALTER TABLE processing_attempts ADD COLUMN {col} TEXT")
+                except sqlite3.OperationalError:
+                    pass
+            for col_sql in (
+                "planned_actions TEXT NOT NULL DEFAULT '[]'",
+                "source_size INTEGER NOT NULL DEFAULT 0",
+                "source_mtime REAL NOT NULL DEFAULT 0.0",
+                "started_at TEXT NOT NULL DEFAULT ''",
+                "completed_at TEXT NOT NULL DEFAULT ''",
+                "accepted_results TEXT NOT NULL DEFAULT '[]'",
+                "abandoned_reason TEXT NOT NULL DEFAULT ''",
+                "audit_events TEXT NOT NULL DEFAULT '[]'",
+            ):
+                try:
+                    connection.execute(f"ALTER TABLE processing_attempts ADD COLUMN {col_sql}")
+                except sqlite3.OperationalError:
+                    pass
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS item_observations (
+                watch_id TEXT NOT NULL, source_path TEXT NOT NULL, size INTEGER NOT NULL,
+                mtime REAL NOT NULL, first_seen_at REAL NOT NULL,
+                PRIMARY KEY (watch_id, source_path))"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS processing_suppressions (
+                watch_id TEXT NOT NULL, source_path TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL, attempt_id TEXT NOT NULL,
+                suppressed_at TEXT NOT NULL, reason TEXT NOT NULL,
+                PRIMARY KEY (watch_id, source_path, source_fingerprint))"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS processing_leases (
+                watch_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                PRIMARY KEY (watch_id, source_path, source_fingerprint)
+                )"""
+            )
+
+    def start_attempt(self, attempt_id: str, plan: Plan, retry_of_attempt_id: str | None = None) -> None:
+        planned_actions = json.dumps([
+            {
+                "kind": action.kind,
+                "target": str(action.target),
+                "preserve_original": action.preserve_original,
+                "limits": list(action.limits),
+                "max_depth": action.max_depth,
+            }
+            for action in plan.actions
+        ])
+        started_at = str(time.time())
+        with sqlite3.connect(self._attempts_path) as connection:
+            connection.execute(
+                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance, source_fingerprint, retry_of_attempt_id, processing_lineage, planned_actions, source_size, source_mtime, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None, plan.source_fingerprint, retry_of_attempt_id, json.dumps(list(plan.processing_lineage)), planned_actions, plan.source_size, plan.source_mtime, started_at),
+            )
+
+    def finish_attempt(self, attempt_id: str, status: str, results: list[ActionResult], processing_lineage: tuple[str, ...] = ()) -> None:
+        paths = [str(result.resulting_path or result.target) for result in results if result.result == "OK"]
+        provenance = next((json.dumps({"source": str(result.source), "result": str(result.resulting_path)}) for result in results if result.kind == "copy" and result.result == "OK"), None)
+        action_results = json.dumps([{"kind": result.kind, "target": str(result.target), "result": result.result, "detail": result.detail, "source": str(result.source) if result.source else None, "resulting_path": str(result.resulting_path) if result.resulting_path else None} for result in results])
+        failure_detail = results[-1].detail if status == "failed" and results else ""
+        completed_at = str(time.time())
+        with sqlite3.connect(self._attempts_path) as connection:
+            connection.execute(
+                "UPDATE processing_attempts SET status = ?, resulting_paths = ?, copy_provenance = ?, action_results = ?, failure_detail = ?, processing_lineage = ?, completed_at = ? WHERE attempt_id = ?",
+                (status, json.dumps(paths), provenance, action_results, failure_detail, json.dumps(list(processing_lineage)), completed_at, attempt_id),
+            )
+
+    def acquire_lease(self, watch_id: str, source: Path, fingerprint: str) -> bool:
+        canonical = str(self._canonical_path(source))
+        try:
+            with sqlite3.connect(self._attempts_path) as connection:
+                connection.execute(
+                    "INSERT INTO processing_leases (watch_id, source_path, source_fingerprint, attempt_id, acquired_at) VALUES (?, ?, ?, ?, ?)",
+                    (watch_id, canonical, fingerprint, "", str(time.time())),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def release_lease(self, watch_id: str, source: Path, fingerprint: str) -> None:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            connection.execute(
+                "DELETE FROM processing_leases WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
+                (watch_id, canonical, fingerprint),
+            )
+
+    def has_active_lease(self, watch_id: str, source: Path, fingerprint: str) -> bool:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM processing_leases WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
+                (watch_id, canonical, fingerprint),
+            ).fetchone()
+        return int(row[0]) > 0
+
+    def has_completed_attempt(self, watch_id: str, source: Path, fingerprint: str) -> bool:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM processing_attempts WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ? AND status = ?",
+                (watch_id, canonical, fingerprint, "completed"),
+            ).fetchone()
+        return int(row[0]) > 0
+
+    def has_suppressed_attempt(self, watch_id: str, source: Path, fingerprint: str) -> bool:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM processing_suppressions WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
+                (watch_id, canonical, fingerprint),
+            ).fetchone()
+        return int(row[0]) > 0
+
+    def create_suppression(self, watch_id: str, source: Path, fingerprint: str, attempt_id: str, reason: str) -> None:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO processing_suppressions (watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                (watch_id, canonical, fingerprint, attempt_id, str(time.time()), reason),
+            )
+
+    def clear_suppression(self, watch_id: str, source: Path, fingerprint: str) -> None:
+        canonical = str(self._canonical_path(source))
+        with sqlite3.connect(self._attempts_path) as connection:
+            connection.execute(
+                "DELETE FROM processing_suppressions WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
+                (watch_id, canonical, fingerprint),
+            )
+
+    def list_attempts(self) -> list[dict[str, object]]:
+        with sqlite3.connect(self._attempts_path) as connection:
+            rows = connection.execute(
+                "SELECT status, resulting_paths, copy_provenance, failure_detail, retry_of_attempt_id, processing_lineage FROM processing_attempts ORDER BY rowid"
+            ).fetchall()
+        result: list[dict[str, object]] = []
+        for row in rows:
+            status, paths, provenance, failure_detail, retry_of, lineage_json = row
+            entry: dict[str, object] = {"status": status, "resulting_paths": json.loads(paths)}
+            if provenance:
+                entry["copy_provenance"] = json.loads(provenance)
+            if failure_detail:
+                entry["failure_detail"] = failure_detail
+            if retry_of:
+                entry["retry_of_attempt_id"] = retry_of
+            if lineage_json:
+                entry["processing_lineage"] = json.loads(lineage_json)
+            result.append(entry)
+        return result
+
+    def list_suppressions(self) -> list[dict[str, object]]:
+        with sqlite3.connect(self._attempts_path) as connection:
+            rows = connection.execute(
+                "SELECT watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason FROM processing_suppressions ORDER BY suppressed_at"
+            ).fetchall()
+        return [
+            {
+                "watch_id": watch_id,
+                "source_path": source_path,
+                "source_fingerprint": source_fingerprint,
+                "attempt_id": attempt_id,
+                "suppressed_at": suppressed_at,
+                "reason": reason,
+            }
+            for watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason in rows
+        ]
+
+    def record_audit_event(self, attempt_id: str, command: str, detail: str) -> None:
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT audit_events FROM processing_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"attempt not found: {attempt_id}")
+            events = json.loads(row[0] or "[]")
+            events.append({"command": command, "detail": detail, "at": str(time.time())})
+            connection.execute(
+                "UPDATE processing_attempts SET audit_events = ? WHERE attempt_id = ?",
+                (json.dumps(events), attempt_id),
+            )
+
+    def record_accepted_result(self, attempt_id: str, entry: dict[str, object], command: str) -> None:
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT accepted_results, audit_events FROM processing_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"attempt not found: {attempt_id}")
+            accepted = json.loads(row[0] or "[]")
+            accepted.append({**entry, "command": command})
+            events = json.loads(row[1] or "[]")
+            events.append({"command": command, "detail": str(entry.get("resulting_path", "")), "at": str(time.time())})
+            connection.execute(
+                "UPDATE processing_attempts SET accepted_results = ?, audit_events = ? WHERE attempt_id = ?",
+                (json.dumps(accepted), json.dumps(events), attempt_id),
+            )
+
+    def is_stable(self, watch_id: str, snapshot: ItemSnapshot, *, now: float, stability_interval: float) -> bool:
+        canonical = str(self._canonical_path(snapshot.path))
+        with sqlite3.connect(self._attempts_path) as connection:
+            row = connection.execute(
+                "SELECT size, mtime, first_seen_at FROM item_observations WHERE watch_id = ? AND source_path = ?",
+                (watch_id, canonical),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO item_observations (watch_id, source_path, size, mtime, first_seen_at) VALUES (?, ?, ?, ?, ?)",
+                    (watch_id, canonical, snapshot.size, snapshot.mtime, now),
+                )
+                return stability_interval <= 0.0
+            stored_size, stored_mtime, first_seen_at = row
+            if stored_size != snapshot.size or stored_mtime != snapshot.mtime:
+                connection.execute(
+                    "UPDATE item_observations SET size = ?, mtime = ?, first_seen_at = ? WHERE watch_id = ? AND source_path = ?",
+                    (snapshot.size, snapshot.mtime, now, watch_id, canonical),
+                )
+                return stability_interval <= 0.0
+            return (now - float(first_seen_at)) >= stability_interval
+
+    def recover_stale_leases(self) -> list[str]:
+        recovered: list[str] = []
+        with sqlite3.connect(self._attempts_path) as connection:
+            leases = connection.execute(
+                "SELECT watch_id, source_path, source_fingerprint FROM processing_leases"
+            ).fetchall()
+            for watch_id, source_path, source_fingerprint in leases:
+                rows = connection.execute(
+                    "SELECT attempt_id FROM processing_attempts WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ? AND status = ?",
+                    (watch_id, source_path, source_fingerprint, "started"),
+                ).fetchall()
+                for (attempt_id,) in rows:
+                    connection.execute(
+                        "UPDATE processing_attempts SET status = ? WHERE attempt_id = ?",
+                        ("needs-reconciliation", attempt_id),
+                    )
+                    recovered.append(attempt_id)
+                connection.execute(
+                    "DELETE FROM processing_leases WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
+                    (watch_id, source_path, source_fingerprint),
+                )
+        return recovered
+
+    def record_collision_attempt(self, attempt_id: str, watch_id: str, canonical: Path, fingerprint: str, error: Exception) -> None:
+        with sqlite3.connect(self._attempts_path) as connection:
+            connection.execute(
+                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, action_results, source_fingerprint, failure_detail, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (attempt_id, watch_id, str(canonical), "unknown", "failed", "[]", "[]", fingerprint, str(error), str(time.time())),
+            )
+
+    def check_writable(self) -> bool:
+        try:
+            with sqlite3.connect(self._attempts_path) as connection:
+                connection.execute("SELECT 1")
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+    @staticmethod
+    def _canonical_path(path: Path) -> Path:
+        return Path(os.path.abspath(os.path.normpath(path))).resolve(strict=False)
+
+
 class ItemProcessor:
     """Plans and executes item actions without exposing storage details to callers."""
 
@@ -160,7 +453,7 @@ class ItemProcessor:
         self._events = events if events is not None else []
         self._logger = logger
         self._health_checker = health_checker
-        self._initialize_attempts()
+        self._store = _AttemptStore(attempts_path)
 
     def plan(self, request: PlanRequest) -> Plan:
         policy = request.boundary_policy or BoundaryPolicy()
@@ -592,145 +885,19 @@ class ItemProcessor:
         raise NeedsReconciliationError("source fingerprint changed before removal")
 
     def attempts(self) -> list[dict[str, object]]:
-        with sqlite3.connect(self._attempts_path) as connection:
-            rows = connection.execute(
-                "SELECT status, resulting_paths, copy_provenance, failure_detail, retry_of_attempt_id, processing_lineage FROM processing_attempts ORDER BY rowid"
-            ).fetchall()
-        result: list[dict[str, object]] = []
-        for row in rows:
-            status, paths, provenance, failure_detail, retry_of, lineage_json = row
-            entry: dict[str, object] = {"status": status, "resulting_paths": json.loads(paths)}
-            if provenance:
-                entry["copy_provenance"] = json.loads(provenance)
-            if failure_detail:
-                entry["failure_detail"] = failure_detail
-            if retry_of:
-                entry["retry_of_attempt_id"] = retry_of
-            if lineage_json:
-                entry["processing_lineage"] = json.loads(lineage_json)
-            result.append(entry)
-        return result
-
-    def _initialize_attempts(self) -> None:
-        self._attempts_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._attempts_path) as connection:
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS processing_attempts (
-                attempt_id TEXT PRIMARY KEY,
-                watch_id TEXT NOT NULL,
-                source_path TEXT NOT NULL,
-                rule_name TEXT NOT NULL,
-                status TEXT NOT NULL,
-                resulting_paths TEXT NOT NULL,
-                copy_provenance TEXT,
-                action_results TEXT NOT NULL DEFAULT '[]',
-                source_fingerprint TEXT NOT NULL DEFAULT ''
-                )"""
-            )
-            for col in ("retry_of_attempt_id", "failure_detail", "processing_lineage"):
-                try:
-                    connection.execute(f"ALTER TABLE processing_attempts ADD COLUMN {col} TEXT")
-                except sqlite3.OperationalError:
-                    pass
-            for col_sql in (
-                "planned_actions TEXT NOT NULL DEFAULT '[]'",
-                "source_size INTEGER NOT NULL DEFAULT 0",
-                "source_mtime REAL NOT NULL DEFAULT 0.0",
-                "started_at TEXT NOT NULL DEFAULT ''",
-                "completed_at TEXT NOT NULL DEFAULT ''",
-                "accepted_results TEXT NOT NULL DEFAULT '[]'",
-                "abandoned_reason TEXT NOT NULL DEFAULT ''",
-                "audit_events TEXT NOT NULL DEFAULT '[]'",
-            ):
-                try:
-                    connection.execute(f"ALTER TABLE processing_attempts ADD COLUMN {col_sql}")
-                except sqlite3.OperationalError:
-                    pass
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS item_observations (
-                watch_id TEXT NOT NULL, source_path TEXT NOT NULL, size INTEGER NOT NULL,
-                mtime REAL NOT NULL, first_seen_at REAL NOT NULL,
-                PRIMARY KEY (watch_id, source_path))"""
-            )
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS processing_suppressions (
-                watch_id TEXT NOT NULL, source_path TEXT NOT NULL,
-                source_fingerprint TEXT NOT NULL, attempt_id TEXT NOT NULL,
-                suppressed_at TEXT NOT NULL, reason TEXT NOT NULL,
-                PRIMARY KEY (watch_id, source_path, source_fingerprint))"""
-            )
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS processing_leases (
-                watch_id TEXT NOT NULL,
-                source_path TEXT NOT NULL,
-                source_fingerprint TEXT NOT NULL,
-                attempt_id TEXT NOT NULL,
-                acquired_at TEXT NOT NULL,
-                PRIMARY KEY (watch_id, source_path, source_fingerprint)
-                )"""
-            )
+        return self._store.list_attempts()
 
     def record_audit_event(self, attempt_id: str, command: str, detail: str) -> None:
-        with sqlite3.connect(self._attempts_path) as connection:
-            row = connection.execute(
-                "SELECT audit_events FROM processing_attempts WHERE attempt_id = ?",
-                (attempt_id,),
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"attempt not found: {attempt_id}")
-            events = json.loads(row[0] or "[]")
-            events.append({"command": command, "detail": detail, "at": str(time.time())})
-            connection.execute(
-                "UPDATE processing_attempts SET audit_events = ? WHERE attempt_id = ?",
-                (json.dumps(events), attempt_id),
-            )
+        self._store.record_audit_event(attempt_id, command, detail)
 
     def record_accepted_result(self, attempt_id: str, entry: dict[str, object], command: str) -> None:
-        with sqlite3.connect(self._attempts_path) as connection:
-            row = connection.execute(
-                "SELECT accepted_results, audit_events FROM processing_attempts WHERE attempt_id = ?",
-                (attempt_id,),
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"attempt not found: {attempt_id}")
-            accepted = json.loads(row[0] or "[]")
-            accepted.append({**entry, "command": command})
-            events = json.loads(row[1] or "[]")
-            events.append({"command": command, "detail": str(entry.get("resulting_path", "")), "at": str(time.time())})
-            connection.execute(
-                "UPDATE processing_attempts SET accepted_results = ?, audit_events = ? WHERE attempt_id = ?",
-                (json.dumps(accepted), json.dumps(events), attempt_id),
-            )
+        self._store.record_accepted_result(attempt_id, entry, command)
 
     def _start_attempt(self, attempt_id: str, plan: Plan, retry_of_attempt_id: str | None = None) -> None:
-        planned_actions = json.dumps([
-            {
-                "kind": action.kind,
-                "target": str(action.target),
-                "preserve_original": action.preserve_original,
-                "limits": list(action.limits),
-                "max_depth": action.max_depth,
-            }
-            for action in plan.actions
-        ])
-        started_at = str(time.time())
-        with sqlite3.connect(self._attempts_path) as connection:
-            connection.execute(
-                "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance, source_fingerprint, retry_of_attempt_id, processing_lineage, planned_actions, source_size, source_mtime, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None, plan.source_fingerprint, retry_of_attempt_id, json.dumps(list(plan.processing_lineage)), planned_actions, plan.source_size, plan.source_mtime, started_at),
-            )
+        self._store.start_attempt(attempt_id, plan, retry_of_attempt_id)
 
     def _finish_attempt(self, attempt_id: str, status: str, results: list[ActionResult], processing_lineage: tuple[str, ...] = ()) -> None:
-        paths = [str(result.resulting_path or result.target) for result in results if result.result == "OK"]
-        provenance = next((json.dumps({"source": str(result.source), "result": str(result.resulting_path)}) for result in results if result.kind == "copy" and result.result == "OK"), None)
-        action_results = json.dumps([{"kind": result.kind, "target": str(result.target), "result": result.result, "detail": result.detail, "source": str(result.source) if result.source else None, "resulting_path": str(result.resulting_path) if result.resulting_path else None} for result in results])
-        failure_detail = results[-1].detail if status == "failed" and results else ""
-        completed_at = str(time.time())
-        with sqlite3.connect(self._attempts_path) as connection:
-            connection.execute(
-                "UPDATE processing_attempts SET status = ?, resulting_paths = ?, copy_provenance = ?, action_results = ?, failure_detail = ?, processing_lineage = ?, completed_at = ? WHERE attempt_id = ?",
-                (status, json.dumps(paths), provenance, action_results, failure_detail, json.dumps(list(processing_lineage)), completed_at, attempt_id),
-            )
+        self._store.finish_attempt(attempt_id, status, results, processing_lineage)
 
     def _emit(self, plan: Plan, result: ActionResult) -> None:
         event = {
@@ -759,10 +926,11 @@ class ItemProcessor:
 
     def check_persistence_health(self) -> bool:
         """Check if persistence is healthy. Returns True if healthy or no checker configured."""
-        if self._health_checker is None:
-            return True
-        health = self._health_checker.check_persistence(self._attempts_path)
-        return health.tracking_db_writable
+        if self._health_checker is not None:
+            health = self._health_checker.check_persistence(self._attempts_path)
+            if not health.tracking_db_writable:
+                return False
+        return self._store.check_writable()
 
     def check_watch_folder_health(self, watch_id: str, watch_root: Path) -> bool:
         """Check if a watch folder is healthy. Returns True if healthy or no checker configured."""
@@ -1373,84 +1541,28 @@ class ItemProcessor:
         return False
 
     def acquire_lease(self, watch_id: str, source: Path, fingerprint: str) -> bool:
-        canonical = str(self._canonical_path(source))
-        try:
-            with sqlite3.connect(self._attempts_path) as connection:
-                connection.execute(
-                    "INSERT INTO processing_leases (watch_id, source_path, source_fingerprint, attempt_id, acquired_at) VALUES (?, ?, ?, ?, ?)",
-                    (watch_id, canonical, fingerprint, "", str(time.time())),
-                )
-            return True
-        except sqlite3.IntegrityError:
-            return False
+        return self._store.acquire_lease(watch_id, source, fingerprint)
 
     def _release_lease(self, watch_id: str, source: Path, fingerprint: str) -> None:
-        canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
-            connection.execute(
-                "DELETE FROM processing_leases WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
-                (watch_id, canonical, fingerprint),
-            )
+        self._store.release_lease(watch_id, source, fingerprint)
 
     def _has_active_lease(self, watch_id: str, source: Path, fingerprint: str) -> bool:
-        canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) FROM processing_leases WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
-                (watch_id, canonical, fingerprint),
-            ).fetchone()
-        return int(row[0]) > 0
+        return self._store.has_active_lease(watch_id, source, fingerprint)
 
     def has_completed_attempt(self, watch_id: str, source: Path, fingerprint: str) -> bool:
-        canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) FROM processing_attempts WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ? AND status = ?",
-                (watch_id, canonical, fingerprint, "completed"),
-            ).fetchone()
-        return int(row[0]) > 0
+        return self._store.has_completed_attempt(watch_id, source, fingerprint)
 
     def has_suppressed_attempt(self, watch_id: str, source: Path, fingerprint: str) -> bool:
-        canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) FROM processing_suppressions WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
-                (watch_id, canonical, fingerprint),
-            ).fetchone()
-        return int(row[0]) > 0
+        return self._store.has_suppressed_attempt(watch_id, source, fingerprint)
 
     def _create_suppression(self, watch_id: str, source: Path, fingerprint: str, attempt_id: str, reason: str) -> None:
-        canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
-            connection.execute(
-                "INSERT OR REPLACE INTO processing_suppressions (watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason) VALUES (?, ?, ?, ?, ?, ?)",
-                (watch_id, canonical, fingerprint, attempt_id, str(time.time()), reason),
-            )
+        self._store.create_suppression(watch_id, source, fingerprint, attempt_id, reason)
 
     def clear_suppression(self, watch_id: str, source: Path, fingerprint: str) -> None:
-        canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
-            connection.execute(
-                "DELETE FROM processing_suppressions WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
-                (watch_id, canonical, fingerprint),
-            )
+        self._store.clear_suppression(watch_id, source, fingerprint)
 
     def suppressed_attempts(self) -> list[dict[str, object]]:
-        with sqlite3.connect(self._attempts_path) as connection:
-            rows = connection.execute(
-                "SELECT watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason FROM processing_suppressions ORDER BY suppressed_at"
-            ).fetchall()
-        return [
-            {
-                "watch_id": watch_id,
-                "source_path": source_path,
-                "source_fingerprint": source_fingerprint,
-                "attempt_id": attempt_id,
-                "suppressed_at": suppressed_at,
-                "reason": reason,
-            }
-            for watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason in rows
-        ]
+        return self._store.list_suppressions()
 
     def retry_attempt(
         self,
@@ -1503,26 +1615,7 @@ class ItemProcessor:
         return self.execute(plan)
 
     def is_stable(self, watch_id: str, snapshot: ItemSnapshot, *, now: float, stability_interval: float) -> bool:
-        canonical = str(self._canonical_path(snapshot.path))
-        with sqlite3.connect(self._attempts_path) as connection:
-            row = connection.execute(
-                "SELECT size, mtime, first_seen_at FROM item_observations WHERE watch_id = ? AND source_path = ?",
-                (watch_id, canonical),
-            ).fetchone()
-            if row is None:
-                connection.execute(
-                    "INSERT INTO item_observations (watch_id, source_path, size, mtime, first_seen_at) VALUES (?, ?, ?, ?, ?)",
-                    (watch_id, canonical, snapshot.size, snapshot.mtime, now),
-                )
-                return stability_interval <= 0.0
-            stored_size, stored_mtime, first_seen_at = row
-            if stored_size != snapshot.size or stored_mtime != snapshot.mtime:
-                connection.execute(
-                    "UPDATE item_observations SET size = ?, mtime = ?, first_seen_at = ? WHERE watch_id = ? AND source_path = ?",
-                    (snapshot.size, snapshot.mtime, now, watch_id, canonical),
-                )
-                return stability_interval <= 0.0
-            return (now - float(first_seen_at)) >= stability_interval
+        return self._store.is_stable(watch_id, snapshot, now=now, stability_interval=stability_interval)
 
     def process_batch(
         self,
@@ -1584,11 +1677,7 @@ class ItemProcessor:
                 if is_collision:
                     attempt_id = str(uuid.uuid4())
                     self._create_suppression(watch_id, canonical, fingerprint, attempt_id, "collision")
-                    with sqlite3.connect(self._attempts_path) as connection:
-                        connection.execute(
-                            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, action_results, source_fingerprint, failure_detail, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (attempt_id, watch_id, str(canonical), "unknown", "failed", "[]", "[]", fingerprint, str(error), str(time.time())),
-                        )
+                    self._store.record_collision_attempt(attempt_id, watch_id, canonical, fingerprint, error)
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
             except OSError as error:
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
@@ -1601,24 +1690,4 @@ class ItemProcessor:
         )
 
     def recover_stale_leases(self) -> list[str]:
-        recovered: list[str] = []
-        with sqlite3.connect(self._attempts_path) as connection:
-            leases = connection.execute(
-                "SELECT watch_id, source_path, source_fingerprint FROM processing_leases"
-            ).fetchall()
-            for watch_id, source_path, source_fingerprint in leases:
-                rows = connection.execute(
-                    "SELECT attempt_id FROM processing_attempts WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ? AND status = ?",
-                    (watch_id, source_path, source_fingerprint, "started"),
-                ).fetchall()
-                for (attempt_id,) in rows:
-                    connection.execute(
-                        "UPDATE processing_attempts SET status = ? WHERE attempt_id = ?",
-                        ("needs-reconciliation", attempt_id),
-                    )
-                    recovered.append(attempt_id)
-                connection.execute(
-                    "DELETE FROM processing_leases WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
-                    (watch_id, source_path, source_fingerprint),
-                )
-        return recovered
+        return self._store.recover_stale_leases()

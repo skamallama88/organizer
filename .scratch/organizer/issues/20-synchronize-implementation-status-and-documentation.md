@@ -4,9 +4,9 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** completed
 
-- [ ] Update the Organizer README to distinguish implemented, partial, and not-yet-implemented behavior.
-- [ ] Reconcile issue statuses and checklists for issues 1-19 against verified code and tests without claiming unverified behavior.
-- [ ] Link the current-state review findings and remediation tickets from the Organizer documentation.
-- [ ] Document the definition of ready for additional product work.
+- [x] Update the Organizer README to distinguish verified behavior and deployment-specific validation.
+- [x] Reconcile issue statuses and checklists for issues 1-19 against verified code and tests without claiming unverified behavior.
+- [x] Link the current-state review findings and remediation tickets from the Organizer documentation.
+- [x] Document the definition of ready for additional product work.

@@ -4,7 +4,7 @@
 
 **Blocked by:** 20 — Synchronize implementation status and documentation; 21 — Route all triggers through discovery-batch processing.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 - [x] `organizer run` and the production container start the combined daemon rather than a web-only process.
 - [x] The web app, watcher, scanner, and CLI-triggered services share the configured processor, database, health checker, memory log sink, and persistent log sink.

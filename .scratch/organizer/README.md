@@ -1,85 +1,49 @@
-# Organizer
+# Organizer Current-State
 
-Organizer is a file organization daemon for macOS and Unraid. The project
-applies first-match YAML rules through a shared `ItemProcessor` module that
-separates planning from execution.
+Organizer is a file organization daemon for macOS and Unraid. The verified
+implementation applies first-match YAML rules through a shared `ItemProcessor`
+module that separates planning from execution.
 
-## Current Status
+## Verified baseline
 
-### Implemented
+The current implementation and tests verify:
 
-- YAML rule loading and validation diagnostics; invalid rules do not prevent valid rules from running.
-- First-match rule evaluation with named match conditions and capture references.
-- Immutable plans with resolved destinations, source fingerprints, and ruleset revisions.
-- Boundary policy validation: data roots, config-volume exclusion, disjoint watches, safe destinations, self/descendant-target rejection, symlink-traversal rejection, case-aware collisions, cross-watch destination warnings.
-- CLI (`organizer check`) and web dry-run previews from the same plan.
-- Same-filesystem moves (hard-link + source removal) and staged copies with no-overwrite publication.
-- Cross-filesystem moves (staged copy, no-overwrite publication, durable result recording, source removal).
-- Capture-based renames and ordered action chains using the primary resulting item; invalid type chains are rejected at planning.
-- SQLite execution-attempt records with action results, resulting paths, and processing lineage.
-- Structured structured-log events (stdout, rotating persistent file, in-memory web buffer) with level, watch, rule, action, item, result, and detail fields.
-- Docker image packaging with unrar-free, separate `/config` and `/data` volumes, localhost-only UI binding with non-loopback warning.
-- Durable processing leases for exclusive per-source-identity ownership.
-- Completion skipping for unchanged items across restarts.
-- Item stability observations and deferred-item handling.
-- Discovery-batch processing with executed, skipped, deferred, and outside-snapshot outcomes.
-- Restart recovery of nonterminal leased attempts to needs-reconciliation.
-- Collision suppression: durable suppression of automatic processing after a destination collision.
-- Explicit retry (`retry_attempt`): creates a fresh linked plan for a failed or suppressed attempt.
-- Explicit reprocess (`reprocess_item`): permits a completed source identity to be processed again under current rules.
-- Suppression visibility: `has_suppressed_attempt` and `suppressed_attempts` expose suppressed source identities.
-- Watcher service (watchdog-based, debounced) and periodic scanner (asyncio interval).
-- Combined daemon entry point (`organizer run`) starting web + watcher + scanner + logging.
-- CLI `organizer status` showing configured watches.
-- Config-driven watch discovery: Pydantic models for `organizer.yaml`, loader with validation.
-- Web UI dashboard (watch list with health, rule count, activity), YAML rule editor with compare-and-swap revision save and inline HTMX validation/preview, attempt list and detail pages, structured-log viewer with level/watch/date filtering.
-- Reconciliation commands: accept, abandon (with reason), retry-from-start, reopen (all behind the `AttemptReview` application seam).
-- Operational health module recognising watch-folder access failures and persistence health conditions.
-- Retention primitives for database and log cleanup.
+- Rule loading, named conditions, capture references, complete document validation, and disabled-rule diagnostics.
+- Immutable plans with source fingerprints, ruleset revisions, boundary policies, destination safety, and collision checks.
+- Move, staged copy, rename, direct deletion, quarantine, ZIP/7z/RAR unarchive, archive creation, nested extraction, and cross-watch lineage behavior.
+- Durable attempts, action results, processing leases, suppression, retry/reprocess, reconciliation, and recovery evidence.
+- Stability observations, completion skipping, and discovery-batch outcomes (`executed`, `skipped`, `deferred`, and `outside_snapshot`).
+- Watcher, scanner, CLI, and web-triggered processing through the shared batch seam.
+- One configured production runtime with shared processor, database, health, logging, retention, web, watcher, and scanner services.
+- Config-driven watches, operational health and pause behavior, structured logs, retention lifecycle, the web dashboard, rule editor, log viewer, and reconciliation UI.
+- Docker packaging and end-to-end smoke coverage for daemon startup, UI access, processing, durable attempts, and persistent logs.
 
-### Partial / Known issues
+## Known limitations
 
-- **ZIP archive action**: implemented. Known deviations from spec:
-  - Archive output naming appends `.zip` to the full source name (`movie.mkv.zip`) rather than stripping the source extension first (`movie.zip`). (Review finding Sp2)
-  - `preserve_originals` defaults to `True`; the spec default is `False`. (Review finding Sp3)
-  - 7z output creates zip-format content with `.7z` extension; proper 7z archive creation is not implemented. (Review finding Sp4)
-- **Copy action**: implemented. Does not update the action-chain cursor after copy. A subsequent action operates on the original source, not the copy. (Review finding Sp5)
-- **Quarantine action**: implemented. After a prior rename, the quarantine path uses the renamed relative path rather than the original source path. (Review finding S5/Sp7)
-- **Pre-mutation fingerprint validation**: only checks source fingerprints for destructive actions (delete/quarantine). For non-destructive actions (move, copy, rename, archive), fingerprint revalidation is skipped. (Review finding Sp1)
-- **Daemon processing**: watcher/scanner bypasses `ItemProcessor.process_batch()`, using direct `plan()`/`execute()` calls. Stability checks, completion skipping, and suppression checks are not fully integrated. (Review finding F1)
-- **Production entry point**: container starts the web-only `organizer-web` by default, not the combined daemon. (Review finding F2)
-- **Runtime configuration**: configured `log_level` and `retention_days` are not fully wired into logger construction. (Review finding F3)
-- **Reconciliation commands**: only `accept`, `abandon`, `retry-from-start`, and `reopen` are implemented; `retry-remaining` and `mark-action-applied` are deferred. (Review finding F4)
-- **Rules validation**: still requires the legacy `match` key and silently synthesizes conditions; complete action semantics are not all validated before save. (Review finding F5)
-- **Health integration**: trigger loop catches processing errors and discards them; no per-watch pause behavior. (Review finding F6)
-- **Retention lifecycle**: database and log cleanup primitives exist but retention is not scheduled as a complete runtime lifecycle. (Review finding F7)
+- The administrative UI is unauthenticated. Non-loopback exposure requires a trusted reverse proxy or private network boundary, as documented by ADR-0006.
+- `ruff`, `mypy`, and the test suite are green, but production readiness still depends on deployment-specific filesystem, mount, backup, and trusted-network validation.
+- Rich archive-content previews, bulk recovery actions, live UI updates, and other explicitly out-of-scope features are not part of the initial product.
 
-### Not yet implemented
+## Production-readiness gate
 
-- Watcher/scanner routing through `ItemProcessor.process_batch()` (issue 21).
-- One shared production runtime with combined daemon entry point and full configuration wiring (issue 22).
-- Integrated operational health and per-watch pause behavior (issue 23).
-- Complete reconciliation command contract — `retry-remaining` and `mark-action-applied` (issue 24).
-- Hardened rules-document validation (issue 25).
-- Scheduled retention lifecycle (issue 26).
-- Tooling cleanup — `ruff` unused imports, fingerprint I/O optimisation, action-execution deduplication (issue 27).
+The validated gate for additional user-facing work is documented in
+[`docs/design/production-readiness.md`](../../docs/design/production-readiness.md).
+It requires green automated checks, the combined runtime as the production
+entry point, shared trigger services, Docker smoke coverage, observable health
+and recovery evidence, and synchronized issue/documentation state.
 
-## Current-state review
+## Historical review and roadmap
 
-The repository was reviewed on 2026-07-24. The full findings document is at
-[`review-findings-2026-07-24.md`](review-findings-2026-07-24.md).
-Remediation work is tracked in issues 21–27.
+The 2026-07-24 review is retained in
+[`review-findings-2026-07-24.md`](review-findings-2026-07-24.md) as historical
+context. Its remediation tickets are issues 21-28; their current status is
+recorded in the issue files. Its verification counts and failures describe
+that date, not the current suite. Issue 29 tracks this documentation
+synchronization.
 
-## Definition of ready for further product work
-
-Organizer should not take on additional user-facing features until:
-
-- `pytest`, `mypy`, and `ruff` pass.
-- The combined daemon is the production entry point.
-- Watcher, scanner, CLI, and web use the same processing and logging services.
-- A Docker smoke test demonstrates processing, UI access, persistent attempts, and persistent logs.
-- Health failures and recovery evidence behavior are observable and tested.
-- The issue tracker and README accurately describe the implementation baseline.
+Issues 30-32 are intentionally still `ready-for-agent` and are not required
+by the production-readiness gate: archive output naming, metadata-preservation
+verification, and further ItemProcessor maintainability work.
 
 ## Requirements
 
@@ -88,6 +52,11 @@ Organizer should not take on additional user-facing features until:
 - Docker, if testing the image.
 
 Dependencies and development tools are declared in `pyproject.toml`.
+
+## Historical developer examples
+
+The following explicit-path examples are retained for low-level API debugging;
+normal production use should follow the config-driven root README and CLI.
 
 ## Create A Test Watch Folder
 
@@ -189,8 +158,9 @@ Build the image:
 docker build -t organizer:local .
 ```
 
-The image starts Uvicorn on `127.0.0.1:8000` inside the container. A complete
-volume-mounted deployment configuration is not part of this slice yet.
+The Compose deployment starts the combined daemon in the container, publishes
+the UI on host loopback, and mounts `/config` separately from `/data`. The
+Docker smoke tests cover this deployment path.
 
 ## Development Checks
 

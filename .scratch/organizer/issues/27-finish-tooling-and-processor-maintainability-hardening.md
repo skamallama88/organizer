@@ -4,7 +4,7 @@
 
 **Blocked by:** 21 — Route all triggers through discovery-batch processing; 22 — Compose one shared production runtime; 23 — Integrate operational health and failure handling.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 - [x] Make `ruff check src tests` pass and keep pytest and mypy green.
 - [x] Measure fingerprint cost for large files and folders across planning, execution, and batch processing.

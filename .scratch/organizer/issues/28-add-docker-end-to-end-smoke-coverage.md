@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 - [x] A containerized smoke flow proves the production command starts the web server, watcher, periodic scanner, and shared processing runtime.
 - [x] The flow proves a configured watch folder processes a matching item and records a durable completed attempt.

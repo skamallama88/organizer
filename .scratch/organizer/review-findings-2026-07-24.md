@@ -4,7 +4,10 @@
 
 **Scope:** Current implementation compared with `CONTEXT.md`, `docs/`, and `.scratch/organizer/spec.md`.
 
-## Verification
+## Historical Verification Snapshot
+
+The following results describe the repository on 2026-07-24. They are retained
+to explain the remediation roadmap and must not be read as current results.
 
 - `uv run pytest`: 197 passed.
 - `uv run mypy src tests`: passed.

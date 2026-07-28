@@ -4,7 +4,7 @@
 
 **Blocked by:** 20 — Synchronize implementation status and documentation.
 
-**Status:** ready-for-agent
+**Status:** completed
 
 - [x] Watcher and scanner submit `ItemSnapshot` observations through the shared batch-processing contract.
 - [x] Immediate CLI and web processing expose the same discovery-batch outcomes and diagnostics as watcher and scanner processing.

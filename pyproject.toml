@@ -32,6 +32,9 @@ include = ["src/organizer/web_ui/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "smoke: Docker smoke test (requires running Docker daemon)",
+]
 
 [tool.mypy]
 python_version = "3.12"

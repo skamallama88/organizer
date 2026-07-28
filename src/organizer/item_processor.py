@@ -311,7 +311,7 @@ class ItemProcessor:
             self._validate_destination_item(current)
             if current.exists() or self._case_collision(current, policy):
                 raise ValueError(f"destination collision: {current}")
-            destination_watch = self._watch_id_for_path(destination_root, policy)
+            destination_watch = self._watch_id_for_path(destination_root, policy, request.watch_id)
             if destination_watch is not None:
                 if destination_watch in lineage:
                     raise ValueError(f"processing lineage cycle: {destination_watch}")
@@ -387,11 +387,13 @@ class ItemProcessor:
             lineage = (*lineage, current_watch)
         return lineage
 
-    def _watch_id_for_path(self, path: Path, policy: BoundaryPolicy) -> str | None:
+    def _watch_id_for_path(self, path: Path, policy: BoundaryPolicy, current_watch_id: str | None = None) -> str | None:
         canonical = self._canonical_path(path)
         if len(policy.watch_ids) != len(policy.watch_roots):
             return None
         for watch_id, watch_root in zip(policy.watch_ids, policy.watch_roots):
+            if current_watch_id is not None and watch_id == current_watch_id:
+                continue
             if self._is_within(canonical, self._canonical_path(watch_root)):
                 return watch_id
         return None
@@ -402,7 +404,7 @@ class ItemProcessor:
         seen: set[str] = {plan.watch_id}
         for action in plan.actions:
             if action.kind in ("move", "copy"):
-                dest_watch = self._watch_id_for_path(action.target.parent, policy)
+                dest_watch = self._watch_id_for_path(action.target.parent, policy, plan.watch_id)
                 if dest_watch is not None and dest_watch not in seen:
                     seen.add(dest_watch)
                     handoffs.append(ProcessingLineageHandoff(watch_id=dest_watch, resulting_path=action.target))

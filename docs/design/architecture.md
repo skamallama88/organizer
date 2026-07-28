@@ -183,7 +183,7 @@ Supports nested archives up to a configurable depth (default: 1 level). Exceedin
     preserve_originals: false # default: false — delete originals after archiving
 ```
 
-Matches files or folders and bundles them into a single archive file in `destination`, which is an output directory. The archive is named after the matched item with the appropriate extension appended.
+Matches files or folders and bundles them into a single archive file in `destination`, which is an output directory. The archive output name removes at most one final recognized input archive suffix (`.zip`, `.7z`, or `.rar`, case-insensitive), preserves all other suffixes, and appends the requested extension. Thus `project` becomes `project.zip` or `project.7z`, `project.zip` becomes `project.zip` or `project.7z`, and `bundle.tar.gz` becomes `bundle.tar.gz.zip`.
 
 ## Destination collisions
 

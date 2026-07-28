@@ -1434,24 +1434,54 @@ def test_archive_rejects_destination_collision(tmp_path: Path) -> None:
         ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
 
 
-def test_archive_output_name_strips_only_recognized_suffix_once(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("source_name", "extension", "expected_name"),
+    [
+        ("project", ".zip", "project.zip"),
+        ("project", ".7z", "project.7z"),
+        ("backup.ZIP", ".zip", "backup.zip"),
+        ("backup.7z", ".7z", "backup.7z"),
+        ("backup.7Z", ".zip", "backup.zip"),
+        ("backup.rar", ".zip", "backup.zip"),
+        ("backup.rar", ".7z", "backup.7z"),
+        ("backup.RAR", ".zip", "backup.zip"),
+        ("bundle.tar.gz", ".zip", "bundle.tar.gz.zip"),
+    ],
+)
+def test_archive_output_name_contract(
+    tmp_path: Path, source_name: str, extension: str, expected_name: str
+) -> None:
     watch_root = tmp_path / "downloads"
     destination = tmp_path / "archives"
     watch_root.mkdir()
     destination.mkdir()
-    item_zip = watch_root / "backup.ZIP"
-    item_zip.write_text("zip")
-    item_tar_gz = watch_root / "bundle.tar.gz"
-    item_tar_gz.write_text("tar.gz")
-    rules_zip = write_archive_rules(watch_root / "rules_zip.yaml", "../archives")
-    rules_tgz = write_archive_rules(watch_root / "rules_tgz.yaml", "../archives")
+    item = watch_root / source_name
+    item.write_text(source_name)
+    rules = write_archive_rules(watch_root / "rules.yaml", "../archives", extension=extension)
     processor = ItemProcessor(tmp_path / "attempts.db")
 
-    plan_zip = processor.plan(make_request(watch_root, item_zip, rules_zip))
-    plan_tgz = processor.plan(make_request(watch_root, item_tar_gz, rules_tgz))
+    plan = processor.plan(make_request(watch_root, item, rules))
 
-    assert plan_zip.actions[0].target == destination / "backup.zip"
-    assert plan_tgz.actions[0].target == destination / "bundle.tar.gz.zip"
+    assert plan.actions[0].target == destination / expected_name
+
+
+@pytest.mark.parametrize("extension", [".zip", ".7z"])
+def test_archive_execution_uses_contract_for_recognized_suffix(
+    tmp_path: Path, extension: str
+) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "project.zip"
+    item.write_text("project")
+    rules = write_archive_rules(watch_root / "rules.yaml", "../archives", extension=extension)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    assert report.status == "completed"
+    assert (destination / f"project{extension}").exists()
 
 
 def test_archive_creates_7z_and_preserves_original(tmp_path: Path) -> None:

@@ -109,6 +109,7 @@ class ExecutionReport:
     dry_run: bool
     actions: tuple[ActionResult, ...]
     handoffs: tuple[ProcessingLineageHandoff, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -429,7 +430,12 @@ class ItemProcessor:
             )
             for result in dry_run_results:
                 self._emit(plan, result)
-            return ExecutionReport(status="dry-run", dry_run=True, actions=dry_run_results)
+            return ExecutionReport(
+                status="dry-run",
+                dry_run=True,
+                actions=dry_run_results,
+                warnings=self._metadata_warnings(),
+            )
 
         self._validate_plan_source(plan)
         if plan.rules_path is not None and self._ruleset_revision(plan.rules_path) != plan.ruleset_revision:
@@ -442,6 +448,7 @@ class ItemProcessor:
         try:
             self._start_attempt(attempt_id, plan, retry_of_attempt_id=retry_of_attempt_id)
             results: list[ActionResult] = []
+            warnings = self._metadata_warnings()
             source = plan.source
             try:
                 for action in plan.actions:
@@ -452,7 +459,7 @@ class ItemProcessor:
                             result = ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed", source=source)
                             self._finish_attempt(attempt_id, "needs-reconciliation", results + [result], plan.processing_lineage)
                             self._emit(plan, result)
-                            return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [result]))
+                            return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [result]), warnings=warnings)
                         if action.kind == "delete":
                             if source.is_dir():
                                 shutil.rmtree(source)
@@ -481,7 +488,7 @@ class ItemProcessor:
                             try:
                                 self._ensure_source_unchanged(plan, source, action, results, attempt_id)
                             except NeedsReconciliationError:
-                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)]))
+                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)]), warnings=warnings)
                             self._remove_source(source)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
                     elif action.kind == "unarchive":
@@ -497,7 +504,7 @@ class ItemProcessor:
                             try:
                                 self._ensure_source_unchanged(plan, source, action, results, attempt_id)
                             except NeedsReconciliationError:
-                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)]))
+                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)]), warnings=warnings)
                             self._remove_source(source)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
                     else:
@@ -511,7 +518,7 @@ class ItemProcessor:
                                 results.append(result)
                                 self._finish_attempt(attempt_id, "needs-reconciliation", results, plan.processing_lineage)
                                 self._emit(plan, result)
-                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results))
+                                return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results), warnings=warnings)
                         source = action.target
                         result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
                     results.append(result)
@@ -526,11 +533,11 @@ class ItemProcessor:
                     self._create_suppression(plan.watch_id, plan.source, plan.source_fingerprint, attempt_id, reason)
                 self._finish_attempt(attempt_id, "failed", results, plan.processing_lineage)
                 self._emit(plan, result)
-                return ExecutionReport(status="failed", dry_run=False, actions=tuple(results))
+                return ExecutionReport(status="failed", dry_run=False, actions=tuple(results), warnings=warnings)
 
             self._finish_attempt(attempt_id, "completed", results, plan.processing_lineage)
             handoffs = self._compute_handoffs(plan)
-            return ExecutionReport(status="completed", dry_run=False, actions=tuple(results), handoffs=tuple(handoffs))
+            return ExecutionReport(status="completed", dry_run=False, actions=tuple(results), handoffs=tuple(handoffs), warnings=warnings)
         finally:
             self._release_lease(plan.watch_id, plan.source, plan.source_fingerprint)
 
@@ -547,7 +554,20 @@ class ItemProcessor:
         except ValueError as error:
             self._remove_tree(staging)
             raise OSError(str(error)) from error
+        source_mode = source.stat().st_mode & 0o7777 if source.is_file() and not source.is_symlink() else None
         self._publish_staged(staging, target)
+        if source_mode is not None and not target.is_symlink() and target.is_file() and target.stat().st_mode & 0o7777 != source_mode:
+            raise OSError(f"POSIX mode bits were not preserved: {source} -> {target}")
+
+    @staticmethod
+    def _validate_mode_preservation(source: Path, target: Path) -> None:
+        """Ensure supported POSIX mode bits survive a published copy."""
+        if source.is_symlink() or target.is_symlink():
+            return
+        source_mode = source.stat().st_mode & 0o7777
+        target_mode = target.stat().st_mode & 0o7777
+        if source_mode != target_mode:
+            raise OSError(f"POSIX mode bits were not preserved: {source} -> {target}")
 
     def _ensure_source_unchanged(
         self,
@@ -786,6 +806,12 @@ class ItemProcessor:
             shutil.copy2(source, staging)
         return staging
 
+    @staticmethod
+    def _metadata_warnings() -> tuple[str, ...]:
+        return (
+            "ownership, ACLs, extended attributes, and platform-specific metadata are not guaranteed to be preserved",
+        )
+
     def _archive_to_staging(self, source: Path, target: Path) -> Path:
         staging = self._attempts_path.parent / "staging" / f".organizer-staging-{uuid.uuid4()}{target.suffix.lower()}"
         staging.parent.mkdir(parents=True, exist_ok=True)
@@ -997,6 +1023,7 @@ class ItemProcessor:
     @staticmethod
     def _move_without_overwrite(source: Path, target: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
+        source_mode = source.stat().st_mode & 0o7777 if source.is_file() and not source.is_symlink() else None
         try:
             os.link(source, target)
         except FileExistsError as error:
@@ -1011,6 +1038,8 @@ class ItemProcessor:
                 else:
                     shutil.copy2(source, staging)
                 ItemProcessor._publish_staged(staging, target)
+                if source_mode is not None and not target.is_symlink() and target.is_file() and target.stat().st_mode & 0o7777 != source_mode:
+                    raise OSError(f"POSIX mode bits were not preserved: {source} -> {target}")
             except FileExistsError as error:
                 ItemProcessor._remove_tree(staging)
                 raise FileExistsError(f"destination already exists: {target}") from error

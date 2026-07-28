@@ -6,6 +6,6 @@
 
 **Status:** ready-for-agent
 
-- [ ] Supported actions preserve file contents, basenames, and supported POSIX mode bits as documented.
-- [ ] Tests cover metadata behavior for files and folders where the platform supports it.
-- [ ] Unsupported metadata guarantees are documented and surfaced as non-fatal warnings where Organizer can detect them.
+- [x] Supported actions preserve file contents, basenames, and supported POSIX mode bits as documented.
+- [x] Tests cover metadata behavior for files and folders where the platform supports it.
+- [x] Unsupported metadata guarantees are documented and surfaced as non-fatal warnings where Organizer can detect them.

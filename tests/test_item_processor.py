@@ -72,6 +72,50 @@ def make_request(
     )
 
 
+def test_copy_preserves_file_mode_and_reports_unsupported_metadata_warning(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "organized"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    item.chmod(0o640)
+    rules = write_copy_rules(watch_root / "rules.yaml", str(destination))
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    copied = destination / item.name
+    assert report.status == "completed"
+    assert copied.read_text() == "movie"
+    assert copied.stat().st_mode & 0o7777 == 0o640
+    assert report.warnings == (
+        "ownership, ACLs, extended attributes, and platform-specific metadata are not guaranteed to be preserved",
+    )
+
+
+def test_quarantine_preserves_folder_mode(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    quarantine_root = tmp_path / "quarantine"
+    watch_root.mkdir()
+    quarantine_root.mkdir()
+    item = watch_root / "folder"
+    item.mkdir()
+    item.chmod(0o750)
+    (item / "file.txt").write_text("content")
+    rules = write_quarantine_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(
+        processor.plan(make_request(watch_root, item, rules, policy=BoundaryPolicy(quarantine_root=quarantine_root)))
+    )
+
+    quarantined = Path(_resulting_paths(processor.attempts())[0])
+    assert report.status == "completed"
+    assert quarantined.stat().st_mode & 0o7777 == 0o750
+    assert (quarantined / "file.txt").read_text() == "content"
+
+
 def _resulting_paths(attempts: list[dict[str, object]], index: int = 0) -> list[str]:
     from typing import cast
 

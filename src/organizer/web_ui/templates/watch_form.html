@@ -1,0 +1,29 @@
+<form hx-post="/watches" hx-target="#add-watch-form" hx-swap="innerHTML"
+      x-data="{ id: '', rulesPath: '/config/rules_.yaml' }">
+  <p>
+    <label for="id">Watch ID</label>
+    <input id="id" name="id" type="text"
+           x-model="id"
+           x-on:input="rulesPath = '/config/rules_' + id + '.yaml'"
+           placeholder="my_watch" required>
+  </p>
+  <p>
+    <label for="root">Root path</label>
+    <select id="root" name="root">
+      {% for root in data_roots %}
+      <option value="{{ root }}">{{ root }}</option>
+      {% endfor %}
+    </select>
+  </p>
+  <p>
+    <label for="rules_path">Rules path</label>
+    <input id="rules_path" name="rules_path" type="text" x-model="rulesPath" required>
+  </p>
+  <p>
+    <button type="submit">Add Watch</button>
+    <button type="button" hx-get="/" hx-target="#add-watch-form" hx-swap="innerHTML">Cancel</button>
+  </p>
+  {% if errors %}
+  <div class="feedback error">{{ errors }}</div>
+  {% endif %}
+</form>

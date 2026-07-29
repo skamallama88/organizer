@@ -1,0 +1,18 @@
+<section id="watch-list">
+{% if watches %}
+<table>
+  <thead><tr><th>Watch</th><th>Health</th><th>Rules</th><th>Recent activity</th><th>Actions</th></tr></thead>
+  <tbody>
+  {% for watch in watches %}
+    <tr>
+      <td><strong>{{ watch.id }}</strong><br><small>{{ watch.root }}</small></td>
+      <td>{% if watch.healthy %}Healthy{% else %}Unhealthy{% endif %}{% if watch.health_detail %}<br><small>{{ watch.health_detail }}</small>{% endif %}</td>
+      <td>{{ watch.rule_count }} rule{% if watch.rule_count != 1 %}s{% endif %}</td>
+      <td>{% if watch.recent_activity %}{{ watch.recent_activity.timestamp }}: {{ watch.recent_activity.rule }} {{ watch.recent_activity.action }}{% else %}No activity{% endif %}</td>
+      <td><a href="/watches/{{ watch.id }}/rules">Rules</a> <a href="/logs?watch={{ watch.id }}">Logs</a> <button hx-delete="/watches/{{ watch.id }}" hx-confirm="Remove watch '{{ watch.id }}'?" hx-target="#watch-list" hx-swap="outerHTML">Remove</button></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p>No watch folders configured.</p>{% endif %}
+</section>

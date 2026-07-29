@@ -24,7 +24,12 @@ from organizer.attempt_review import (
     RetryFromStart,
     RetryRemaining,
 )
-from organizer.config import ConfigError, WatchFolderConfig, validate_watch_id, validate_watch_root
+from organizer.config import (
+    ConfigError,
+    WatchFolderConfig,
+    validate_watch_id,
+    validate_watch_root,
+)
 from organizer.daemon import WatchMutator
 from organizer.item_processor import BoundaryPolicy, ItemProcessor, ItemSnapshot
 from organizer.operational_health import OperationalHealth
@@ -43,7 +48,9 @@ def create_app(
     *,
     log_sink: MemoryLogSink | None = None,
     health_checker: OperationalHealth | None = None,
-    watch_folders: list[WatchFolderConfig] | tuple[WatchFolderConfig, ...] | None = None,
+    watch_folders: list[WatchFolderConfig]
+    | tuple[WatchFolderConfig, ...]
+    | None = None,
     db_path: Path | None = None,
     watch_mutator: WatchMutator | None = None,
     config_path: Path | None = None,
@@ -71,10 +78,15 @@ def create_app(
         if health_checker is None or db_path is None or not _runtime_watches:
             return {}
         health = health_checker.check_all(
-            watch_folders=[(config.watch_id, config.watch_root) for config in _runtime_watches],
+            watch_folders=[
+                (config.watch_id, config.watch_root) for config in _runtime_watches
+            ],
             db_path=db_path,
         )
-        return {entry.watch_id: (entry.accessible, entry.detail) for entry in health.watch_folder_healths}
+        return {
+            entry.watch_id: (entry.accessible, entry.detail)
+            for entry in health.watch_folder_healths
+        }
 
     def _fragment(request: Request, template: str, **context: object) -> HTMLResponse:
         return _TEMPLATES.TemplateResponse(request, template, context)
@@ -109,13 +121,16 @@ def create_app(
         }
 
     def _is_html_request(request: Request) -> bool:
-        return request.headers.get("HX-Request") == "true" or "text/html" in request.headers.get("accept", "")
+        return request.headers.get(
+            "HX-Request"
+        ) == "true" or "text/html" in request.headers.get("accept", "")
 
     def _form_or_json(body: bytes) -> dict[str, object]:
         try:
             return dict(json.loads(body))
         except (json.JSONDecodeError, TypeError, ValueError):
             from urllib.parse import parse_qs
+
             return {key: values[-1] for key, values in parse_qs(body.decode()).items()}
 
     def _read_disk_watches() -> list[dict[str, object]]:
@@ -134,7 +149,9 @@ def create_app(
     def _save_watches_to_disk(document: dict[str, object]) -> None:
         if config_path is None:
             return
-        temp_path = config_path.with_suffix(f"{config_path.suffix}.tmp-{uuid.uuid4().hex}")
+        temp_path = config_path.with_suffix(
+            f"{config_path.suffix}.tmp-{uuid.uuid4().hex}"
+        )
         try:
             with _WATCH_SAVE_LOCK:
                 temp_path.write_text(yaml.dump(document, default_flow_style=False))
@@ -147,26 +164,50 @@ def create_app(
     def _data_roots_and_config_root() -> tuple[list[Path], Path]:
         if _runtime_watches:
             bp = _runtime_watches[0].boundary_policy
-            config_root: Path = bp.config_root if bp.config_root is not None else Path("/config")
+            config_root: Path = (
+                bp.config_root if bp.config_root is not None else Path("/config")
+            )
             return list(bp.data_roots), config_root
         return [], Path("/config")
 
-    @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request) -> HTMLResponse:
+    def _build_watches() -> list[dict[str, object]]:
         health_by_watch = _health_by_watch()
         watches = []
         for config in _runtime_watches:
             accessible, detail = health_by_watch.get(config.watch_id, (True, ""))
-            entries = log_sink.read_recent(limit=1, watch=config.watch_id) if log_sink is not None else []
-            watches.append({
-                "id": config.watch_id,
-                "root": config.watch_root,
-                "healthy": accessible and not processor.validate_rules_document(config.rules_path, policy=config.boundary_policy, watch_root=config.watch_root),
-                "health_detail": detail,
-                "rule_count": _rule_count(config.rules_path),
-                "recent_activity": entries[-1] if entries else None,
-            })
-        return _fragment(request, "dashboard.html", watches=watches)
+            entries = (
+                log_sink.read_recent(limit=1, watch=config.watch_id)
+                if log_sink is not None
+                else []
+            )
+            watches.append(
+                {
+                    "id": config.watch_id,
+                    "root": config.watch_root,
+                    "healthy": accessible
+                    and not processor.validate_rules_document(
+                        config.rules_path,
+                        policy=config.boundary_policy,
+                        watch_root=config.watch_root,
+                    ),
+                    "health_detail": detail,
+                    "rule_count": _rule_count(config.rules_path),
+                    "recent_activity": entries[-1] if entries else None,
+                }
+            )
+        return watches
+
+    @app.get("/", response_class=HTMLResponse)
+    def dashboard(request: Request) -> HTMLResponse:
+        data_roots, _ = _data_roots_and_config_root()
+        return _fragment(
+            request, "dashboard.html", watches=_build_watches(), data_roots=data_roots
+        )
+
+    @app.get("/watches/new", response_class=HTMLResponse)
+    def new_watch_form(request: Request) -> HTMLResponse:
+        data_roots, _ = _data_roots_and_config_root()
+        return _fragment(request, "watch_form.html", data_roots=data_roots)
 
     @app.get("/watches/{watch_id}/rules", response_class=HTMLResponse)
     def rule_editor(request: Request, watch_id: str) -> HTMLResponse:
@@ -176,41 +217,63 @@ def create_app(
         try:
             rules = config.rules_path.read_text()
         except OSError as error:
-            raise HTTPException(status_code=500, detail=f"cannot read rules: {error}") from error
+            raise HTTPException(
+                status_code=500, detail=f"cannot read rules: {error}"
+            ) from error
         revision = hashlib.sha256(rules.encode()).hexdigest()
-        return _fragment(request, "rule_editor.html", watch=config, rules=rules, revision=revision)
+        return _fragment(
+            request, "rule_editor.html", watch=config, rules=rules, revision=revision
+        )
 
     @app.post("/watches/{watch_id}/rules/validate", response_class=HTMLResponse)
-    def validate_rules(request: Request, watch_id: str, rules: str = Form()) -> HTMLResponse:
+    def validate_rules(
+        request: Request, watch_id: str, rules: str = Form()
+    ) -> HTMLResponse:
         config = _watch_config(watch_id)
         if config is None:
             raise HTTPException(status_code=404, detail="watch folder not configured")
-        temp_path = config.rules_path.with_suffix(f"{config.rules_path.suffix}.validate-{uuid.uuid4().hex}")
+        temp_path = config.rules_path.with_suffix(
+            f"{config.rules_path.suffix}.validate-{uuid.uuid4().hex}"
+        )
         try:
             temp_path.write_text(rules)
-            diagnostics = processor.validate_rules_document(temp_path, policy=config.boundary_policy, watch_root=config.watch_root)
+            diagnostics = processor.validate_rules_document(
+                temp_path, policy=config.boundary_policy, watch_root=config.watch_root
+            )
         finally:
             if temp_path.exists():
                 temp_path.unlink()
         if diagnostics:
-            return HTMLResponse(_rules_feedback("; ".join(diagnostics), error=True), status_code=422)
+            return HTMLResponse(
+                _rules_feedback("; ".join(diagnostics), error=True), status_code=422
+            )
         return HTMLResponse(_rules_feedback("Rules are valid."))
 
     @app.post("/watches/{watch_id}/rules/dry-run", response_class=HTMLResponse)
-    def editor_dry_run(request: Request, watch_id: str, item: Path = Form(), rules: str = Form()) -> HTMLResponse:
+    def editor_dry_run(
+        request: Request, watch_id: str, item: Path = Form(), rules: str = Form()
+    ) -> HTMLResponse:
         config = _watch_config(watch_id)
         if config is None:
             raise HTTPException(status_code=404, detail="watch folder not configured")
-        temp_path = config.rules_path.with_suffix(f"{config.rules_path.suffix}.preview-{uuid.uuid4().hex}")
+        temp_path = config.rules_path.with_suffix(
+            f"{config.rules_path.suffix}.preview-{uuid.uuid4().hex}"
+        )
         try:
             temp_path.write_text(rules)
-            diagnostics = processor.validate_rules_document(temp_path, policy=config.boundary_policy, watch_root=config.watch_root)
+            diagnostics = processor.validate_rules_document(
+                temp_path, policy=config.boundary_policy, watch_root=config.watch_root
+            )
             if diagnostics:
-                return HTMLResponse(_rules_feedback("; ".join(diagnostics), error=True), status_code=422)
+                return HTMLResponse(
+                    _rules_feedback("; ".join(diagnostics), error=True), status_code=422
+                )
             try:
                 stat = item.stat()
             except OSError as error:
-                return HTMLResponse(_rules_feedback(str(error), error=True), status_code=422)
+                return HTMLResponse(
+                    _rules_feedback(str(error), error=True), status_code=422
+                )
             snapshot = ItemSnapshot(path=item, size=stat.st_size, mtime=stat.st_mtime)
             batch = processor.process_batch(
                 watch_id=watch_id,
@@ -232,7 +295,9 @@ def create_app(
                 f"<li>{html.escape(action.kind)}: {html.escape(str(action.source))} to {html.escape(str(action.target))}</li>"
                 for action in batch_item.report.actions
             )
-            return HTMLResponse(f"<section class=\"preview\"><h2>Dry run</h2><ul>{rows}</ul></section>")
+            return HTMLResponse(
+                f'<section class="preview"><h2>Dry run</h2><ul>{rows}</ul></section>'
+            )
         detail = batch_item.detail
         if "no valid rule matched" in detail:
             return HTMLResponse(_rules_feedback("Dry run: No rule matched."))
@@ -249,19 +314,41 @@ def create_app(
         if config is None:
             raise HTTPException(status_code=404, detail="watch folder not configured")
         rules_path = config.rules_path
-        temp_path = rules_path.with_suffix(f"{rules_path.suffix}.tmp-{uuid.uuid4().hex}")
+        temp_path = rules_path.with_suffix(
+            f"{rules_path.suffix}.tmp-{uuid.uuid4().hex}"
+        )
         try:
             with _RULE_SAVE_LOCK:
                 temp_path.write_text(rules)
-                diagnostics = processor.validate_rules_document(temp_path, policy=config.boundary_policy, watch_root=config.watch_root)
+                diagnostics = processor.validate_rules_document(
+                    temp_path,
+                    policy=config.boundary_policy,
+                    watch_root=config.watch_root,
+                )
                 if diagnostics:
-                    return HTMLResponse(_rules_feedback("; ".join(diagnostics), error=True), status_code=422)
+                    return HTMLResponse(
+                        _rules_feedback("; ".join(diagnostics), error=True),
+                        status_code=422,
+                    )
                 try:
-                    current_revision = hashlib.sha256(rules_path.read_bytes()).hexdigest()
+                    current_revision = hashlib.sha256(
+                        rules_path.read_bytes()
+                    ).hexdigest()
                 except OSError as error:
-                    return HTMLResponse(_rules_feedback(f"cannot read current rules: {error}", error=True), status_code=500)
+                    return HTMLResponse(
+                        _rules_feedback(
+                            f"cannot read current rules: {error}", error=True
+                        ),
+                        status_code=500,
+                    )
                 if current_revision != expected_revision:
-                    return HTMLResponse(_rules_feedback("Ruleset revision conflict. Reload before saving.", error=True), status_code=409)
+                    return HTMLResponse(
+                        _rules_feedback(
+                            "Ruleset revision conflict. Reload before saving.",
+                            error=True,
+                        ),
+                        status_code=409,
+                    )
                 rules_path.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(temp_path, rules_path)
         finally:
@@ -270,11 +357,15 @@ def create_app(
         revision = hashlib.sha256(rules.encode()).hexdigest()
         return HTMLResponse(_rules_feedback(f"Rules saved. Revision: {revision}"))
 
-    @app.get("/watches/{watch_id}/dry-run", response_class=HTMLResponse, response_model=None)
+    @app.get(
+        "/watches/{watch_id}/dry-run", response_class=HTMLResponse, response_model=None
+    )
     def dry_run(watch_id: str, item: Path) -> str | JSONResponse:
         config = _watch_config(watch_id)
         if config is None:
-            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
+            return JSONResponse(
+                status_code=404, content={"detail": "watch folder not configured"}
+            )
         try:
             stat = item.stat()
         except OSError as error:
@@ -294,7 +385,8 @@ def create_app(
         batch_item = batch.items[0]
         if batch_item.report and batch_item.report.actions:
             rows = "".join(
-                f"<li>{action.kind}: {action.source} to {action.target}</li>" for action in batch_item.report.actions
+                f"<li>{action.kind}: {action.source} to {action.target}</li>"
+                for action in batch_item.report.actions
             )
             return f"<h1>Dry run: {watch_id}</h1><ul>{rows}</ul>"
         return f"<h1>Dry run: {watch_id}</h1><p>{html.escape(batch_item.detail)}</p>"
@@ -305,29 +397,49 @@ def create_app(
     ) -> dict[str, str] | JSONResponse:
         config = _watch_config(watch_id)
         if config is None:
-            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
+            return JSONResponse(
+                status_code=404, content={"detail": "watch folder not configured"}
+            )
         rules_path = config.rules_path
         try:
             processor._resolve_destination(rules_path)
         except ValueError as error:
-            return JSONResponse(status_code=500, content={"detail": f"unsafe rules path: {error}"})
+            return JSONResponse(
+                status_code=500, content={"detail": f"unsafe rules path: {error}"}
+            )
         loaded = yaml.safe_load(body) or {}
-        if not isinstance(loaded, dict) or not isinstance(loaded.get("rules", []), list):
-            return JSONResponse(status_code=422, content={"detail": "invalid rules document"})
-        temp_path = rules_path.with_suffix(f"{rules_path.suffix}.tmp-{uuid.uuid4().hex}")
+        if not isinstance(loaded, dict) or not isinstance(
+            loaded.get("rules", []), list
+        ):
+            return JSONResponse(
+                status_code=422, content={"detail": "invalid rules document"}
+            )
+        temp_path = rules_path.with_suffix(
+            f"{rules_path.suffix}.tmp-{uuid.uuid4().hex}"
+        )
         try:
             temp_path.write_bytes(body)
-            diagnostics = processor.validate_rules_document(temp_path, policy=config.boundary_policy, watch_root=config.watch_root)
+            diagnostics = processor.validate_rules_document(
+                temp_path, policy=config.boundary_policy, watch_root=config.watch_root
+            )
             if diagnostics:
-                return JSONResponse(status_code=422, content={"detail": "; ".join(diagnostics)})
+                return JSONResponse(
+                    status_code=422, content={"detail": "; ".join(diagnostics)}
+                )
             try:
                 current_revision = hashlib.sha256(rules_path.read_bytes()).hexdigest()
             except OSError as error:
-                return JSONResponse(status_code=500, content={"detail": f"cannot read current rules: {error}"})
+                return JSONResponse(
+                    status_code=500,
+                    content={"detail": f"cannot read current rules: {error}"},
+                )
             if current_revision != expected_revision:
                 return JSONResponse(
                     status_code=409,
-                    content={"detail": "ruleset revision conflict", "revision": current_revision},
+                    content={
+                        "detail": "ruleset revision conflict",
+                        "revision": current_revision,
+                    },
                 )
             rules_path.parent.mkdir(parents=True, exist_ok=True)
             os.replace(temp_path, rules_path)
@@ -337,13 +449,26 @@ def create_app(
         return {"watch_id": watch_id, "revision": hashlib.sha256(body).hexdigest()}
 
     @app.get("/attempts", response_model=None)
-    def list_attempts(request: Request, status: str = "", watch_id: str = "") -> list[dict[str, object]] | HTMLResponse | JSONResponse:
+    def list_attempts(
+        request: Request, status: str = "", watch_id: str = ""
+    ) -> list[dict[str, object]] | HTMLResponse | JSONResponse:
         if watch_id and _watch_config(watch_id) is None:
-            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
-        statuses = tuple(s.strip() for s in status.split(",") if s.strip()) if status else ()
+            return JSONResponse(
+                status_code=404, content={"detail": "watch folder not configured"}
+            )
+        statuses = (
+            tuple(s.strip() for s in status.split(",") if s.strip()) if status else ()
+        )
         summaries = review.list(AttemptFilters(statuses=statuses, watch_id=watch_id))
         if _is_html_request(request):
-            return _fragment(request, "attempt_list.html", attempts=summaries, status=status, watch_id=watch_id, watches=_runtime_watches)
+            return _fragment(
+                request,
+                "attempt_list.html",
+                attempts=summaries,
+                status=status,
+                watch_id=watch_id,
+                watches=_runtime_watches,
+            )
         return [
             {
                 "attempt_id": s.attempt_id,
@@ -360,18 +485,24 @@ def create_app(
         ]
 
     @app.get("/attempts/{attempt_id}", response_model=None)
-    def inspect_attempt(request: Request, attempt_id: str) -> dict[str, object] | HTMLResponse | JSONResponse:
+    def inspect_attempt(
+        request: Request, attempt_id: str
+    ) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
             details = review.inspect(attempt_id)
         except ValueError as error:
             return JSONResponse(status_code=404, content={"detail": str(error)})
         if _is_html_request(request):
             config = _watch_config(details.watch_id)
-            return _fragment(request, "attempt_detail.html", attempt=details, watch=config)
+            return _fragment(
+                request, "attempt_detail.html", attempt=details, watch=config
+            )
         return _attempt_payload(details)
 
     @app.post("/attempts/{attempt_id}/accept", response_model=None)
-    def accept_attempt(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
+    def accept_attempt(
+        request: Request, attempt_id: str, body: bytes = Body(...)
+    ) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
             payload = _form_or_json(body)
             action_index = int(str(payload["action_index"]))
@@ -384,7 +515,9 @@ def create_app(
             return JSONResponse(status_code=404, content={"detail": str(error)})
         config = _watch_config(details.watch_id)
         if config is None:
-            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
+            return JSONResponse(
+                status_code=404, content={"detail": "watch folder not configured"}
+            )
         try:
             result = review.command(
                 attempt_id,
@@ -398,11 +531,20 @@ def create_app(
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
         if _is_html_request(request):
-            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
-        return {"success": result.success, "attempt_id": result.attempt_id, "status": result.status, "detail": result.detail}
+            return _fragment(
+                request, "command_feedback.html", result=result, attempt_id=attempt_id
+            )
+        return {
+            "success": result.success,
+            "attempt_id": result.attempt_id,
+            "status": result.status,
+            "detail": result.detail,
+        }
 
     @app.post("/attempts/{attempt_id}/abandon", response_model=None)
-    def abandon_attempt(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
+    def abandon_attempt(
+        request: Request, attempt_id: str, body: bytes = Body(...)
+    ) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
             payload = _form_or_json(body)
             reason = str(payload.get("reason", ""))
@@ -413,41 +555,89 @@ def create_app(
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
         if _is_html_request(request):
-            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
-        return {"success": result.success, "attempt_id": result.attempt_id, "status": result.status, "detail": result.detail}
+            return _fragment(
+                request, "command_feedback.html", result=result, attempt_id=attempt_id
+            )
+        return {
+            "success": result.success,
+            "attempt_id": result.attempt_id,
+            "status": result.status,
+            "detail": result.detail,
+        }
 
     @app.post("/attempts/{attempt_id}/mark-action-applied", response_model=None)
-    def mark_action_applied(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
+    def mark_action_applied(
+        request: Request, attempt_id: str, body: bytes = Body(...)
+    ) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
             payload = _form_or_json(body)
             details = review.inspect(attempt_id)
             config = _watch_config(details.watch_id)
             if config is None:
-                return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
-            result = review.command(attempt_id, MarkActionApplied(int(str(payload["action_index"])), str(payload["resulting_path"]), config.watch_root, config.boundary_policy))
+                return JSONResponse(
+                    status_code=404, content={"detail": "watch folder not configured"}
+                )
+            result = review.command(
+                attempt_id,
+                MarkActionApplied(
+                    int(str(payload["action_index"])),
+                    str(payload["resulting_path"]),
+                    config.watch_root,
+                    config.boundary_policy,
+                ),
+            )
         except (KeyError, ValueError) as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
         if _is_html_request(request):
-            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
-        return {"success": result.success, "attempt_id": result.attempt_id, "status": result.status, "detail": result.detail}
+            return _fragment(
+                request, "command_feedback.html", result=result, attempt_id=attempt_id
+            )
+        return {
+            "success": result.success,
+            "attempt_id": result.attempt_id,
+            "status": result.status,
+            "detail": result.detail,
+        }
 
     @app.post("/attempts/{attempt_id}/retry-remaining", response_model=None)
-    def retry_remaining(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
+    def retry_remaining(
+        request: Request, attempt_id: str, body: bytes = Body(...)
+    ) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
             payload = _form_or_json(body)
             details = review.inspect(attempt_id)
             config = _watch_config(details.watch_id)
             if config is None:
-                return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
-            result = review.command(attempt_id, RetryRemaining(int(str(payload["action_index"])), str(payload["resulting_path"]), config.watch_root, config.boundary_policy))
+                return JSONResponse(
+                    status_code=404, content={"detail": "watch folder not configured"}
+                )
+            result = review.command(
+                attempt_id,
+                RetryRemaining(
+                    int(str(payload["action_index"])),
+                    str(payload["resulting_path"]),
+                    config.watch_root,
+                    config.boundary_policy,
+                ),
+            )
         except (KeyError, ValueError) as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
         if _is_html_request(request):
-            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
-        return {"success": result.success, "attempt_id": result.attempt_id, "status": result.status, "detail": result.detail, "new_attempt_id": result.new_attempt_id}
+            return _fragment(
+                request, "command_feedback.html", result=result, attempt_id=attempt_id
+            )
+        return {
+            "success": result.success,
+            "attempt_id": result.attempt_id,
+            "status": result.status,
+            "detail": result.detail,
+            "new_attempt_id": result.new_attempt_id,
+        }
 
     @app.post("/attempts/{attempt_id}/reopen", response_model=None)
-    def reopen_attempt(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
+    def reopen_attempt(
+        request: Request, attempt_id: str, body: bytes = Body(...)
+    ) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
             payload = _form_or_json(body)
             watch_id = str(payload["watch_id"])
@@ -455,13 +645,24 @@ def create_app(
             return JSONResponse(status_code=422, content={"detail": str(error)})
         config = _watch_config(watch_id)
         if config is None:
-            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
+            return JSONResponse(
+                status_code=404, content={"detail": "watch folder not configured"}
+            )
         try:
-            result = review.command(attempt_id, Reopen(watch_root=config.watch_root, rules_path=config.rules_path, boundary_policy=config.boundary_policy))
+            result = review.command(
+                attempt_id,
+                Reopen(
+                    watch_root=config.watch_root,
+                    rules_path=config.rules_path,
+                    boundary_policy=config.boundary_policy,
+                ),
+            )
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
         if _is_html_request(request):
-            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
+            return _fragment(
+                request, "command_feedback.html", result=result, attempt_id=attempt_id
+            )
         return {
             "success": result.success,
             "attempt_id": result.attempt_id,
@@ -471,7 +672,9 @@ def create_app(
         }
 
     @app.post("/attempts/{attempt_id}/retry", response_model=None)
-    def retry_attempt(request: Request, attempt_id: str, body: bytes = Body(...)) -> dict[str, object] | HTMLResponse | JSONResponse:
+    def retry_attempt(
+        request: Request, attempt_id: str, body: bytes = Body(...)
+    ) -> dict[str, object] | HTMLResponse | JSONResponse:
         try:
             payload = _form_or_json(body)
             watch_id = str(payload["watch_id"])
@@ -479,13 +682,24 @@ def create_app(
             return JSONResponse(status_code=422, content={"detail": str(error)})
         config = _watch_config(watch_id)
         if config is None:
-            return JSONResponse(status_code=404, content={"detail": "watch folder not configured"})
+            return JSONResponse(
+                status_code=404, content={"detail": "watch folder not configured"}
+            )
         try:
-            result = review.command(attempt_id, RetryFromStart(watch_root=config.watch_root, rules_path=config.rules_path, boundary_policy=config.boundary_policy))
+            result = review.command(
+                attempt_id,
+                RetryFromStart(
+                    watch_root=config.watch_root,
+                    rules_path=config.rules_path,
+                    boundary_policy=config.boundary_policy,
+                ),
+            )
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
         if _is_html_request(request):
-            return _fragment(request, "command_feedback.html", result=result, attempt_id=attempt_id)
+            return _fragment(
+                request, "command_feedback.html", result=result, attempt_id=attempt_id
+            )
         return {
             "success": result.success,
             "attempt_id": result.attempt_id,
@@ -529,7 +743,16 @@ def create_app(
             for entry in entries
         ]
         if _is_html_request(request):
-            return _fragment(request, "log_viewer.html", entries=payload, watch=watch, level=level, start=start, end=end, watches=_runtime_watches)
+            return _fragment(
+                request,
+                "log_viewer.html",
+                entries=payload,
+                watch=watch,
+                level=level,
+                start=start,
+                end=end,
+                watches=_runtime_watches,
+            )
         return payload
 
     @app.get("/health", response_model=None)
@@ -540,7 +763,9 @@ def create_app(
                 "watch_folder_healths": [],
                 "persistence_health": {"tracking_db_writable": True, "detail": ""},
             }
-        folder_tuples = [(config.watch_id, config.watch_root) for config in _runtime_watches]
+        folder_tuples = [
+            (config.watch_id, config.watch_root) for config in _runtime_watches
+        ]
         overall = health_checker.check_all(watch_folders=folder_tuples, db_path=db_path)
         return {
             "all_healthy": overall.all_healthy,
@@ -559,17 +784,49 @@ def create_app(
         }
 
     @app.post("/watches", response_model=None)
-    def add_watch(payload: dict[str, object] = Body(...)) -> dict[str, object] | JSONResponse:
+    async def add_watch(
+        request: Request,
+    ) -> dict[str, object] | JSONResponse | HTMLResponse:
+        body = await request.body()
+        payload = _form_or_json(body)
         watch_id = payload.get("id")
         root = payload.get("root")
         rules_path = payload.get("rules_path")
 
+        is_htmx = request.headers.get("HX-Request") == "true"
+
         if not isinstance(watch_id, str) or not watch_id:
+            if is_htmx:
+                data_roots, _ = _data_roots_and_config_root()
+                return _TEMPLATES.TemplateResponse(
+                    request,
+                    "watch_form.html",
+                    {"data_roots": data_roots, "errors": "id is required"},
+                    status_code=422,
+                )
             return JSONResponse(status_code=422, content={"detail": "id is required"})
         if not isinstance(root, str) or not root:
+            if is_htmx:
+                data_roots, _ = _data_roots_and_config_root()
+                return _TEMPLATES.TemplateResponse(
+                    request,
+                    "watch_form.html",
+                    {"data_roots": data_roots, "errors": "root is required"},
+                    status_code=422,
+                )
             return JSONResponse(status_code=422, content={"detail": "root is required"})
         if not isinstance(rules_path, str) or not rules_path:
-            return JSONResponse(status_code=422, content={"detail": "rules_path is required"})
+            if is_htmx:
+                data_roots, _ = _data_roots_and_config_root()
+                return _TEMPLATES.TemplateResponse(
+                    request,
+                    "watch_form.html",
+                    {"data_roots": data_roots, "errors": "rules_path is required"},
+                    status_code=422,
+                )
+            return JSONResponse(
+                status_code=422, content={"detail": "rules_path is required"}
+            )
 
         existing_ids = [w.watch_id for w in _runtime_watches]
         existing_roots = [w.watch_root for w in _runtime_watches]
@@ -577,8 +834,21 @@ def create_app(
 
         try:
             validate_watch_id(watch_id, existing_ids)
-            validate_watch_root(Path(root), config_root, tuple(data_roots), tuple(existing_roots), watch_id)
+            validate_watch_root(
+                Path(root),
+                config_root,
+                tuple(data_roots),
+                tuple(existing_roots),
+                watch_id,
+            )
         except ConfigError as e:
+            if is_htmx:
+                return _TEMPLATES.TemplateResponse(
+                    request,
+                    "watch_form.html",
+                    {"data_roots": data_roots, "errors": str(e)},
+                    status_code=422,
+                )
             return JSONResponse(status_code=422, content={"detail": str(e)})
 
         disk_doc: dict[str, object] = {}
@@ -603,20 +873,38 @@ def create_app(
             watch_id=watch_id,
             watch_root=Path(root),
             rules_path=Path(rules_path),
-            boundary_policy=_runtime_watches[0].boundary_policy if _runtime_watches else BoundaryPolicy(data_roots=tuple(data_roots), config_root=config_root),
+            boundary_policy=_runtime_watches[0].boundary_policy
+            if _runtime_watches
+            else BoundaryPolicy(data_roots=tuple(data_roots), config_root=config_root),
         )
         _runtime_watches.append(new_config)
 
         if watch_mutator is not None:
             watch_mutator.add_watch(new_config)
 
+        if is_htmx:
+            watch_list_html = _TEMPLATES.get_template("watch_list.html").render(
+                watches=_build_watches()
+            )
+            add_button = '<button hx-get="/watches/new" hx-target="#add-watch-form" hx-swap="innerHTML">Add Watch</button>'
+            return HTMLResponse(add_button + watch_list_html)
         return {"id": watch_id, "root": root, "rules_path": rules_path}
 
     @app.delete("/watches/{watch_id}", response_model=None)
-    def remove_watch(watch_id: str) -> dict[str, object] | JSONResponse:
+    def remove_watch(
+        request: Request, watch_id: str
+    ) -> dict[str, object] | JSONResponse | HTMLResponse:
         watch = next((w for w in _runtime_watches if w.watch_id == watch_id), None)
         if watch is None:
-            return JSONResponse(status_code=404, content={"detail": f"watch folder not found: {watch_id}"})
+            if request.headers.get("HX-Request") == "true":
+                return HTMLResponse(
+                    f"<p>Watch folder not found: {html.escape(watch_id)}</p>",
+                    status_code=404,
+                )
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"watch folder not found: {watch_id}"},
+            )
 
         del_doc: dict[str, object] = {}
         if config_path is not None:
@@ -640,6 +928,13 @@ def create_app(
         if watch_mutator is not None:
             watch_mutator.remove_watch(watch_id)
 
-        return {"id": watch_id, "root": str(watch.watch_root), "rules_path": str(watch.rules_path), "status": "removed"}
+        if request.headers.get("HX-Request") == "true":
+            return _fragment(request, "watch_list.html", watches=_build_watches())
+        return {
+            "id": watch_id,
+            "root": str(watch.watch_root),
+            "rules_path": str(watch.rules_path),
+            "status": "removed",
+        }
 
     return app

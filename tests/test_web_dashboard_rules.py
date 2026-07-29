@@ -34,6 +34,124 @@ def make_client(tmp_path: Path) -> tuple[TestClient, Path, MemoryLogSink]:
     )), rules_path, log_sink
 
 
+def test_dashboard_has_add_watch_button(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "Add Watch" in response.text
+    assert 'hx-get="/watches/new"' in response.text
+
+
+def test_dashboard_has_remove_buttons(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+    response = client.get("/")
+    assert response.status_code == 200
+    assert hx_delete in response.text
+    assert hx_confirm in response.text
+
+
+hx_delete = 'hx-delete="/watches/downloads"'
+hx_confirm = "Remove watch 'downloads'?"
+
+
+def test_dashboard_watch_list_is_updatable_via_target(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+    response = client.get("/")
+    assert response.status_code == 200
+    assert 'id="watch-list"' in response.text
+
+
+def test_watch_form_partial_renders(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+    response = client.get("/watches/new")
+    assert response.status_code == 200
+    assert "Watch ID" in response.text
+    assert "Root path" in response.text
+    assert "Rules path" in response.text
+    assert 'hx-post="/watches"' in response.text
+
+
+def test_watch_form_root_dropdown_populated(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+    response = client.get("/watches/new")
+    assert response.status_code == 200
+    assert str(tmp_path) in response.text
+
+
+def test_watch_form_has_cancel_button(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+    response = client.get("/watches/new")
+    assert response.status_code == 200
+    assert "Cancel" in response.text
+    assert 'hx-get="/"' in response.text
+
+
+def test_add_watch_htmx_success_returns_watch_list(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+    new_root = tmp_path / "incoming"
+    new_root.mkdir()
+    new_rules = tmp_path / "incoming_rules.yaml"
+    new_rules.write_text("rules: []\n")
+
+    response = client.post(
+        "/watches",
+        data={"id": "incoming", "root": str(new_root), "rules_path": str(new_rules)},
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 200
+    assert "downloads" in response.text
+    assert "incoming" in response.text
+    assert "watch-list" in response.text or "<table" in response.text
+
+
+def test_add_watch_htmx_duplicate_id_shows_form_with_errors(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+    watch_root = tmp_path / "downloads"
+
+    response = client.post(
+        "/watches",
+        data={"id": "downloads", "root": str(watch_root), "rules_path": str(tmp_path / "r.yaml")},
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 422
+    assert "duplicate" in response.text or "already" in response.text.lower()
+
+
+def test_add_watch_htmx_rejects_root_outside_data_roots(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+    outside = tmp_path.parent / "outside"
+    outside.mkdir(exist_ok=True)
+
+    response = client.post(
+        "/watches",
+        data={"id": "outside", "root": str(outside), "rules_path": str(tmp_path / "r.yaml")},
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 422
+    assert "outside" in response.text.lower()
+
+
+def test_remove_watch_htmx_success_returns_watch_list(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+
+    response = client.delete("/watches/downloads", headers={"HX-Request": "true"})
+
+    assert response.status_code == 200
+    assert "watch-list" in response.text or "<table" in response.text or "No watch folders" in response.text
+
+
+def test_remove_watch_htmx_unknown_returns_error(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+
+    response = client.delete("/watches/unknown", headers={"HX-Request": "true"})
+
+    assert response.status_code == 404
+    assert "not found" in response.text.lower()
+
+
 def test_dashboard_renders_watch_health_rule_count_and_recent_activity(tmp_path: Path) -> None:
     client, rules_path, log_sink = make_client(tmp_path)
     rules_path.write_text("rules:\n  - name: Archive\n    match: {field: file_name, pattern: .+}\n    actions: [{move: {destination: ../archives}}]\n")

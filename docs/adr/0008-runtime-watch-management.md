@@ -23,6 +23,8 @@ The validation logic in `load_config()` is extracted into standalone functions:
 - `validate_watch_id(watch_id, existing_ids)`
 
 These are reused by both the initial config load and the runtime API.
+`load_config()` constructs one immutable `BoundaryPolicy` for the complete
+validated watch set and all loaded watches reference that instance.
 
 ### 3. Web API
 

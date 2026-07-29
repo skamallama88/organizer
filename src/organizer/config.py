@@ -42,6 +42,28 @@ class OrganizerConfig(BaseModel):
         raise KeyError(watch_id)
 
 
+def validate_watch_id(watch_id: str, existing_ids: list[str]) -> None:
+    if watch_id in existing_ids:
+        raise ConfigError(f"duplicate watch id: {watch_id}")
+
+
+def validate_watch_root(
+    root: Path,
+    config_root: Path,
+    data_roots: list[Path] | tuple[Path, ...],
+    existing_roots: list[Path] | tuple[Path, ...],
+    watch_id: str | None = None,
+) -> None:
+    context = f"watch {watch_id}" if watch_id is not None else "watch"
+    if _within(root, config_root):
+        raise ConfigError(f"{context} is within the config volume")
+    if not any(_within(root, data_root) for data_root in data_roots):
+        raise ConfigError(f"{context} is outside data volumes")
+    for other in existing_roots:
+        if _within(root, other) or _within(other, root):
+            raise ConfigError(f"{context} roots overlap")
+
+
 def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
     config_path = path.expanduser().resolve()
     try:
@@ -74,8 +96,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
         watch_id = raw_watch.get("id")
         if not isinstance(watch_id, str) or not watch_id:
             raise ConfigError("watch id is required")
-        if watch_id in watch_ids:
-            raise ConfigError(f"duplicate watch id: {watch_id}")
+        validate_watch_id(watch_id, watch_ids)
         root = _required_path(raw_watch, "root", f"watch {watch_id}", config_path.parent)
         rules_value = raw_watch.get("rules", "rules.yaml")
         if not isinstance(rules_value, str) or not rules_value:
@@ -83,22 +104,21 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
         rules_path = Path(rules_value)
         if not rules_path.is_absolute():
             rules_path = config_path.parent / rules_path
+        validate_watch_root(root, config_root, data_roots, watch_roots, watch_id)
         watch_roots.append(root)
         watch_ids.append(watch_id)
-
-    for index, root in enumerate(watch_roots):
-        if _within(root, config_root):
-            raise ConfigError(f"watch {watch_ids[index]} is within the config volume")
-        if not any(_within(root, data_root) for data_root in data_roots):
-            raise ConfigError(f"watch {watch_ids[index]} is outside data volumes")
-        rules_value = raw_watches[index].get("rules", "rules.yaml")
-        for other_index, other in enumerate(watch_roots):
-            if index != other_index and (_within(root, other) or _within(other, root)):
-                raise ConfigError(f"watch roots overlap: {watch_ids[index]} and {watch_ids[other_index]}")
 
     if document.get("quarantine_root") is not None and (_within(quarantine_root, config_root) or not any(_within(quarantine_root, data_root) for data_root in data_roots)):
         raise ConfigError("quarantine root must be within a data volume and outside the config volume")
 
+    boundary_policy = BoundaryPolicy(
+        data_roots=tuple(data_roots),
+        config_root=config_root,
+        watch_roots=tuple(watch_roots),
+        allowed_destinations=tuple(data_roots),
+        quarantine_root=quarantine_root,
+        watch_ids=tuple(watch_ids),
+    )
     watches = tuple(
         WatchFolderConfig(
             watch_id=watch_id,
@@ -106,14 +126,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
             rules_path=(config_path.parent / Path(raw_watch.get("rules", "rules.yaml"))).resolve()
             if not Path(raw_watch.get("rules", "rules.yaml")).is_absolute()
             else Path(raw_watch.get("rules", "rules.yaml")).resolve(),
-            boundary_policy=BoundaryPolicy(
-                data_roots=tuple(data_roots),
-                config_root=config_root,
-                watch_roots=tuple(watch_roots),
-                allowed_destinations=tuple(data_roots),
-                quarantine_root=quarantine_root,
-                watch_ids=tuple(watch_ids),
-            ),
+            boundary_policy=boundary_policy,
         )
         for raw_watch, watch_id, root in zip(raw_watches, watch_ids, watch_roots)
     )

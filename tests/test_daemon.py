@@ -97,10 +97,19 @@ def test_scanner_processes_root_items_on_interval(tmp_path: Path) -> None:
 def test_daemon_stops_services_and_server(tmp_path: Path) -> None:
     configured = watch(tmp_path)
     processor = RecordingProcessor()
-    daemon = OrganizerDaemon((configured,), processor, scanner_interval=60)
+    daemon = OrganizerDaemon([configured], processor, scanner_interval=60)
     daemon.stop()
 
     assert daemon.stopped
+
+
+def test_daemon_watches_are_mutable_list(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    daemon = OrganizerDaemon([configured], RecordingProcessor(), scanner_interval=60)
+
+    assert isinstance(daemon.watches, list)
+    daemon.watches.append(configured)
+    assert len(daemon.watches) == 2
 
 
 def test_processor_batch_adapter_delegates_to_process_batch(tmp_path: Path) -> None:

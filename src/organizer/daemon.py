@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -50,7 +50,7 @@ class ProcessorBatchAdapter:
 
 
 class WatcherService:
-    def __init__(self, watches: tuple[WatchFolderConfig, ...], processor: BatchProcessor, debounce_seconds: float = 0.5) -> None:
+    def __init__(self, watches: Sequence[WatchFolderConfig], processor: BatchProcessor, debounce_seconds: float = 0.5) -> None:
         self._watches = {watch.watch_id: watch for watch in watches}
         self._processor = processor
         self._debounce_seconds = debounce_seconds
@@ -121,7 +121,7 @@ class _WatchdogHandler(FileSystemEventHandler):
 
 
 class PeriodicScanner:
-    def __init__(self, watches: tuple[WatchFolderConfig, ...], processor: BatchProcessor, interval_seconds: float = 300) -> None:
+    def __init__(self, watches: Sequence[WatchFolderConfig], processor: BatchProcessor, interval_seconds: float = 300) -> None:
         self._watches = watches
         self._processor = processor
         self._interval_seconds = interval_seconds
@@ -167,12 +167,13 @@ class RetentionService:
 
 @dataclass
 class OrganizerDaemon:
-    watches: tuple[WatchFolderConfig, ...]
+    watches: list[WatchFolderConfig]
     processor: BatchProcessor
     scanner_interval: float = 300
     retention: RetentionService | None = None
 
     def __post_init__(self) -> None:
+        self.watches = list(self.watches)
         self.watcher = WatcherService(self.watches, self.processor)
         self.scanner = PeriodicScanner(self.watches, self.processor, self.scanner_interval)
         self._scanner_task: asyncio.Task[None] | None = None
@@ -240,7 +241,7 @@ def create_daemon(
             interval_seconds=retention_interval or 3600,
         )
     return OrganizerDaemon(
-        config.watches,
+        list(config.watches),
         ProcessorBatchAdapter(processor),
         config.scan_interval,
         retention=retention_service,

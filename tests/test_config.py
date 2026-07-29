@@ -4,7 +4,25 @@ from pathlib import Path
 
 import pytest
 
-from organizer.config import ConfigError, load_config
+from organizer.config import (
+    ConfigError,
+    load_config,
+    validate_watch_id,
+    validate_watch_root,
+)
+
+
+def test_validate_watch_id_rejects_duplicate_ids() -> None:
+    with pytest.raises(ConfigError, match="duplicate watch id: downloads"):
+        validate_watch_id("downloads", ["downloads"])
+
+
+def test_validate_watch_root_rejects_config_volume_and_overlaps(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="config volume"):
+        validate_watch_root(tmp_path / "config" / "watch", tmp_path / "config", [tmp_path], [])
+
+    with pytest.raises(ConfigError, match="overlap"):
+        validate_watch_root(tmp_path / "data" / "child", tmp_path / "config", [tmp_path / "data"], [tmp_path / "data"])
 
 
 def test_load_config_resolves_global_and_watch_settings(tmp_path: Path) -> None:
@@ -20,6 +38,9 @@ watches:
   - id: downloads
     root: /data/downloads
     rules: rules/downloads.yaml
+  - id: incoming
+    root: /data/incoming
+    rules: rules/incoming.yaml
 """
     )
 
@@ -32,6 +53,7 @@ watches:
     assert config.watches[0].rules_path == (tmp_path / "rules/downloads.yaml").resolve()
     assert config.watches[0].boundary_policy.data_roots == (Path("/data"),)
     assert config.watches[0].boundary_policy.quarantine_root == Path("/data/.quarantine")
+    assert config.watches[0].boundary_policy is config.watches[1].boundary_policy
 
 
 def test_load_config_rejects_overlapping_watch_roots(tmp_path: Path) -> None:

@@ -4,11 +4,13 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** completed
 
-- [ ] Extract `validate_watch_root(root, config_root, data_roots, existing_roots)` from `config.py:89-97`
-- [ ] Extract `validate_watch_id(watch_id, existing_ids)` from `config.py:75-78`
-- [ ] Hoist `BoundaryPolicy` construction to a single shared instance referenced by all watches (or rebuilt on mutation) — not a copy per watch
-- [ ] Convert `OrganizerDaemon.watches` from `tuple` to `list[WatchFolderConfig]`
-- [ ] `load_config()` calls the extracted helpers so existing validation semantics are preserved
-- [ ] All existing tests pass without modification
+- [x] Extract `validate_watch_root(root, config_root, data_roots, existing_roots)` from `config.py:89-97`
+- [x] Extract `validate_watch_id(watch_id, existing_ids)` from `config.py:75-78`
+- [x] Hoist `BoundaryPolicy` construction to a single shared instance referenced by all watches (or rebuilt on mutation) — not a copy per watch
+- [x] Convert `OrganizerDaemon.watches` from `tuple` to `list[WatchFolderConfig]`
+- [x] `load_config()` calls the extracted helpers so existing validation semantics are preserved
+- [x] All existing tests pass without modification
+
+Implemented in commit `86b3c7a`. Verification passed: 285 tests, mypy, and Ruff.

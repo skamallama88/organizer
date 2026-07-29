@@ -4,6 +4,7 @@ import asyncio
 import threading
 import time
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Protocol, Sequence
 
@@ -21,6 +22,12 @@ from organizer.retention import Retention
 
 class BatchProcessor(Protocol):
     def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None: ...
+
+
+class WatchMutator(Protocol):
+    def add_watch(self, watch: WatchFolderConfig) -> None: ...
+
+    def remove_watch(self, watch_id: str) -> None: ...
 
 
 class ProcessorBatchAdapter:
@@ -56,6 +63,8 @@ class WatcherService:
         self._debounce_seconds = debounce_seconds
         self._pending: dict[tuple[str, Path], float] = {}
         self._observer: object | None = None
+        self._handler: _WatchdogHandler | None = None
+        self._handles: dict[str, object] = {}
         self._lock = threading.Lock()
 
     def handle_event(self, watch_id: str, path: Path, event_type: str) -> None:
@@ -77,17 +86,46 @@ class WatcherService:
                     ready.setdefault(watch_id, []).append(path)
                     del self._pending[key]
         for watch_id, paths in ready.items():
-            self._processor.process_batch(self._watches[watch_id], paths)
+            with self._lock:
+                watch = self._watches.get(watch_id)
+            if watch is not None:
+                self._processor.process_batch(watch, paths)
         return sum(len(paths) for paths in ready.values())
 
     def start(self) -> None:
         observer = Observer()
         handler = _WatchdogHandler(self)
+        self._handler = handler
         for watch in self._watches.values():
             if watch.watch_root.is_dir():
-                observer.schedule(handler, str(watch.watch_root), recursive=True)
+                self._handles[watch.watch_id] = observer.schedule(handler, str(watch.watch_root), recursive=True)
         observer.start()
         self._observer = observer
+
+    def add_watch(self, watch: WatchFolderConfig) -> None:
+        with self._lock:
+            self._watches[watch.watch_id] = watch
+            observer = self._observer
+            handler = self._handler or _WatchdogHandler(self)
+            self._handler = handler
+        if observer is not None and handler is not None and watch.watch_root.is_dir():
+            handle = observer.schedule(handler, str(watch.watch_root), recursive=True)  # type: ignore[attr-defined]
+            with self._lock:
+                self._handles[watch.watch_id] = handle
+
+    def remove_watch(self, watch_id: str) -> None:
+        with self._lock:
+            self._watches.pop(watch_id, None)
+            self._pending = {key: deadline for key, deadline in self._pending.items() if key[0] != watch_id}
+            handle = self._handles.pop(watch_id, None)
+            observer = self._observer
+        if handle is not None and observer is not None:
+            observer.unschedule(handle)  # type: ignore[attr-defined]
+
+    def update_watch(self, watch: WatchFolderConfig) -> None:
+        with self._lock:
+            if watch.watch_id in self._watches:
+                self._watches[watch.watch_id] = watch
 
     def stop(self) -> None:
         if self._observer is not None:
@@ -95,6 +133,8 @@ class WatcherService:
             observer.stop()  # type: ignore[attr-defined]
             observer.join()  # type: ignore[attr-defined]
             self._observer = None
+            self._handler = None
+            self._handles.clear()
         with self._lock:
             self._pending.clear()
 
@@ -113,8 +153,9 @@ class _WatchdogHandler(FileSystemEventHandler):
 
     def _dispatch(self, event: FileSystemEvent, event_type: str) -> None:
         path = Path(event.src_path.decode() if isinstance(event.src_path, bytes) else event.src_path)
-        for watch_id in self._service._watches:
-            watch = self._service._watches[watch_id]
+        with self._service._lock:
+            watches = tuple(self._service._watches.items())
+        for watch_id, watch in watches:
             if path.is_relative_to(watch.watch_root):
                 self._service.handle_event(watch_id, path, event_type)
                 return
@@ -122,7 +163,7 @@ class _WatchdogHandler(FileSystemEventHandler):
 
 class PeriodicScanner:
     def __init__(self, watches: Sequence[WatchFolderConfig], processor: BatchProcessor, interval_seconds: float = 300) -> None:
-        self._watches = watches
+        self._watches = list(watches)
         self._processor = processor
         self._interval_seconds = interval_seconds
         self._stop_event = asyncio.Event()
@@ -140,6 +181,19 @@ class PeriodicScanner:
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def add_watch(self, watch: WatchFolderConfig) -> None:
+        self._watches[:] = [existing for existing in self._watches if existing.watch_id != watch.watch_id]
+        self._watches.append(watch)
+
+    def remove_watch(self, watch_id: str) -> None:
+        self._watches[:] = [watch for watch in self._watches if watch.watch_id != watch_id]
+
+    def update_watch(self, watch: WatchFolderConfig) -> None:
+        for index, existing in enumerate(self._watches):
+            if existing.watch_id == watch.watch_id:
+                self._watches[index] = watch
+                return
 
 
 class RetentionService:
@@ -184,6 +238,36 @@ class OrganizerDaemon:
     @property
     def stopped(self) -> bool:
         return self._stopped
+
+    def add_watch(self, watch: WatchFolderConfig) -> None:
+        self.watcher.remove_watch(watch.watch_id)
+        self.scanner.remove_watch(watch.watch_id)
+        self.watches[:] = [existing for existing in self.watches if existing.watch_id != watch.watch_id]
+        self.watches.append(watch)
+        self._rebuild_boundary_policy()
+        updated = self.watches[-1]
+        self.watcher.add_watch(updated)
+        self.scanner.add_watch(updated)
+
+    def remove_watch(self, watch_id: str) -> None:
+        self.watcher.remove_watch(watch_id)
+        self.scanner.remove_watch(watch_id)
+        self.watches[:] = [watch for watch in self.watches if watch.watch_id != watch_id]
+        self._rebuild_boundary_policy()
+
+    def _rebuild_boundary_policy(self) -> None:
+        if not self.watches:
+            return
+        policy = replace(
+            self.watches[0].boundary_policy,
+            watch_roots=tuple(watch.watch_root for watch in self.watches),
+            watch_ids=tuple(watch.watch_id for watch in self.watches),
+        )
+        self.watches[:] = [watch.model_copy(update={"boundary_policy": policy}) for watch in self.watches]
+        for watch in self.watches:
+            self.watcher.update_watch(watch)
+        for watch in self.watches:
+            self.scanner.update_watch(watch)
 
     def start(self) -> None:
         self.watcher.start()
@@ -246,3 +330,14 @@ def create_daemon(
         config.scan_interval,
         retention=retention_service,
     )
+
+
+class DaemonWatchMutator:
+    def __init__(self, daemon: OrganizerDaemon) -> None:
+        self._daemon = daemon
+
+    def add_watch(self, watch: WatchFolderConfig) -> None:
+        self._daemon.add_watch(watch)
+
+    def remove_watch(self, watch_id: str) -> None:
+        self._daemon.remove_watch(watch_id)

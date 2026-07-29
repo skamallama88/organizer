@@ -8,7 +8,7 @@ We extend the daemon, config loader, and web layer so watches are hot-swappable 
 
 ### 1. Daemon hot-reload (per-watch granularity)
 
-`WatcherService`, `PeriodicScanner`, and `OrganizerDaemon` each get `add_watch()` and `remove_watch()` methods that mutate the internal watch list and schedule or unschedule the watchdog observer for that root alone. Other watches keep running uninterrupted.
+`WatcherService`, `PeriodicScanner`, and `OrganizerDaemon` each get `add_watch()` and `remove_watch()` methods that mutate the internal watch list and schedule or unschedule the watchdog observer for that root alone. Other watches keep running uninterrupted. `WatchMutator` exposes the daemon operations to callers without exposing daemon internals, and `DaemonWatchMutator` adapts the daemon to that protocol.
 
 `WatcherService` stores the return value of `observer.schedule()` (a `WatchdogWatch` handle) keyed by `watch_id` so `remove_watch` can call `observer.unschedule(handle)`.
 

@@ -4,9 +4,18 @@ import asyncio
 import sqlite3
 import time
 from pathlib import Path
+from typing import cast
 
 from organizer.config import WatchFolderConfig
-from organizer.daemon import OrganizerDaemon, PeriodicScanner, ProcessorBatchAdapter, RetentionService, WatcherService
+from organizer.daemon import (
+    DaemonWatchMutator,
+    OrganizerDaemon,
+    PeriodicScanner,
+    ProcessorBatchAdapter,
+    RetentionService,
+    WatcherService,
+    WatchMutator,
+)
 from organizer.item_processor import (
     BatchItemStatus,
     BoundaryPolicy,
@@ -34,6 +43,20 @@ def watch(tmp_path: Path) -> WatchFolderConfig:
         rules_path=tmp_path / "rules.yaml",
         boundary_policy=BoundaryPolicy(),
     )
+
+
+class RecordingObserver:
+    def __init__(self) -> None:
+        self.scheduled: list[tuple[object, str, bool]] = []
+        self.unscheduled: list[object] = []
+
+    def schedule(self, handler: object, path: str, recursive: bool) -> object:
+        handle = object()
+        self.scheduled.append((handler, path, recursive))
+        return handle
+
+    def unschedule(self, handle: object) -> None:
+        self.unscheduled.append(handle)
 
 
 def _write_move_rules(path: Path, destination: str) -> Path:
@@ -74,6 +97,84 @@ def test_watcher_ignores_unconfigured_event(tmp_path: Path) -> None:
 
     assert service.flush() == 0
     assert processor.calls == []
+
+
+def test_watcher_add_and_remove_watch_updates_observer_and_pending_events(tmp_path: Path) -> None:
+    first = watch(tmp_path)
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second = WatchFolderConfig(
+        watch_id="second",
+        watch_root=second_root,
+        rules_path=tmp_path / "second-rules.yaml",
+        boundary_policy=BoundaryPolicy(),
+    )
+    processor = RecordingProcessor()
+    service = WatcherService((first,), processor, debounce_seconds=0)
+    observer = RecordingObserver()
+    service._observer = observer
+    service.add_watch(second)
+    handler = service._handler
+    assert handler is not None
+
+    event_path = second_root / "movie.mkv"
+    service.handle_event("second", event_path, "created")
+    service.remove_watch("second")
+
+    assert observer.scheduled == [(handler, str(second_root), True)]
+    assert len(observer.unscheduled) == 1
+    assert service.flush() == 0
+    assert "second" not in service._watches
+
+
+def test_scanner_add_and_remove_watch_updates_watch_list(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    processor = RecordingProcessor()
+    scanner = PeriodicScanner((), processor)
+
+    scanner.add_watch(configured)
+    scanner.remove_watch(configured.watch_id)
+
+    assert scanner._watches == []
+
+
+def test_daemon_mutator_cascades_and_rebuilds_boundary_policy(tmp_path: Path) -> None:
+    first = watch(tmp_path)
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second = WatchFolderConfig(
+        watch_id="second",
+        watch_root=second_root,
+        rules_path=tmp_path / "second-rules.yaml",
+        boundary_policy=BoundaryPolicy(),
+    )
+    daemon = OrganizerDaemon([first], RecordingProcessor(), scanner_interval=60)
+
+    daemon.add_watch(second)
+
+    assert [watch.watch_id for watch in daemon.watches] == [first.watch_id, second.watch_id]
+    assert daemon.watcher._watches["second"].watch_root == second.watch_root
+    assert [watch.watch_id for watch in daemon.scanner._watches] == [first.watch_id, second.watch_id]
+    assert daemon.watches[0].boundary_policy.watch_roots == (first.watch_root, second_root)
+    assert daemon.watches[1].boundary_policy.watch_roots == (first.watch_root, second_root)
+
+    daemon.remove_watch(first.watch_id)
+
+    assert [watch.watch_id for watch in daemon.watches] == [second.watch_id]
+    assert "first" not in daemon.watcher._watches
+    assert [watch.watch_id for watch in daemon.scanner._watches] == [second.watch_id]
+    assert tuple(daemon.watches[0].boundary_policy.watch_roots) == (second_root,)
+
+
+def test_daemon_watch_mutator_adapter_implements_protocol(tmp_path: Path) -> None:
+    daemon = OrganizerDaemon([], RecordingProcessor(), scanner_interval=60)
+    mutator: WatchMutator = DaemonWatchMutator(daemon)
+    configured = watch(tmp_path)
+
+    mutator.add_watch(configured)
+    mutator.remove_watch(configured.watch_id)
+
+    assert daemon.watches == []
 
 
 def test_scanner_processes_root_items_on_interval(tmp_path: Path) -> None:

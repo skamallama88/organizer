@@ -4,11 +4,11 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** completed
 
-- [ ] `POST /watches` endpoint — parse `{id, root, rules_path}`, call `validate_watch_root` and `validate_watch_id`, persist to YAML, call `WatchMutator.add_watch()`, return watch config
-- [ ] `DELETE /watches/{watch_id}` endpoint — remove from YAML, call `WatchMutator.remove_watch()`
-- [ ] YAML persistence helper `_save_watches_to_disk(watches: list[dict])` — reads current `organizer.yaml`, replaces the `watches` key, writes via atomic tempfile swap (same pattern as rules save in `web.py:216-233`)
-- [ ] Pass `WatchMutator` into `create_app()` from `cli.py` and `webapp.py`
-- [ ] Error responses: 422 for validation errors (duplicate ID, root outside data_roots, overlapping roots, root inside config volume), 404 for unknown watch_id on DELETE
-- [ ] Tests via FastAPI test client: verify POST returns new config, DELETE removes it, validation errors return 422
+- [x] `POST /watches` endpoint — parse `{id, root, rules_path}`, call `validate_watch_root` and `validate_watch_id`, persist to YAML, call `WatchMutator.add_watch()`, return watch config
+- [x] `DELETE /watches/{watch_id}` endpoint — remove from YAML, call `WatchMutator.remove_watch()`
+- [x] YAML persistence helper `_save_watches_to_disk(watches: list[dict])` — reads current `organizer.yaml`, replaces the `watches` key, writes via atomic tempfile swap (same pattern as rules save in `web.py:216-233`)
+- [x] Pass `WatchMutator` into `create_app()` from `cli.py` and `webapp.py`
+- [x] Error responses: 422 for validation errors (duplicate ID, root outside data_roots, overlapping roots, root inside config volume), 404 for unknown watch_id on DELETE
+- [x] Tests via FastAPI test client: verify POST returns new config, DELETE removes it, validation errors return 422

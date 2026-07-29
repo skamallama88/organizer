@@ -15,7 +15,7 @@ from organizer.attempt_review import (
     RetryFromStart,
 )
 from organizer.config import OrganizerConfig, WatchFolderConfig, load_config
-from organizer.daemon import create_daemon
+from organizer.daemon import DaemonWatchMutator, create_daemon
 from organizer.item_processor import ItemProcessor, ItemSnapshot
 
 app = typer.Typer(no_args_is_help=True)
@@ -101,6 +101,8 @@ def run(
         health_checker=health_checker,
         watch_folders=config.watches,
         db_path=config.database_path,
+        watch_mutator=DaemonWatchMutator(daemon),
+        config_path=config_path,
     )
     settings = RuntimeSettings.from_environment()
     log_startup_diagnostics(settings, logging.getLogger("organizer"))

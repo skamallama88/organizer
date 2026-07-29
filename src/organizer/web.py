@@ -24,8 +24,9 @@ from organizer.attempt_review import (
     RetryFromStart,
     RetryRemaining,
 )
-from organizer.config import WatchFolderConfig
-from organizer.item_processor import ItemProcessor, ItemSnapshot
+from organizer.config import ConfigError, WatchFolderConfig, validate_watch_id, validate_watch_root
+from organizer.daemon import WatchMutator
+from organizer.item_processor import BoundaryPolicy, ItemProcessor, ItemSnapshot
 from organizer.operational_health import OperationalHealth
 from organizer.structured_log import LogLevel, MemoryLogSink
 
@@ -34,6 +35,7 @@ __all__ = ["WatchFolderConfig", "create_app"]
 _WEB_ROOT = Path(__file__).parent / "web_ui"
 _TEMPLATES = Jinja2Templates(directory=str(_WEB_ROOT / "templates"))
 _RULE_SAVE_LOCK = threading.Lock()
+_WATCH_SAVE_LOCK = threading.Lock()
 
 
 def create_app(
@@ -43,15 +45,16 @@ def create_app(
     health_checker: OperationalHealth | None = None,
     watch_folders: list[WatchFolderConfig] | tuple[WatchFolderConfig, ...] | None = None,
     db_path: Path | None = None,
+    watch_mutator: WatchMutator | None = None,
+    config_path: Path | None = None,
 ) -> FastAPI:
     app = FastAPI()
     app.mount("/static", StaticFiles(directory=_WEB_ROOT / "static"), name="static")
     review = AttemptReview(processor)
+    _runtime_watches: list[WatchFolderConfig] = list(watch_folders or [])
 
     def _watch_config(watch_id: str) -> WatchFolderConfig | None:
-        if watch_folders is None:
-            return None
-        for config in watch_folders:
+        for config in _runtime_watches:
             if config.watch_id == watch_id:
                 return config
         return None
@@ -65,10 +68,10 @@ def create_app(
         return len(rules) if isinstance(rules, list) else 0
 
     def _health_by_watch() -> dict[str, tuple[bool, str]]:
-        if health_checker is None or db_path is None or watch_folders is None:
+        if health_checker is None or db_path is None or not _runtime_watches:
             return {}
         health = health_checker.check_all(
-            watch_folders=[(config.watch_id, config.watch_root) for config in watch_folders],
+            watch_folders=[(config.watch_id, config.watch_root) for config in _runtime_watches],
             db_path=db_path,
         )
         return {entry.watch_id: (entry.accessible, entry.detail) for entry in health.watch_folder_healths}
@@ -115,11 +118,44 @@ def create_app(
             from urllib.parse import parse_qs
             return {key: values[-1] for key, values in parse_qs(body.decode()).items()}
 
+    def _read_disk_watches() -> list[dict[str, object]]:
+        if config_path is None:
+            return []
+        try:
+            doc = yaml.safe_load(config_path.read_text()) or {}
+            if isinstance(doc, dict):
+                raw = doc.get("watches", [])
+                if isinstance(raw, list):
+                    return list(raw)
+        except OSError:
+            pass
+        return []
+
+    def _save_watches_to_disk(document: dict[str, object]) -> None:
+        if config_path is None:
+            return
+        temp_path = config_path.with_suffix(f"{config_path.suffix}.tmp-{uuid.uuid4().hex}")
+        try:
+            with _WATCH_SAVE_LOCK:
+                temp_path.write_text(yaml.dump(document, default_flow_style=False))
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(temp_path, config_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+
+    def _data_roots_and_config_root() -> tuple[list[Path], Path]:
+        if _runtime_watches:
+            bp = _runtime_watches[0].boundary_policy
+            config_root: Path = bp.config_root if bp.config_root is not None else Path("/config")
+            return list(bp.data_roots), config_root
+        return [], Path("/config")
+
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request) -> HTMLResponse:
         health_by_watch = _health_by_watch()
         watches = []
-        for config in watch_folders or ():
+        for config in _runtime_watches:
             accessible, detail = health_by_watch.get(config.watch_id, (True, ""))
             entries = log_sink.read_recent(limit=1, watch=config.watch_id) if log_sink is not None else []
             watches.append({
@@ -307,7 +343,7 @@ def create_app(
         statuses = tuple(s.strip() for s in status.split(",") if s.strip()) if status else ()
         summaries = review.list(AttemptFilters(statuses=statuses, watch_id=watch_id))
         if _is_html_request(request):
-            return _fragment(request, "attempt_list.html", attempts=summaries, status=status, watch_id=watch_id, watches=watch_folders or ())
+            return _fragment(request, "attempt_list.html", attempts=summaries, status=status, watch_id=watch_id, watches=_runtime_watches)
         return [
             {
                 "attempt_id": s.attempt_id,
@@ -493,18 +529,18 @@ def create_app(
             for entry in entries
         ]
         if _is_html_request(request):
-            return _fragment(request, "log_viewer.html", entries=payload, watch=watch, level=level, start=start, end=end, watches=watch_folders or ())
+            return _fragment(request, "log_viewer.html", entries=payload, watch=watch, level=level, start=start, end=end, watches=_runtime_watches)
         return payload
 
     @app.get("/health", response_model=None)
     def get_health() -> dict[str, object]:
-        if health_checker is None or db_path is None or watch_folders is None:
+        if health_checker is None or db_path is None or not _runtime_watches:
             return {
                 "all_healthy": True,
                 "watch_folder_healths": [],
                 "persistence_health": {"tracking_db_writable": True, "detail": ""},
             }
-        folder_tuples = [(config.watch_id, config.watch_root) for config in watch_folders]
+        folder_tuples = [(config.watch_id, config.watch_root) for config in _runtime_watches]
         overall = health_checker.check_all(watch_folders=folder_tuples, db_path=db_path)
         return {
             "all_healthy": overall.all_healthy,
@@ -521,5 +557,89 @@ def create_app(
                 "detail": overall.persistence_health.detail,
             },
         }
+
+    @app.post("/watches", response_model=None)
+    def add_watch(payload: dict[str, object] = Body(...)) -> dict[str, object] | JSONResponse:
+        watch_id = payload.get("id")
+        root = payload.get("root")
+        rules_path = payload.get("rules_path")
+
+        if not isinstance(watch_id, str) or not watch_id:
+            return JSONResponse(status_code=422, content={"detail": "id is required"})
+        if not isinstance(root, str) or not root:
+            return JSONResponse(status_code=422, content={"detail": "root is required"})
+        if not isinstance(rules_path, str) or not rules_path:
+            return JSONResponse(status_code=422, content={"detail": "rules_path is required"})
+
+        existing_ids = [w.watch_id for w in _runtime_watches]
+        existing_roots = [w.watch_root for w in _runtime_watches]
+        data_roots, config_root = _data_roots_and_config_root()
+
+        try:
+            validate_watch_id(watch_id, existing_ids)
+            validate_watch_root(Path(root), config_root, tuple(data_roots), tuple(existing_roots), watch_id)
+        except ConfigError as e:
+            return JSONResponse(status_code=422, content={"detail": str(e)})
+
+        disk_doc: dict[str, object] = {}
+        if config_path is not None:
+            try:
+                loaded = yaml.safe_load(config_path.read_text())
+                if isinstance(loaded, dict):
+                    disk_doc = loaded
+            except OSError:
+                pass
+        disk_watches_list: list[dict[str, object]] = []
+        raw_watches = disk_doc.get("watches", [])
+        if isinstance(raw_watches, list):
+            for w in raw_watches:
+                if isinstance(w, dict):
+                    disk_watches_list.append({k: v for k, v in w.items()})
+        disk_watches_list.append({"id": watch_id, "root": root, "rules": rules_path})
+        disk_doc["watches"] = disk_watches_list
+        _save_watches_to_disk(disk_doc)
+
+        new_config = WatchFolderConfig(
+            watch_id=watch_id,
+            watch_root=Path(root),
+            rules_path=Path(rules_path),
+            boundary_policy=_runtime_watches[0].boundary_policy if _runtime_watches else BoundaryPolicy(data_roots=tuple(data_roots), config_root=config_root),
+        )
+        _runtime_watches.append(new_config)
+
+        if watch_mutator is not None:
+            watch_mutator.add_watch(new_config)
+
+        return {"id": watch_id, "root": root, "rules_path": rules_path}
+
+    @app.delete("/watches/{watch_id}", response_model=None)
+    def remove_watch(watch_id: str) -> dict[str, object] | JSONResponse:
+        watch = next((w for w in _runtime_watches if w.watch_id == watch_id), None)
+        if watch is None:
+            return JSONResponse(status_code=404, content={"detail": f"watch folder not found: {watch_id}"})
+
+        del_doc: dict[str, object] = {}
+        if config_path is not None:
+            try:
+                loaded = yaml.safe_load(config_path.read_text())
+                if isinstance(loaded, dict):
+                    del_doc = loaded
+            except OSError:
+                pass
+        raw_del = del_doc.get("watches", [])
+        filtered: list[dict[str, object]] = []
+        if isinstance(raw_del, list):
+            for w in raw_del:
+                if isinstance(w, dict) and w.get("id") != watch_id:
+                    filtered.append({k: v for k, v in w.items()})
+        del_doc["watches"] = filtered
+        _save_watches_to_disk(del_doc)
+
+        _runtime_watches[:] = [w for w in _runtime_watches if w.watch_id != watch_id]
+
+        if watch_mutator is not None:
+            watch_mutator.remove_watch(watch_id)
+
+        return {"id": watch_id, "root": str(watch.watch_root), "rules_path": str(watch.rules_path), "status": "removed"}
 
     return app

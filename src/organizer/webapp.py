@@ -20,6 +20,7 @@ app = create_app(
     health_checker=health_checker,
     watch_folders=config.watches,
     db_path=db_path,
+    config_path=config.config_path,
 )
 
 settings = RuntimeSettings.from_environment()

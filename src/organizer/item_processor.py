@@ -596,7 +596,7 @@ class ItemProcessor:
             destination = action[kind].get("destination")
             if not isinstance(destination, str) or not destination:
                 raise ValueError(f"rule {rule_name} move destination is required")
-            root = Path(destination)
+            root = Path(self._expand_captures(destination, matches))
             if not root.is_absolute():
                 root = watch_root / root
             destination_root = self._resolve_destination(root)
@@ -1303,6 +1303,8 @@ class ItemProcessor:
                 destination = params.get("destination")
                 if not isinstance(destination, str) or not destination:
                     raise ValueError("action destination is required")
+                if re.search(r"\\(?:[1-9][0-9]*|g<[^>]+>)", destination):
+                    raise ValueError("action destination contains a capture reference")
             else:
                 raise ValueError(f"unsupported action: {kind}")
 
@@ -1312,10 +1314,12 @@ class ItemProcessor:
         for condition_name, (field, pattern_str) in conditions.items():
             condition_patterns[condition_name] = re.compile(pattern_str)
         for action in actions:
-            if set(action) == {"rename"} and isinstance(action["rename"], dict):
-                name = action["rename"].get("name")
+            kind = next(iter(action), "")
+            if kind in {"rename", "move", "copy"} and isinstance(action[kind], dict):
+                field = "name" if kind == "rename" else "destination"
+                name = action[kind].get(field)
                 if not isinstance(name, str) or not name:
-                    raise ValueError("rename name is required")
+                    raise ValueError(f"{kind} {field} is required")
                 for reference in re.findall(r"\\(?:[1-9][0-9]*|g<[^>]+>)", name):
                     condition_name, capture = ItemProcessor._split_capture_reference(reference)
                     compiled = condition_patterns.get(condition_name)
@@ -1394,10 +1398,12 @@ class ItemProcessor:
     @staticmethod
     def _validate_action_references(actions: list[dict[str, Any]], matches: dict[str, re.Match[str]]) -> None:
         for action in actions:
-            if set(action) == {"rename"} and isinstance(action["rename"], dict):
-                name = action["rename"].get("name")
+            kind = next(iter(action), "")
+            if kind in {"rename", "move", "copy"} and isinstance(action[kind], dict):
+                field = "name" if kind == "rename" else "destination"
+                name = action[kind].get(field)
                 if not isinstance(name, str) or not name:
-                    raise ValueError("rename name is required")
+                    raise ValueError(f"{kind} {field} is required")
                 try:
                     for reference in re.findall(r"\\(?:[1-9][0-9]*|g<[^>]+>)", name):
                         condition_name, capture = ItemProcessor._split_capture_reference(reference)

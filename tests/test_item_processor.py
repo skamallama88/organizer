@@ -752,6 +752,67 @@ def test_policy_requires_watch_and_destination_roots_inside_data_volumes(tmp_pat
         )
 
 
+def test_move_destination_expands_match_capture(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "report [finance].zip"
+    item.write_text("report")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: move
+    match:
+      field: file_name
+      pattern: '.*\\[([^]]+)\\].*'
+    actions:
+      - move:
+          destination: ../\\1
+"""
+    )
+
+    plan = ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+    assert plan.actions[0].target == tmp_path / "finance" / item.name
+
+
+def test_copy_destination_capture_reference_is_validated(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: copy
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - copy:
+          destination: ../\\g<missing>
+"""
+    )
+
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+
+    assert any("capture reference" in diagnostic for diagnostic in diagnostics)
+
+
+def test_move_destination_capture_reference_is_validated(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: move
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move:
+          destination: ../\\g<missing>
+"""
+    )
+
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+
+    assert any("capture reference" in diagnostic for diagnostic in diagnostics)
+
+
 def test_policy_rejects_overlapping_watch_roots_and_config_watch(tmp_path: Path) -> None:
     data = tmp_path / "data"
     config = tmp_path / "config"

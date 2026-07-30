@@ -1,22 +1,52 @@
 #!/bin/sh
 set -eu
 
-if [ ! -f /config/organizer.yaml ]; then
-  mkdir -p /config
-  cat > /config/organizer.yaml <<'EOF'
+CONFIG_DIR=${CONFIG_DIR:-/config}
+MOUNTS_FILE=${MOUNTS_FILE:-/proc/mounts}
+
+if [ ! -f "$CONFIG_DIR/organizer.yaml" ]; then
+  mkdir -p "$CONFIG_DIR"
+  mount_paths=$(awk '
+    function unescape(value) {
+      gsub(/\\040/, " ", value)
+      gsub(/\\011/, "\t", value)
+      gsub(/\\134/, "\\", value)
+      return value
+    }
+    {
+      path = unescape($2)
+      type = $3
+      if (type == "rootfs" || type == "overlay" || type == "proc" ||
+          type == "sysfs" || type == "devtmpfs" || type == "tmpfs" ||
+          path == "/" || path == "/data" || path == "/config" || path == "/etc/hosts" ||
+          path == "/etc/resolv.conf" || path == "/etc/hostname" ||
+          path ~ /^\/proc(\/|$)/ || path ~ /^\/sys(\/|$)/ ||
+          path ~ /^\/dev(\/|$)/) next
+      if (!seen[path]++) print path
+    }
+  ' "$MOUNTS_FILE")
+
+  {
+    cat <<'EOF'
 # Organizer runtime configuration
 data_roots:
   - /data
+EOF
+    printf '%s\n' "$mount_paths" | while IFS= read -r path; do
+      [ -n "$path" ] && printf '  - %s\n' "$path"
+    done
+    cat <<'EOF'
 quarantine_root: /data/.quarantine
 watches:
   - id: data
     root: /data
     rules: /config/rules.yaml
 EOF
+  } > "$CONFIG_DIR/organizer.yaml"
 fi
 
-if [ ! -f /config/rules.yaml ]; then
-  cat > /config/rules.yaml <<'EOF'
+if [ ! -f "$CONFIG_DIR/rules.yaml" ]; then
+  cat > "$CONFIG_DIR/rules.yaml" <<'EOF'
 rules: []
 EOF
 fi

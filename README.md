@@ -27,8 +27,11 @@ the published port on host loopback while the container listens on `0.0.0.0`, wh
 is required for Docker port forwarding.
 
 On first start, the image creates `/config/organizer.yaml` and `/config/rules.yaml`
-in an empty config volume. Edit those files to configure watch folders and rules;
-existing files are never overwritten on restart.
+in an empty config volume. The generated `data_roots` includes `/data` and any
+additional bind mounts visible in the container, excluding Docker and system
+mounts. Edit those files to configure watch folders and rules; existing files are
+never overwritten on restart. Discovered roots are eligible data roots only and
+are not automatically watched.
 
 Inspect or edit the generated files with a temporary container:
 

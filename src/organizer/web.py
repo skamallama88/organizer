@@ -170,6 +170,24 @@ def create_app(
             return list(bp.data_roots), config_root
         return [], Path("/config")
 
+    def _watch_form_context(
+        data_roots: list[Path],
+        *,
+        errors: str | None = None,
+        watch_id: object = "",
+        root: object = "",
+        folder: object = "/",
+        rules_path: object = "",
+    ) -> dict[str, object]:
+        return {
+            "data_roots": data_roots,
+            "errors": errors,
+            "watch_id": watch_id if isinstance(watch_id, str) else "",
+            "selected_root": root if isinstance(root, str) else "",
+            "folder": folder if isinstance(folder, str) else "/",
+            "rules_path": rules_path if isinstance(rules_path, str) else "",
+        }
+
     def _build_watches() -> list[dict[str, object]]:
         health_by_watch = _health_by_watch()
         watches = []
@@ -207,7 +225,7 @@ def create_app(
     @app.get("/watches/new", response_class=HTMLResponse)
     def new_watch_form(request: Request) -> HTMLResponse:
         data_roots, _ = _data_roots_and_config_root()
-        return _fragment(request, "watch_form.html", data_roots=data_roots)
+        return _fragment(request, "watch_form.html", **_watch_form_context(data_roots))
 
     @app.get("/watches/{watch_id}/rules", response_class=HTMLResponse)
     def rule_editor(request: Request, watch_id: str) -> HTMLResponse:
@@ -792,6 +810,7 @@ def create_app(
         watch_id = payload.get("id")
         root = payload.get("root")
         rules_path = payload.get("rules_path")
+        folder = payload.get("folder", "/")
 
         is_htmx = request.headers.get("HX-Request") == "true"
 
@@ -801,7 +820,7 @@ def create_app(
                 return _TEMPLATES.TemplateResponse(
                     request,
                     "watch_form.html",
-                    {"data_roots": data_roots, "errors": "id is required"},
+                    _watch_form_context(data_roots, errors="id is required", root=root, folder=folder, rules_path=rules_path),
                     status_code=422,
                 )
             return JSONResponse(status_code=422, content={"detail": "id is required"})
@@ -811,17 +830,20 @@ def create_app(
                 return _TEMPLATES.TemplateResponse(
                     request,
                     "watch_form.html",
-                    {"data_roots": data_roots, "errors": "root is required"},
+                    _watch_form_context(data_roots, errors="root is required", watch_id=watch_id, folder=folder, rules_path=rules_path),
                     status_code=422,
                 )
             return JSONResponse(status_code=422, content={"detail": "root is required"})
+        if not isinstance(folder, str) or not folder:
+            folder = "/"
+        root_path = Path(root) / folder.lstrip("/")
         if not isinstance(rules_path, str) or not rules_path:
             if is_htmx:
                 data_roots, _ = _data_roots_and_config_root()
                 return _TEMPLATES.TemplateResponse(
                     request,
                     "watch_form.html",
-                    {"data_roots": data_roots, "errors": "rules_path is required"},
+                    _watch_form_context(data_roots, errors="rules_path is required", watch_id=watch_id, root=root, folder=folder),
                     status_code=422,
                 )
             return JSONResponse(
@@ -835,7 +857,7 @@ def create_app(
         try:
             validate_watch_id(watch_id, existing_ids)
             validate_watch_root(
-                Path(root),
+                root_path,
                 config_root,
                 tuple(data_roots),
                 tuple(existing_roots),
@@ -846,7 +868,7 @@ def create_app(
                 return _TEMPLATES.TemplateResponse(
                     request,
                     "watch_form.html",
-                    {"data_roots": data_roots, "errors": str(e)},
+                    _watch_form_context(data_roots, errors=str(e), watch_id=watch_id, root=root, folder=folder, rules_path=rules_path),
                     status_code=422,
                 )
             return JSONResponse(status_code=422, content={"detail": str(e)})
@@ -865,13 +887,13 @@ def create_app(
             for w in raw_watches:
                 if isinstance(w, dict):
                     disk_watches_list.append({k: v for k, v in w.items()})
-        disk_watches_list.append({"id": watch_id, "root": root, "rules": rules_path})
+        disk_watches_list.append({"id": watch_id, "root": str(root_path), "rules": rules_path})
         disk_doc["watches"] = disk_watches_list
         _save_watches_to_disk(disk_doc)
 
         new_config = WatchFolderConfig(
             watch_id=watch_id,
-            watch_root=Path(root),
+            watch_root=root_path,
             rules_path=Path(rules_path),
             boundary_policy=_runtime_watches[0].boundary_policy
             if _runtime_watches
@@ -883,12 +905,13 @@ def create_app(
             watch_mutator.add_watch(new_config)
 
         if is_htmx:
-            watch_list_html = _TEMPLATES.get_template("watch_list.html").render(
-                watches=_build_watches()
+            data_roots, _ = _data_roots_and_config_root()
+            return _TEMPLATES.TemplateResponse(
+                request,
+                "dashboard.html",
+                {"watches": _build_watches(), "data_roots": data_roots},
             )
-            add_button = '<button hx-get="/watches/new" hx-target="#add-watch-form" hx-swap="innerHTML">Add Watch</button>'
-            return HTMLResponse(add_button + watch_list_html)
-        return {"id": watch_id, "root": root, "rules_path": rules_path}
+        return {"id": watch_id, "root": str(root_path), "rules_path": rules_path}
 
     @app.delete("/watches/{watch_id}", response_model=None)
     def remove_watch(

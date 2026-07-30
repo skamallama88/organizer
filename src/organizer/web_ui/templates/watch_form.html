@@ -1,27 +1,32 @@
-<form hx-post="/watches" hx-target="#add-watch-form" hx-swap="innerHTML"
+<form hx-post="/watches" hx-target="#dashboard" hx-swap="innerHTML"
       x-data="{ id: '', rulesPath: '/config/rules_.yaml' }">
   <p>
     <label for="id">Watch ID</label>
     <input id="id" name="id" type="text"
-           x-model="id"
+           x-model="id" value="{{ watch_id }}"
            x-on:input="rulesPath = '/config/rules_' + id + '.yaml'"
            placeholder="my_watch" required>
   </p>
   <p>
+    <label for="folder">Folder</label>
+    <input id="folder" name="folder" type="text" value="{{ folder }}" placeholder="subfolder">
+    <small>Optional path relative to the root.</small>
+  </p>
+  <p>
     <label for="root">Root path</label>
     <select id="root" name="root">
-      {% for root in data_roots %}
-      <option value="{{ root }}">{{ root }}</option>
+      {% for root_option in data_roots %}
+      <option value="{{ root_option }}"{% if selected_root == root_option|string %} selected{% endif %}>{{ root_option }}</option>
       {% endfor %}
     </select>
   </p>
   <p>
     <label for="rules_path">Rules path</label>
-    <input id="rules_path" name="rules_path" type="text" x-model="rulesPath" required>
+    <input id="rules_path" name="rules_path" type="text" x-model="rulesPath" value="{{ rules_path }}" required>
   </p>
   <p>
     <button type="submit">Add Watch</button>
-    <button type="button" hx-get="/" hx-target="#add-watch-form" hx-swap="innerHTML">Cancel</button>
+    <button type="button" hx-get="/" hx-target="#dashboard" hx-swap="innerHTML">Cancel</button>
   </p>
   {% if errors %}
   <div class="feedback error">{{ errors }}</div>

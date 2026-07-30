@@ -69,6 +69,7 @@ def test_watch_form_partial_renders(tmp_path: Path) -> None:
     assert "Root path" in response.text
     assert "Rules path" in response.text
     assert 'hx-post="/watches"' in response.text
+    assert 'name="folder"' in response.text
 
 
 def test_watch_form_root_dropdown_populated(tmp_path: Path) -> None:
@@ -84,6 +85,7 @@ def test_watch_form_has_cancel_button(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert "Cancel" in response.text
     assert 'hx-get="/"' in response.text
+    assert 'hx-target="#dashboard"' in response.text
 
 
 def test_add_watch_htmx_success_returns_watch_list(tmp_path: Path) -> None:
@@ -103,6 +105,7 @@ def test_add_watch_htmx_success_returns_watch_list(tmp_path: Path) -> None:
     assert "downloads" in response.text
     assert "incoming" in response.text
     assert "watch-list" in response.text or "<table" in response.text
+    assert "Watch folders" in response.text
 
 
 def test_add_watch_htmx_duplicate_id_shows_form_with_errors(tmp_path: Path) -> None:

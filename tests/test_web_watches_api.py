@@ -80,6 +80,26 @@ def test_post_watch_adds_and_returns_config(tmp_path: Path) -> None:
     assert data["rules_path"] == str(new_rules)
 
 
+def test_post_watch_can_select_folder_under_root(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+    root = tmp_path / "incoming"
+    folder = root / "ready"
+    folder.mkdir(parents=True)
+
+    response = client.post(
+        "/watches",
+        json={
+            "id": "ready",
+            "root": str(root),
+            "folder": "ready",
+            "rules_path": str(tmp_path / "ready_rules.yaml"),
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["root"] == str(folder)
+
+
 def test_post_watch_rejects_duplicate_id(tmp_path: Path) -> None:
     client, _ = _make_client(tmp_path)
 

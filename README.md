@@ -61,6 +61,25 @@ After editing configuration, restart the service:
 docker compose restart organizer
 ```
 
+### Runtime watch management
+
+Watch folders can also be added and removed while Organizer is running. Use the
+**Add Watch** control on the dashboard, or call the unauthenticated API endpoints:
+
+```sh
+curl -X POST http://127.0.0.1:8000/watches \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"downloads","root":"/data/Downloads","rules_path":"/config/rules-downloads.yaml"}'
+
+curl -X DELETE http://127.0.0.1:8000/watches/downloads
+```
+
+The API validates watch IDs and roots against the configured data roots, rejects
+duplicate or overlapping watches, persists successful changes to
+`/config/organizer.yaml`, and updates both filesystem watching and periodic
+scanning without restarting the service. Removing a watch changes its runtime
+configuration only; it does not delete the watched files or its rules file.
+
 The default rules file contains no rules, so Organizer starts safely without
 modifying files. Add rules through the web UI or edit the configured YAML file.
 

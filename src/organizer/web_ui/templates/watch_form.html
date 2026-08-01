@@ -29,6 +29,6 @@
     <button type="button" hx-get="/" hx-target="#dashboard" hx-swap="innerHTML">Cancel</button>
   </p>
   {% if errors %}
-  <div class="feedback error">{{ errors }}</div>
+  <div class="feedback error" role="alert">Could not add watch: {{ errors }}</div>
   {% endif %}
 </form>

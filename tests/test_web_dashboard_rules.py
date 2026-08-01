@@ -79,6 +79,17 @@ def test_watch_form_root_dropdown_populated(tmp_path: Path) -> None:
     assert str(tmp_path) in response.text
 
 
+def test_watch_form_root_dropdown_uses_config_when_no_watches(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(f"data_roots:\n  - {tmp_path}\nconfig_root: {tmp_path / 'config'}\nwatches: []\n")
+    client = TestClient(create_app(ItemProcessor(tmp_path / "attempts.db"), config_path=config_path))
+
+    response = client.get("/watches/new")
+
+    assert response.status_code == 200
+    assert str(tmp_path) in response.text
+
+
 def test_watch_form_has_cancel_button(tmp_path: Path) -> None:
     client, _, _ = make_client(tmp_path)
     response = client.get("/watches/new")
@@ -120,6 +131,8 @@ def test_add_watch_htmx_duplicate_id_shows_form_with_errors(tmp_path: Path) -> N
 
     assert response.status_code == 422
     assert "duplicate" in response.text or "already" in response.text.lower()
+    assert 'name="id"' in response.text
+    assert "Could not add watch" in response.text
 
 
 def test_add_watch_htmx_rejects_root_outside_data_roots(tmp_path: Path) -> None:

@@ -168,7 +168,23 @@ def create_app(
                 bp.config_root if bp.config_root is not None else Path("/config")
             )
             return list(bp.data_roots), config_root
+        if config_path is not None:
+            try:
+                document = yaml.safe_load(config_path.read_text()) or {}
+                if isinstance(document, dict):
+                    raw_roots = document.get("data_roots", [])
+                    raw_config_root = document.get("config_root", config_path.parent)
+                    if isinstance(raw_roots, list):
+                        roots = [Path(value) for value in raw_roots if isinstance(value, str)]
+                        config_root = Path(raw_config_root) if isinstance(raw_config_root, str) else config_path.parent
+                        return roots, config_root
+            except (OSError, yaml.YAMLError):
+                pass
         return [], Path("/config")
+
+    def _default_rules_path() -> Path:
+        _, config_root = _data_roots_and_config_root()
+        return config_root / "rules_.yaml"
 
     def _watch_form_context(
         data_roots: list[Path],
@@ -187,6 +203,19 @@ def create_app(
             "folder": folder if isinstance(folder, str) else "/",
             "rules_path": rules_path if isinstance(rules_path, str) else "",
         }
+
+    def _watch_form_response(
+        request: Request,
+        data_roots: list[Path],
+        error: str,
+        **values: object,
+    ) -> HTMLResponse:
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "watch_form.html",
+            _watch_form_context(data_roots, errors=error, **values),
+            status_code=422,
+        )
 
     def _build_watches() -> list[dict[str, object]]:
         health_by_watch = _health_by_watch()
@@ -225,7 +254,11 @@ def create_app(
     @app.get("/watches/new", response_class=HTMLResponse)
     def new_watch_form(request: Request) -> HTMLResponse:
         data_roots, _ = _data_roots_and_config_root()
-        return _fragment(request, "watch_form.html", **_watch_form_context(data_roots))
+        return _fragment(
+            request,
+            "watch_form.html",
+            **_watch_form_context(data_roots, rules_path=str(_default_rules_path())),
+        )
 
     @app.get("/watches/{watch_id}/rules", response_class=HTMLResponse)
     def rule_editor(request: Request, watch_id: str) -> HTMLResponse:
@@ -817,42 +850,30 @@ def create_app(
         if not isinstance(watch_id, str) or not watch_id:
             if is_htmx:
                 data_roots, _ = _data_roots_and_config_root()
-                return _TEMPLATES.TemplateResponse(
-                    request,
-                    "watch_form.html",
-                    _watch_form_context(data_roots, errors="id is required", root=root, folder=folder, rules_path=rules_path),
-                    status_code=422,
-                )
+                return _watch_form_response(request, data_roots, "id is required", root=root, folder=folder, rules_path=rules_path)
             return JSONResponse(status_code=422, content={"detail": "id is required"})
         if not isinstance(root, str) or not root:
             if is_htmx:
                 data_roots, _ = _data_roots_and_config_root()
-                return _TEMPLATES.TemplateResponse(
-                    request,
-                    "watch_form.html",
-                    _watch_form_context(data_roots, errors="root is required", watch_id=watch_id, folder=folder, rules_path=rules_path),
-                    status_code=422,
-                )
+                return _watch_form_response(request, data_roots, "root is required", watch_id=watch_id, folder=folder, rules_path=rules_path)
             return JSONResponse(status_code=422, content={"detail": "root is required"})
+        data_roots, config_root = _data_roots_and_config_root()
         if not isinstance(folder, str) or not folder:
             folder = "/"
         root_path = Path(root) / folder.lstrip("/")
         if not isinstance(rules_path, str) or not rules_path:
             if is_htmx:
                 data_roots, _ = _data_roots_and_config_root()
-                return _TEMPLATES.TemplateResponse(
-                    request,
-                    "watch_form.html",
-                    _watch_form_context(data_roots, errors="rules_path is required", watch_id=watch_id, root=root, folder=folder),
-                    status_code=422,
-                )
+                return _watch_form_response(request, data_roots, "rules_path is required", watch_id=watch_id, root=root, folder=folder)
             return JSONResponse(
                 status_code=422, content={"detail": "rules_path is required"}
             )
+        rules_path_value = Path(rules_path)
+        if not rules_path_value.is_absolute():
+            rules_path_value = config_root / rules_path_value
 
         existing_ids = [w.watch_id for w in _runtime_watches]
         existing_roots = [w.watch_root for w in _runtime_watches]
-        data_roots, config_root = _data_roots_and_config_root()
 
         try:
             validate_watch_id(watch_id, existing_ids)
@@ -865,12 +886,7 @@ def create_app(
             )
         except ConfigError as e:
             if is_htmx:
-                return _TEMPLATES.TemplateResponse(
-                    request,
-                    "watch_form.html",
-                    _watch_form_context(data_roots, errors=str(e), watch_id=watch_id, root=root, folder=folder, rules_path=rules_path),
-                    status_code=422,
-                )
+                return _watch_form_response(request, data_roots, str(e), watch_id=watch_id, root=root, folder=folder, rules_path=rules_path)
             return JSONResponse(status_code=422, content={"detail": str(e)})
 
         disk_doc: dict[str, object] = {}
@@ -887,14 +903,14 @@ def create_app(
             for w in raw_watches:
                 if isinstance(w, dict):
                     disk_watches_list.append({k: v for k, v in w.items()})
-        disk_watches_list.append({"id": watch_id, "root": str(root_path), "rules": rules_path})
+        disk_watches_list.append({"id": watch_id, "root": str(root_path), "rules": str(rules_path_value)})
         disk_doc["watches"] = disk_watches_list
         _save_watches_to_disk(disk_doc)
 
         new_config = WatchFolderConfig(
             watch_id=watch_id,
             watch_root=root_path,
-            rules_path=Path(rules_path),
+            rules_path=rules_path_value,
             boundary_policy=_runtime_watches[0].boundary_policy
             if _runtime_watches
             else BoundaryPolicy(data_roots=tuple(data_roots), config_root=config_root),
@@ -911,7 +927,7 @@ def create_app(
                 "dashboard.html",
                 {"watches": _build_watches(), "data_roots": data_roots},
             )
-        return {"id": watch_id, "root": str(root_path), "rules_path": rules_path}
+        return {"id": watch_id, "root": str(root_path), "rules_path": str(rules_path_value)}
 
     @app.delete("/watches/{watch_id}", response_model=None)
     def remove_watch(

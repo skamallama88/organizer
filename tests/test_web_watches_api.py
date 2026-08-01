@@ -100,6 +100,26 @@ def test_post_watch_can_select_folder_under_root(tmp_path: Path) -> None:
     assert response.json()["root"] == str(folder)
 
 
+def test_post_watch_form_payload_accepts_default_rules_path(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+    root = tmp_path / "incoming"
+    root.mkdir()
+
+    response = client.post(
+        "/watches",
+        data={
+            "id": "incoming",
+            "root": str(tmp_path),
+            "folder": "incoming",
+            "rules_path": "/config/rules_incoming.yaml",
+        },
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 200
+    assert "incoming" in response.text
+
+
 def test_post_watch_rejects_duplicate_id(tmp_path: Path) -> None:
     client, _ = _make_client(tmp_path)
 

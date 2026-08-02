@@ -77,8 +77,10 @@ curl -X DELETE http://127.0.0.1:8000/watches/downloads
 The API validates watch IDs and roots against the configured data roots, rejects
 duplicate or overlapping watches, persists successful changes to
 `/config/organizer.yaml`, and updates both filesystem watching and periodic
-scanning without restarting the service. Removing a watch changes its runtime
-configuration only; it does not delete the watched files or its rules file.
+scanning without restarting the service. When `rules_path` is omitted, it
+defaults to `/config/rules_<watch_id>.yaml`. Removing a watch changes its
+runtime configuration only; it does not delete the watched files or its rules
+file.
 
 The default rules file contains no rules, so Organizer starts safely without
 modifying files. Add rules through the web UI or edit the configured YAML file.

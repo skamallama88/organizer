@@ -182,13 +182,17 @@ def test_post_watch_rejects_missing_root(tmp_path: Path) -> None:
     assert "root is required" in response.json()["detail"]
 
 
-def test_post_watch_rejects_missing_rules_path(tmp_path: Path) -> None:
+def test_post_watch_defaults_missing_rules_path(tmp_path: Path) -> None:
     client, _ = _make_client(tmp_path)
+    new_root = tmp_path / "incoming"
+    new_root.mkdir()
 
-    response = client.post("/watches", json={"id": "test", "root": str(tmp_path)})
+    response = client.post("/watches", json={"id": "test", "root": str(new_root)})
 
-    assert response.status_code == 422
-    assert "rules_path is required" in response.json()["detail"]
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == "test"
+    assert data["rules_path"] == str(tmp_path / "config" / "rules_test.yaml")
 
 
 def test_post_watch_rejects_invalid_json(tmp_path: Path) -> None:
@@ -228,6 +232,26 @@ def test_post_watch_calls_mutator(tmp_path: Path) -> None:
     assert len(mutator.added) == 1
     assert mutator.added[0].watch_id == "incoming"
     assert mutator.added[0].watch_root == new_root
+
+
+def test_post_watch_rebuilds_web_boundary_policy(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+    new_root = tmp_path / "incoming"
+    new_root.mkdir()
+    new_rules = tmp_path / "incoming_rules.yaml"
+    new_rules.write_text("rules: []\n")
+
+    response = client.post(
+        "/watches",
+        json={"id": "incoming", "root": str(new_root), "rules_path": str(new_rules)},
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 200
+    assert "incoming" in response.text
+    assert response.text.lstrip().startswith("<h1>")
+    assert "<!doctype" not in response.text.lower()
+    assert "<html" not in response.text.lower()
 
 
 def test_delete_watch_removes_and_returns_config(tmp_path: Path) -> None:

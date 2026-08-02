@@ -7,6 +7,7 @@ import threading
 import uuid
 import yaml
 
+from collections.abc import Callable
 from fastapi import Body, FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,6 +28,7 @@ from organizer.attempt_review import (
 from organizer.config import (
     ConfigError,
     WatchFolderConfig,
+    rebuild_boundary_policy,
     validate_watch_id,
     validate_watch_root,
 )
@@ -133,33 +135,39 @@ def create_app(
 
             return {key: values[-1] for key, values in parse_qs(body.decode()).items()}
 
-    def _read_disk_watches() -> list[dict[str, object]]:
+    def _update_watches_on_disk(
+        transform: Callable[[list[dict[str, object]]], list[dict[str, object]]]
+    ) -> list[dict[str, object]]:
+        """Read-modify-write watches in organizer.yaml atomically under one lock."""
         if config_path is None:
             return []
-        try:
-            doc = yaml.safe_load(config_path.read_text()) or {}
-            if isinstance(doc, dict):
-                raw = doc.get("watches", [])
-                if isinstance(raw, list):
-                    return list(raw)
-        except OSError:
-            pass
-        return []
-
-    def _save_watches_to_disk(document: dict[str, object]) -> None:
-        if config_path is None:
-            return
-        temp_path = config_path.with_suffix(
-            f"{config_path.suffix}.tmp-{uuid.uuid4().hex}"
-        )
-        try:
-            with _WATCH_SAVE_LOCK:
+        with _WATCH_SAVE_LOCK:
+            document: dict[str, object] = {}
+            try:
+                loaded = yaml.safe_load(config_path.read_text())
+                if isinstance(loaded, dict):
+                    document = loaded
+            except (OSError, yaml.YAMLError):
+                pass
+            raw_watches = document.get("watches", [])
+            watches: list[dict[str, object]] = []
+            if isinstance(raw_watches, list):
+                for watch in raw_watches:
+                    if isinstance(watch, dict):
+                        watches.append({k: v for k, v in watch.items()})
+            updated = transform(watches)
+            document["watches"] = updated
+            temp_path = config_path.with_suffix(
+                f"{config_path.suffix}.tmp-{uuid.uuid4().hex}"
+            )
+            try:
                 temp_path.write_text(yaml.dump(document, default_flow_style=False))
                 config_path.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(temp_path, config_path)
-        finally:
-            if temp_path.exists():
-                temp_path.unlink()
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
+        return updated
 
     def _data_roots_and_config_root() -> tuple[list[Path], Path]:
         if _runtime_watches:
@@ -862,15 +870,11 @@ def create_app(
             folder = "/"
         root_path = Path(root) / folder.lstrip("/")
         if not isinstance(rules_path, str) or not rules_path:
-            if is_htmx:
-                data_roots, _ = _data_roots_and_config_root()
-                return _watch_form_response(request, data_roots, "rules_path is required", watch_id=watch_id, root=root, folder=folder)
-            return JSONResponse(
-                status_code=422, content={"detail": "rules_path is required"}
-            )
-        rules_path_value = Path(rules_path)
-        if not rules_path_value.is_absolute():
-            rules_path_value = config_root / rules_path_value
+            rules_path_value = config_root / f"rules_{watch_id}.yaml"
+        else:
+            rules_path_value = Path(rules_path)
+            if not rules_path_value.is_absolute():
+                rules_path_value = config_root / rules_path_value
 
         existing_ids = [w.watch_id for w in _runtime_watches]
         existing_roots = [w.watch_root for w in _runtime_watches]
@@ -889,23 +893,12 @@ def create_app(
                 return _watch_form_response(request, data_roots, str(e), watch_id=watch_id, root=root, folder=folder, rules_path=rules_path)
             return JSONResponse(status_code=422, content={"detail": str(e)})
 
-        disk_doc: dict[str, object] = {}
-        if config_path is not None:
-            try:
-                loaded = yaml.safe_load(config_path.read_text())
-                if isinstance(loaded, dict):
-                    disk_doc = loaded
-            except OSError:
-                pass
-        disk_watches_list: list[dict[str, object]] = []
-        raw_watches = disk_doc.get("watches", [])
-        if isinstance(raw_watches, list):
-            for w in raw_watches:
-                if isinstance(w, dict):
-                    disk_watches_list.append({k: v for k, v in w.items()})
-        disk_watches_list.append({"id": watch_id, "root": str(root_path), "rules": str(rules_path_value)})
-        disk_doc["watches"] = disk_watches_list
-        _save_watches_to_disk(disk_doc)
+        _update_watches_on_disk(
+            lambda watches: [
+                *watches,
+                {"id": watch_id, "root": str(root_path), "rules": str(rules_path_value)},
+            ]
+        )
 
         new_config = WatchFolderConfig(
             watch_id=watch_id,
@@ -913,24 +906,29 @@ def create_app(
             rules_path=rules_path_value,
             boundary_policy=_runtime_watches[0].boundary_policy
             if _runtime_watches
-            else BoundaryPolicy(data_roots=tuple(data_roots), config_root=config_root),
+            else BoundaryPolicy(
+                data_roots=tuple(data_roots),
+                config_root=config_root,
+                allowed_destinations=tuple(data_roots),
+            ),
         )
         _runtime_watches.append(new_config)
+        rebuild_boundary_policy(_runtime_watches)
 
         if watch_mutator is not None:
-            watch_mutator.add_watch(new_config)
+            watch_mutator.add_watch(_runtime_watches[-1])
 
         if is_htmx:
             data_roots, _ = _data_roots_and_config_root()
             return _TEMPLATES.TemplateResponse(
                 request,
-                "dashboard.html",
+                "dashboard_content.html",
                 {"watches": _build_watches(), "data_roots": data_roots},
             )
         return {"id": watch_id, "root": str(root_path), "rules_path": str(rules_path_value)}
 
     @app.delete("/watches/{watch_id}", response_model=None)
-    def remove_watch(
+    async def remove_watch(
         request: Request, watch_id: str
     ) -> dict[str, object] | JSONResponse | HTMLResponse:
         watch = next((w for w in _runtime_watches if w.watch_id == watch_id), None)
@@ -945,24 +943,12 @@ def create_app(
                 content={"detail": f"watch folder not found: {watch_id}"},
             )
 
-        del_doc: dict[str, object] = {}
-        if config_path is not None:
-            try:
-                loaded = yaml.safe_load(config_path.read_text())
-                if isinstance(loaded, dict):
-                    del_doc = loaded
-            except OSError:
-                pass
-        raw_del = del_doc.get("watches", [])
-        filtered: list[dict[str, object]] = []
-        if isinstance(raw_del, list):
-            for w in raw_del:
-                if isinstance(w, dict) and w.get("id") != watch_id:
-                    filtered.append({k: v for k, v in w.items()})
-        del_doc["watches"] = filtered
-        _save_watches_to_disk(del_doc)
+        _update_watches_on_disk(
+            lambda watches: [w for w in watches if w.get("id") != watch_id]
+        )
 
         _runtime_watches[:] = [w for w in _runtime_watches if w.watch_id != watch_id]
+        rebuild_boundary_policy(_runtime_watches)
 
         if watch_mutator is not None:
             watch_mutator.remove_watch(watch_id)

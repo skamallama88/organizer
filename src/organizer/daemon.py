@@ -4,14 +4,13 @@ import asyncio
 import threading
 import time
 from dataclasses import dataclass
-from dataclasses import replace
 from pathlib import Path
 from typing import Protocol, Sequence
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from organizer.config import OrganizerConfig, WatchFolderConfig
+from organizer.config import OrganizerConfig, WatchFolderConfig, rebuild_boundary_policy
 from organizer.item_processor import (
     DiscoveryBatch,
     ItemProcessor,
@@ -68,9 +67,12 @@ class WatcherService:
         self._lock = threading.Lock()
 
     def handle_event(self, watch_id: str, path: Path, event_type: str) -> None:
-        if event_type not in {"created", "closed"} or watch_id not in self._watches:
+        if event_type not in {"created", "closed"}:
             return
-        watch = self._watches[watch_id]
+        with self._lock:
+            watch = self._watches.get(watch_id)
+        if watch is None:
+            return
         if not path.is_relative_to(watch.watch_root) or path.name.startswith(".organizer-"):
             return
         with self._lock:
@@ -96,7 +98,9 @@ class WatcherService:
         observer = Observer()
         handler = _WatchdogHandler(self)
         self._handler = handler
-        for watch in self._watches.values():
+        with self._lock:
+            watches = tuple(self._watches.values())
+        for watch in watches:
             if watch.watch_root.is_dir():
                 self._handles[watch.watch_id] = observer.schedule(handler, str(watch.watch_root), recursive=True)
         observer.start()
@@ -256,14 +260,7 @@ class OrganizerDaemon:
         self._rebuild_boundary_policy()
 
     def _rebuild_boundary_policy(self) -> None:
-        if not self.watches:
-            return
-        policy = replace(
-            self.watches[0].boundary_policy,
-            watch_roots=tuple(watch.watch_root for watch in self.watches),
-            watch_ids=tuple(watch.watch_id for watch in self.watches),
-        )
-        self.watches[:] = [watch.model_copy(update={"boundary_policy": policy}) for watch in self.watches]
+        rebuild_boundary_policy(self.watches)
         for watch in self.watches:
             self.watcher.update_watch(watch)
         for watch in self.watches:

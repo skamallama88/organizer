@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,20 @@ class OrganizerConfig(BaseModel):
 def validate_watch_id(watch_id: str, existing_ids: list[str]) -> None:
     if watch_id in existing_ids:
         raise ConfigError(f"duplicate watch id: {watch_id}")
+
+
+def rebuild_boundary_policy(watches: list[WatchFolderConfig]) -> None:
+    """Rebuild the shared BoundaryPolicy across the given watches in place."""
+    if not watches:
+        return
+    policy = replace(
+        watches[0].boundary_policy,
+        watch_roots=tuple(watch.watch_root for watch in watches),
+        watch_ids=tuple(watch.watch_id for watch in watches),
+    )
+    watches[:] = [
+        watch.model_copy(update={"boundary_policy": policy}) for watch in watches
+    ]
 
 
 def validate_watch_root(

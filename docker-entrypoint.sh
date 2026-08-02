@@ -6,7 +6,7 @@ MOUNTS_FILE=${MOUNTS_FILE:-/proc/mounts}
 
 if [ ! -f "$CONFIG_DIR/organizer.yaml" ]; then
   mkdir -p "$CONFIG_DIR"
-  mount_paths=$(awk '
+  mount_paths=$(awk -v config_dir="$CONFIG_DIR" '
     function unescape(value) {
       gsub(/\\040/, " ", value)
       gsub(/\\011/, "\t", value)
@@ -18,7 +18,8 @@ if [ ! -f "$CONFIG_DIR/organizer.yaml" ]; then
       type = $3
       if (type == "rootfs" || type == "overlay" || type == "proc" ||
           type == "sysfs" || type == "devtmpfs" || type == "tmpfs" ||
-          path == "/" || path == "/data" || path == "/config" || path == "/etc/hosts" ||
+          path == "/" || path == "/data" || path == config_dir || path == "/config" ||
+          path == "/etc/hosts" ||
           path == "/etc/resolv.conf" || path == "/etc/hostname" ||
           path ~ /^\/proc(\/|$)/ || path ~ /^\/sys(\/|$)/ ||
           path ~ /^\/dev(\/|$)/) next

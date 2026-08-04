@@ -893,6 +893,25 @@ def create_app(
                 return _watch_form_response(request, data_roots, str(e), watch_id=watch_id, root=root, folder=folder, rules_path=rules_path)
             return JSONResponse(status_code=422, content={"detail": str(e)})
 
+        try:
+            rules_path_value.parent.mkdir(parents=True, exist_ok=True)
+            if not rules_path_value.exists():
+                rules_path_value.write_text("rules: []\n")
+        except OSError as e:
+            if is_htmx:
+                return _watch_form_response(
+                    request,
+                    data_roots,
+                    f"cannot create rules file: {e}",
+                    watch_id=watch_id,
+                    root=root,
+                    folder=folder,
+                    rules_path=rules_path,
+                )
+            return JSONResponse(
+                status_code=500, content={"detail": f"cannot create rules file: {e}"}
+            )
+
         _update_watches_on_disk(
             lambda watches: [
                 *watches,

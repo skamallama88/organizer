@@ -80,6 +80,41 @@ def test_post_watch_adds_and_returns_config(tmp_path: Path) -> None:
     assert data["rules_path"] == str(new_rules)
 
 
+def test_post_watch_creates_rules_file_when_missing(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+    new_root = tmp_path / "incoming"
+    new_root.mkdir()
+    new_rules = tmp_path / "config" / "rules_incoming.yaml"
+
+    response = client.post(
+        "/watches",
+        json={"id": "incoming", "root": str(new_root), "rules_path": str(new_rules)},
+    )
+
+    assert response.status_code == 200
+    assert new_rules.exists()
+    assert new_rules.read_text() == "rules: []\n"
+
+
+def test_post_watch_keeps_existing_rules_file(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+    new_root = tmp_path / "incoming"
+    new_root.mkdir()
+    new_rules = tmp_path / "config" / "rules_incoming.yaml"
+    new_rules.parent.mkdir(parents=True, exist_ok=True)
+    new_rules.write_text(
+        "rules:\n  - name: Existing\n    match: {field: file_name, pattern: .+}\n    actions: [{move: {destination: ../out}}]\n"
+    )
+
+    response = client.post(
+        "/watches",
+        json={"id": "incoming", "root": str(new_root), "rules_path": str(new_rules)},
+    )
+
+    assert response.status_code == 200
+    assert new_rules.read_text().startswith("rules:\n  - name: Existing")
+
+
 def test_post_watch_can_select_folder_under_root(tmp_path: Path) -> None:
     client, _ = _make_client(tmp_path)
     root = tmp_path / "incoming"
@@ -111,7 +146,7 @@ def test_post_watch_form_payload_accepts_default_rules_path(tmp_path: Path) -> N
             "id": "incoming",
             "root": str(tmp_path),
             "folder": "incoming",
-            "rules_path": "/config/rules_incoming.yaml",
+            "rules_path": str(tmp_path / "config" / "rules_incoming.yaml"),
         },
         headers={"HX-Request": "true"},
     )

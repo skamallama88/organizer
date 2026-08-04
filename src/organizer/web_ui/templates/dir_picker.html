@@ -1,0 +1,60 @@
+<div class="dir-picker" x-data="dirPicker()"
+     @open-picker.window="open = true"
+     x-cloak x-show="open">
+  <div class="picker-head">
+    <strong>Choose a folder</strong>
+    <button type="button" @click="open = false">Close</button>
+  </div>
+
+  <p class="picker-error" x-show="error" x-text="error"></p>
+
+  <div class="picker-roots" x-show="dataRoots.length > 1">
+    <template x-for="root in dataRoots" :key="root">
+      <button type="button" :class="{ active: root === current_root }" @click="load(root)" x-text="root"></button>
+    </template>
+  </div>
+
+  <nav class="picker-crumb">
+    <template x-for="(part, i) in crumb" :key="part.path">
+      <span>
+        <a href="#" x-show="i < crumb.length - 1" @click.prevent="load(part.path)" x-text="part.name"></a>
+        <span x-show="i === crumb.length - 1" class="crumb-current" x-text="part.name"></span>
+        <span x-show="i < crumb.length - 1">/</span>
+      </span>
+    </template>
+  </nav>
+
+  <div class="picker-filter">
+    <input type="search" x-model="filter" placeholder="Filter folders" @keydown="keynav($event)">
+    <button type="button" @click="up()" :disabled="!parent">&uarr; Up</button>
+  </div>
+
+  <ul class="picker-dirs" @keydown="keynav($event)">
+    <li class="loading" x-show="loading" x-cloak>Loading…</li>
+    <template x-for="d in filteredDirs()" :key="d.path">
+      <li :class="{ selected: selected && selected.path === d.path }"
+          @click="enter(d)"
+          @dblclick="enter(d)"
+          tabindex="0">
+        <span class="icon" aria-hidden="true">&#128193;</span>
+        <a href="#" @click.prevent="enter(d)" x-text="d.name"></a>
+      </li>
+    </template>
+    <li class="empty" x-show="!loading && filteredDirs().length === 0">No subfolders.</li>
+  </ul>
+
+  <p class="picker-path" x-show="current" x-text="'Folder: ' + current"></p>
+
+  <div class="picker-actions">
+    <button type="button" @click="pick()">Use this folder</button>
+    <button type="button" @click="creating = !creating">New folder</button>
+  </div>
+
+  <div class="picker-new" x-show="creating" x-cloak>
+    <form @submit.prevent="create()">
+      <input type="text" x-model="newName" placeholder="New folder name" required>
+      <button type="submit">Create</button>
+      <span class="err" x-show="createError" x-text="createError"></span>
+    </form>
+  </div>
+</div>

@@ -42,6 +42,18 @@ def test_dashboard_has_add_watch_button(tmp_path: Path) -> None:
     assert 'hx-get="/watches/new"' in response.text
 
 
+def test_dashboard_htmx_reload_returns_fragment_not_full_page(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+    response = client.get("/", headers={"HX-Request": "true"})
+    assert response.status_code == 200
+    assert "Add Watch" in response.text
+    assert 'id="watch-list"' in response.text
+    assert "<!doctype" not in response.text.lower()
+    assert "<html" not in response.text.lower()
+    assert "htmx.min.js" not in response.text
+    assert 'id="dashboard"' not in response.text
+
+
 def test_dashboard_has_remove_buttons(tmp_path: Path) -> None:
     client, _, _ = make_client(tmp_path)
     response = client.get("/")
@@ -66,10 +78,12 @@ def test_watch_form_partial_renders(tmp_path: Path) -> None:
     response = client.get("/watches/new")
     assert response.status_code == 200
     assert "Watch ID" in response.text
-    assert "Root path" in response.text
+    assert "Folder to watch" in response.text
     assert "Rules path" in response.text
     assert 'hx-post="/watches"' in response.text
     assert 'name="folder"' in response.text
+    assert "dirPicker()" in response.text
+    assert "$dispatch('open-picker')" in response.text
 
 
 def test_watch_form_root_dropdown_populated(tmp_path: Path) -> None:

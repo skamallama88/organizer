@@ -1,28 +1,56 @@
 <form hx-post="/watches" hx-target="#dashboard" hx-swap="innerHTML"
-      x-data="{ id: '{{ watch_id }}', rulesPath: {{ rules_path|tojson }} }">
+      data-watch-id="{{ watch_id }}"
+      data-root="{{ selected_root }}"
+      data-folder="{{ folder }}"
+      data-rules-path="{{ rules_path }}"
+      data-config-root="{{ config_root }}"
+      x-data="{
+        id: '',
+        root: '',
+        folder: '/',
+        rulesPath: '',
+        configRoot: '',
+        init() {
+          this.id = this.$root.dataset.watchId || '';
+          this.root = this.$root.dataset.root || '';
+          this.folder = this.$root.dataset.folder || '/';
+          this.rulesPath = this.$root.dataset.rulesPath || '';
+          this.configRoot = this.$root.dataset.configRoot || '';
+        },
+        onDirPick(e) {
+          this.root = e.detail.root;
+          this.folder = e.detail.relative;
+        }
+      }"
+      @dirpick="onDirPick($event)">
   <p>
     <label for="id">Watch ID</label>
     <input id="id" name="id" type="text"
            x-model="id" value="{{ watch_id }}"
-           x-on:input="rulesPath = {{ config_root|tojson }} + '/rules_' + id + '.yaml'"
+           x-on:input="rulesPath = configRoot + '/rules_' + id + '.yaml'"
            placeholder="my_watch" required>
   </p>
   <p>
-    <label for="folder">Folder</label>
-    <input id="folder" name="folder" type="text" value="{{ folder }}" placeholder="subfolder">
-    <small>Optional path relative to the root.</small>
-  </p>
-  <p>
-    <label for="root">Root path</label>
-    <select id="root" name="root">
+    <label for="root">Folder to watch</label>
+    <select id="root" name="root" x-model="root">
       {% for root_option in data_roots %}
       <option value="{{ root_option }}"{% if selected_root == root_option|string %} selected{% endif %}>{{ root_option }}</option>
       {% endfor %}
     </select>
+    <small>Choose a data root, then pick or create a folder below.</small>
   </p>
   <p>
+    <label for="folder">Subfolder</label>
+    <input id="folder" name="folder" type="text" x-model="folder" placeholder="/">
+    <small>Optional relative path inside the selected root. Leave empty to watch the root itself.</small>
+  </p>
+  <p>
+    <button type="button" @click="$dispatch('open-picker')">Browse folders</button>
+  </p>
+  {% include "dir_picker.html" %}
+  <p>
     <label for="rules_path">Rules path</label>
-    <input id="rules_path" name="rules_path" type="text" x-model="rulesPath" value="{{ rules_path }}" required>
+    <input id="rules_path" name="rules_path" type="text" x-model="rulesPath" required>
   </p>
   <p>
     <button type="submit">Add Watch</button>

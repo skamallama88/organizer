@@ -16,3 +16,4 @@ venv/
 *.swp
 *.swo
 *~
+docker-compose.override.yml

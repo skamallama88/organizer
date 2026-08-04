@@ -1,4 +1,7 @@
 <section id="watch-list">
+{% if orphaned_rules %}
+<p class="feedback">Note: rules file left in place: <code>{{ orphaned_rules }}</code></p>
+{% endif %}
 {% if watches %}
 <table>
   <thead><tr><th>Watch</th><th>Health</th><th>Rules</th><th>Recent activity</th><th>Actions</th></tr></thead>

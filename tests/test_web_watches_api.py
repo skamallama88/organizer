@@ -199,6 +199,60 @@ def test_post_watch_rejects_root_inside_config_volume(tmp_path: Path) -> None:
     assert "config volume" in response.json()["detail"]
 
 
+def test_post_watch_rejects_folder_dotdot_escape(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+
+    response = client.post(
+        "/watches",
+        json={"id": "esc", "root": str(tmp_path), "folder": "../../etc", "rules_path": str(tmp_path / "r.yaml")},
+    )
+
+    assert response.status_code == 422
+    assert "may not contain '..'" in response.json()["detail"]
+
+
+def test_post_watch_resolves_clean_folder_under_root(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+    target = tmp_path / "ready"
+    target.mkdir()
+
+    response = client.post(
+        "/watches",
+        json={"id": "clean", "root": str(tmp_path), "folder": "ready", "rules_path": str(tmp_path / "r.yaml")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["root"] == str(target.resolve())
+
+
+def test_post_watch_rejects_bad_watch_id_charset(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+    new_root = tmp_path / "incoming"
+    new_root.mkdir()
+
+    response = client.post(
+        "/watches",
+        json={"id": "../../etc", "root": str(new_root), "rules_path": str(tmp_path / "r.yaml")},
+    )
+
+    assert response.status_code == 422
+    assert "invalid watch id" in response.json()["detail"]
+
+
+def test_post_watch_rejects_watch_id_with_slash(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+    new_root = tmp_path / "incoming"
+    new_root.mkdir()
+
+    response = client.post(
+        "/watches",
+        json={"id": "a/b", "root": str(new_root), "rules_path": str(tmp_path / "r.yaml")},
+    )
+
+    assert response.status_code == 422
+    assert "invalid watch id" in response.json()["detail"]
+
+
 def test_post_watch_rejects_missing_id(tmp_path: Path) -> None:
     client, _ = _make_client(tmp_path)
 
@@ -362,6 +416,20 @@ def test_delete_initially_unknown_then_added_watch(tmp_path: Path) -> None:
     response = client.delete("/watches/temp")
     assert response.status_code == 200
     assert response.json()["id"] == "temp"
+
+
+def test_post_watch_persistence_aborts_on_unreadable_config(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+    new_root = tmp_path / "incoming"
+    new_root.mkdir()
+    bad = tmp_path / "config" / "organizer.yaml"
+    bad.unlink()
+    bad.mkdir()  # directory -> read_text raises OSError
+
+    response = client.post("/watches", json={"id": "incoming", "root": str(new_root), "rules_path": str(tmp_path / "r.yaml")})
+
+    assert response.status_code == 500
+    assert "cannot read config" in response.json()["detail"]
 
 
 def test_post_watch_without_config_path_returns_success_without_persistence(tmp_path: Path) -> None:

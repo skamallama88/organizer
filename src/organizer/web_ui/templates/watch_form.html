@@ -1,10 +1,10 @@
 <form hx-post="/watches" hx-target="#dashboard" hx-swap="innerHTML"
-      x-data="{ id: '', rulesPath: '/config/rules_.yaml' }">
+      x-data="{ id: '{{ watch_id }}', rulesPath: {{ rules_path|tojson }} }">
   <p>
     <label for="id">Watch ID</label>
     <input id="id" name="id" type="text"
            x-model="id" value="{{ watch_id }}"
-           x-on:input="rulesPath = '/config/rules_' + id + '.yaml'"
+           x-on:input="rulesPath = {{ config_root|tojson }} + '/rules_' + id + '.yaml'"
            placeholder="my_watch" required>
   </p>
   <p>

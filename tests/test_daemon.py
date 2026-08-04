@@ -4,7 +4,6 @@ import asyncio
 import sqlite3
 import time
 from pathlib import Path
-from typing import cast
 
 from organizer.config import WatchFolderConfig
 from organizer.daemon import (

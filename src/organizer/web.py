@@ -43,6 +43,7 @@ _WEB_ROOT = Path(__file__).parent / "web_ui"
 _TEMPLATES = Jinja2Templates(directory=str(_WEB_ROOT / "templates"))
 _RULE_SAVE_LOCK = threading.Lock()
 _WATCH_SAVE_LOCK = threading.Lock()
+_RUNTIME_WATCHES_LOCK = threading.RLock()
 
 
 def create_app(
@@ -63,10 +64,15 @@ def create_app(
     _runtime_watches: list[WatchFolderConfig] = list(watch_folders or [])
 
     def _watch_config(watch_id: str) -> WatchFolderConfig | None:
-        for config in _runtime_watches:
-            if config.watch_id == watch_id:
-                return config
+        with _RUNTIME_WATCHES_LOCK:
+            for config in _runtime_watches:
+                if config.watch_id == watch_id:
+                    return config
         return None
+
+    def _watch_snapshot() -> list[WatchFolderConfig]:
+        with _RUNTIME_WATCHES_LOCK:
+            return list(_runtime_watches)
 
     def _rule_count(rules_path: Path) -> int:
         try:
@@ -77,12 +83,11 @@ def create_app(
         return len(rules) if isinstance(rules, list) else 0
 
     def _health_by_watch() -> dict[str, tuple[bool, str]]:
-        if health_checker is None or db_path is None or not _runtime_watches:
+        watches = _watch_snapshot()
+        if health_checker is None or db_path is None or not watches:
             return {}
         health = health_checker.check_all(
-            watch_folders=[
-                (config.watch_id, config.watch_root) for config in _runtime_watches
-            ],
+            watch_folders=[(config.watch_id, config.watch_root) for config in watches],
             db_path=db_path,
         )
         return {
@@ -138,17 +143,24 @@ def create_app(
     def _update_watches_on_disk(
         transform: Callable[[list[dict[str, object]]], list[dict[str, object]]]
     ) -> list[dict[str, object]]:
-        """Read-modify-write watches in organizer.yaml atomically under one lock."""
+        """Read-modify-write watches in organizer.yaml atomically under one lock.
+
+        Raises HTTPException(500) if the config cannot be read or written so a
+        transient read error can never silently replace the file with a partial
+        document. When no ``config_path`` is configured (in-memory mode) this is
+        a documented no-op: the caller still mutates the runtime watches.
+        """
         if config_path is None:
             return []
         with _WATCH_SAVE_LOCK:
-            document: dict[str, object] = {}
             try:
                 loaded = yaml.safe_load(config_path.read_text())
-                if isinstance(loaded, dict):
-                    document = loaded
-            except (OSError, yaml.YAMLError):
-                pass
+            except (OSError, yaml.YAMLError) as error:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"cannot read config for update: {error}",
+                ) from error
+            document: dict[str, object] = loaded if isinstance(loaded, dict) else {}
             raw_watches = document.get("watches", [])
             watches: list[dict[str, object]] = []
             if isinstance(raw_watches, list):
@@ -164,6 +176,11 @@ def create_app(
                 temp_path.write_text(yaml.dump(document, default_flow_style=False))
                 config_path.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(temp_path, config_path)
+            except OSError as error:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"cannot persist watch config: {error}",
+                ) from error
             finally:
                 if temp_path.exists():
                     temp_path.unlink()
@@ -171,7 +188,7 @@ def create_app(
 
     def _data_roots_and_config_root() -> tuple[list[Path], Path]:
         if _runtime_watches:
-            bp = _runtime_watches[0].boundary_policy
+            bp = _watch_snapshot()[0].boundary_policy
             config_root: Path = (
                 bp.config_root if bp.config_root is not None else Path("/config")
             )
@@ -203,8 +220,10 @@ def create_app(
         folder: object = "/",
         rules_path: object = "",
     ) -> dict[str, object]:
+        _, config_root = _data_roots_and_config_root()
         return {
             "data_roots": data_roots,
+            "config_root": str(config_root),
             "errors": errors,
             "watch_id": watch_id if isinstance(watch_id, str) else "",
             "selected_root": root if isinstance(root, str) else "",
@@ -228,7 +247,7 @@ def create_app(
     def _build_watches() -> list[dict[str, object]]:
         health_by_watch = _health_by_watch()
         watches = []
-        for config in _runtime_watches:
+        for config in _watch_snapshot():
             accessible, detail = health_by_watch.get(config.watch_id, (True, ""))
             entries = (
                 log_sink.read_recent(limit=1, watch=config.watch_id)
@@ -526,7 +545,7 @@ def create_app(
                 attempts=summaries,
                 status=status,
                 watch_id=watch_id,
-                watches=_runtime_watches,
+                watches=_watch_snapshot(),
             )
         return [
             {
@@ -810,20 +829,21 @@ def create_app(
                 level=level,
                 start=start,
                 end=end,
-                watches=_runtime_watches,
+                watches=_watch_snapshot(),
             )
         return payload
 
     @app.get("/health", response_model=None)
     def get_health() -> dict[str, object]:
-        if health_checker is None or db_path is None or not _runtime_watches:
+        watches = _watch_snapshot()
+        if health_checker is None or db_path is None or not watches:
             return {
                 "all_healthy": True,
                 "watch_folder_healths": [],
                 "persistence_health": {"tracking_db_writable": True, "detail": ""},
             }
         folder_tuples = [
-            (config.watch_id, config.watch_root) for config in _runtime_watches
+            (config.watch_id, config.watch_root) for config in watches
         ]
         overall = health_checker.check_all(watch_folders=folder_tuples, db_path=db_path)
         return {
@@ -868,16 +888,23 @@ def create_app(
         data_roots, config_root = _data_roots_and_config_root()
         if not isinstance(folder, str) or not folder:
             folder = "/"
-        root_path = Path(root) / folder.lstrip("/")
+        if any(part == ".." for part in folder.split("/")):
+            error = f"folder may not contain '..': {folder!r}"
+            if is_htmx:
+                return _watch_form_response(request, data_roots, error, watch_id=watch_id, root=root, folder=folder, rules_path=rules_path)
+            return JSONResponse(status_code=422, content={"detail": error})
+        root_path = (Path(root) / folder.lstrip("/")).resolve()
         if not isinstance(rules_path, str) or not rules_path:
             rules_path_value = config_root / f"rules_{watch_id}.yaml"
         else:
             rules_path_value = Path(rules_path)
             if not rules_path_value.is_absolute():
                 rules_path_value = config_root / rules_path_value
+        rules_path_value = rules_path_value.resolve()
 
-        existing_ids = [w.watch_id for w in _runtime_watches]
-        existing_roots = [w.watch_root for w in _runtime_watches]
+        existing = _watch_snapshot()
+        existing_ids = [w.watch_id for w in existing]
+        existing_roots = [w.watch_root for w in existing]
 
         try:
             validate_watch_id(watch_id, existing_ids)
@@ -912,30 +939,38 @@ def create_app(
                 status_code=500, content={"detail": f"cannot create rules file: {e}"}
             )
 
-        _update_watches_on_disk(
-            lambda watches: [
-                *watches,
-                {"id": watch_id, "root": str(root_path), "rules": str(rules_path_value)},
-            ]
-        )
-
         new_config = WatchFolderConfig(
             watch_id=watch_id,
             watch_root=root_path,
             rules_path=rules_path_value,
-            boundary_policy=_runtime_watches[0].boundary_policy
-            if _runtime_watches
+            boundary_policy=existing[0].boundary_policy
+            if existing
             else BoundaryPolicy(
                 data_roots=tuple(data_roots),
                 config_root=config_root,
                 allowed_destinations=tuple(data_roots),
             ),
         )
-        _runtime_watches.append(new_config)
-        rebuild_boundary_policy(_runtime_watches)
-
-        if watch_mutator is not None:
-            watch_mutator.add_watch(_runtime_watches[-1])
+        with _RUNTIME_WATCHES_LOCK:
+            _runtime_watches.append(new_config)
+            rebuild_boundary_policy(_runtime_watches)
+            if watch_mutator is not None:
+                watch_mutator.add_watch(_runtime_watches[-1])
+            try:
+                _update_watches_on_disk(
+                    lambda watches: [
+                        *watches,
+                        {"id": watch_id, "root": str(root_path), "rules": str(rules_path_value)},
+                    ]
+                )
+            except BaseException:
+                _runtime_watches[:] = [
+                    w for w in _runtime_watches if w.watch_id != watch_id
+                ]
+                rebuild_boundary_policy(_runtime_watches)
+                if watch_mutator is not None:
+                    watch_mutator.remove_watch(watch_id)
+                raise
 
         if is_htmx:
             data_roots, _ = _data_roots_and_config_root()
@@ -950,7 +985,7 @@ def create_app(
     async def remove_watch(
         request: Request, watch_id: str
     ) -> dict[str, object] | JSONResponse | HTMLResponse:
-        watch = next((w for w in _runtime_watches if w.watch_id == watch_id), None)
+        watch = next((w for w in _watch_snapshot() if w.watch_id == watch_id), None)
         if watch is None:
             if request.headers.get("HX-Request") == "true":
                 return HTMLResponse(
@@ -962,22 +997,37 @@ def create_app(
                 content={"detail": f"watch folder not found: {watch_id}"},
             )
 
-        _update_watches_on_disk(
-            lambda watches: [w for w in watches if w.get("id") != watch_id]
-        )
-
-        _runtime_watches[:] = [w for w in _runtime_watches if w.watch_id != watch_id]
-        rebuild_boundary_policy(_runtime_watches)
-
-        if watch_mutator is not None:
-            watch_mutator.remove_watch(watch_id)
+        with _RUNTIME_WATCHES_LOCK:
+            _runtime_watches[:] = [w for w in _runtime_watches if w.watch_id != watch_id]
+            rebuild_boundary_policy(_runtime_watches)
+            if watch_mutator is not None:
+                watch_mutator.remove_watch(watch_id)
+            try:
+                _update_watches_on_disk(
+                    lambda watches: [w for w in watches if w.get("id") != watch_id]
+                )
+            except BaseException:
+                _runtime_watches.append(watch)
+                rebuild_boundary_policy(_runtime_watches)
+                if watch_mutator is not None:
+                    watch_mutator.add_watch(watch)
+                raise
 
         if request.headers.get("HX-Request") == "true":
-            return _fragment(request, "watch_list.html", watches=_build_watches())
+            orphaned_rules = str(watch.rules_path) if watch.rules_path.exists() else ""
+            return _fragment(
+                request,
+                "watch_list.html",
+                watches=_build_watches(),
+                orphaned_rules=orphaned_rules,
+            )
         return {
             "id": watch_id,
             "root": str(watch.watch_root),
             "rules_path": str(watch.rules_path),
+            "orphaned_rules_path": str(watch.rules_path)
+            if watch.rules_path.exists()
+            else None,
             "status": "removed",
         }
 

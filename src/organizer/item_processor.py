@@ -1303,8 +1303,6 @@ class ItemProcessor:
                 destination = params.get("destination")
                 if not isinstance(destination, str) or not destination:
                     raise ValueError("action destination is required")
-                if re.search(r"\\(?:[1-9][0-9]*|g<[^>]+>)", destination):
-                    raise ValueError("action destination contains a capture reference")
             else:
                 raise ValueError(f"unsupported action: {kind}")
 

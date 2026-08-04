@@ -775,6 +775,58 @@ def test_move_destination_expands_match_capture(tmp_path: Path) -> None:
     assert plan.actions[0].target == tmp_path / "finance" / item.name
 
 
+def test_move_destination_capture_passes_validation_and_expands(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "report [finance].zip"
+    item.write_text("report")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: move
+    match:
+      field: file_name
+      pattern: '.*\\[([^]]+)\\].*'
+    actions:
+      - move:
+          destination: ../\\1
+"""
+    )
+
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert diagnostics == []
+
+    plan = ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+    assert plan.actions[0].target == tmp_path / "finance" / item.name
+
+
+def test_copy_destination_capture_passes_validation_and_expands(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "report [finance].zip"
+    item.write_text("report")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: copy
+    match:
+      field: file_name
+      pattern: '.*\\[([^]]+)\\].*'
+    actions:
+      - copy:
+          destination: ../\\1
+"""
+    )
+
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+    assert diagnostics == []
+
+    plan = ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+    assert plan.actions[0].target == tmp_path / "finance" / item.name
+
+
 def test_copy_destination_capture_reference_is_validated(tmp_path: Path) -> None:
     rules = tmp_path / "rules.yaml"
     rules.write_text(

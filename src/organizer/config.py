@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict
 
 from organizer.item_processor import BoundaryPolicy
+
+_WATCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class ConfigError(ValueError):
@@ -44,6 +47,10 @@ class OrganizerConfig(BaseModel):
 
 
 def validate_watch_id(watch_id: str, existing_ids: list[str]) -> None:
+    if not _WATCH_ID_PATTERN.match(watch_id):
+        raise ConfigError(
+            f"invalid watch id: {watch_id!r} (only A-Za-z0-9 _ - allowed)"
+        )
     if watch_id in existing_ids:
         raise ConfigError(f"duplicate watch id: {watch_id}")
 
@@ -190,7 +197,7 @@ def _positive_int(value: object, key: str) -> int:
 
 def _within(path: Path, root: Path) -> bool:
     try:
-        path.relative_to(root)
+        path.resolve().relative_to(root.resolve())
         return True
     except ValueError:
         return False

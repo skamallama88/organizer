@@ -380,6 +380,9 @@ the configuration file). Startup validates that watch roots are disjoint, lie
 within a data root, and do not enter the config volume. The loader resolves each
 watch to a `WatchFolderConfig` and `BoundaryPolicy`; CLI and web callers accept
 only a watch identifier and resolve these values from the loaded configuration.
+On first container start, the entrypoint discovers non-system bind mounts from
+`/proc/mounts` and adds unique paths to `data_roots`; it never creates watches
+for those paths and never changes an existing configuration file.
 
 Example:
 

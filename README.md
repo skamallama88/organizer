@@ -27,8 +27,11 @@ the published port on host loopback while the container listens on `0.0.0.0`, wh
 is required for Docker port forwarding.
 
 On first start, the image creates `/config/organizer.yaml` and `/config/rules.yaml`
-in an empty config volume. Edit those files to configure watch folders and rules;
-existing files are never overwritten on restart.
+in an empty config volume. The generated `data_roots` includes `/data` and any
+additional bind mounts visible in the container, excluding Docker and system
+mounts. Edit those files to configure watch folders and rules; existing files are
+never overwritten on restart. Discovered roots are eligible data roots only and
+are not automatically watched.
 
 Inspect or edit the generated files with a temporary container:
 
@@ -57,6 +60,27 @@ After editing configuration, restart the service:
 ```sh
 docker compose restart organizer
 ```
+
+### Runtime watch management
+
+Watch folders can also be added and removed while Organizer is running. Use the
+**Add Watch** control on the dashboard, or call the unauthenticated API endpoints:
+
+```sh
+curl -X POST http://127.0.0.1:8000/watches \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"downloads","root":"/data/Downloads","rules_path":"/config/rules-downloads.yaml"}'
+
+curl -X DELETE http://127.0.0.1:8000/watches/downloads
+```
+
+The API validates watch IDs and roots against the configured data roots, rejects
+duplicate or overlapping watches, persists successful changes to
+`/config/organizer.yaml`, and updates both filesystem watching and periodic
+scanning without restarting the service. When `rules_path` is omitted, it
+defaults to `/config/rules_<watch_id>.yaml`. Removing a watch changes its
+runtime configuration only; it does not delete the watched files or its rules
+file.
 
 The default rules file contains no rules, so Organizer starts safely without
 modifying files. Add rules through the web UI or edit the configured YAML file.

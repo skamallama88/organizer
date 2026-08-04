@@ -1,0 +1,5 @@
+<h1>Watch folders</h1>
+{% include "watch_list.html" %}
+<section id="add-watch-form">
+  <button hx-get="/watches/new" hx-target="#add-watch-form" hx-swap="innerHTML">Add Watch</button>
+</section>

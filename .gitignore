@@ -10,6 +10,7 @@ build/
 __pycache__/
 .venv/
 venv/
+.playwright-mcp/
 .idea/
 .vscode/
 *.swp

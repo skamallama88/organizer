@@ -34,8 +34,10 @@ data_roots:
   - /data
 EOF
     printf '%s\n' "$mount_paths" | while IFS= read -r path; do
-      [ -n "$path" ] && printf '  - %s\n' "$path"
-    done
+      if [ -n "$path" ]; then
+        printf '  - %s\n' "$path"
+      fi
+    done || true
     cat <<'EOF'
 quarantine_root: /data/.quarantine
 watches:

@@ -1318,7 +1318,9 @@ class ItemProcessor:
                 name = action[kind].get(field)
                 if not isinstance(name, str) or not name:
                     raise ValueError(f"{kind} {field} is required")
-                for reference in re.findall(r"\\(?:[1-9][0-9]*|g<[^>]+>)", name):
+                for reference in re.findall(
+                    r"(?:(?:[A-Za-z_][A-Za-z0-9_]*)\.)?\\(?:[1-9][0-9]*|g<[^>]+>)", name
+                ):
                     condition_name, capture = ItemProcessor._split_capture_reference(reference)
                     compiled = condition_patterns.get(condition_name)
                     if compiled is None:
@@ -1403,7 +1405,9 @@ class ItemProcessor:
                 if not isinstance(name, str) or not name:
                     raise ValueError(f"{kind} {field} is required")
                 try:
-                    for reference in re.findall(r"\\(?:[1-9][0-9]*|g<[^>]+>)", name):
+                    for reference in re.findall(
+                        r"(?:(?:[A-Za-z_][A-Za-z0-9_]*)\.)?\\(?:[1-9][0-9]*|g<[^>]+>)", name
+                    ):
                         condition_name, capture = ItemProcessor._split_capture_reference(reference)
                         matches[condition_name].expand(capture)
                 except (IndexError, re.error, ValueError) as error:

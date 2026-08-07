@@ -1,0 +1,17 @@
+rules:
+  - name: Sort cosplay by artist
+    match:
+      field: file_name
+      pattern: "^\\("
+    conditions:
+      artist:
+        field: file_name
+        pattern: "^[^)]*\\)\\s+(?P<artist>.+?)\\s*-\\s"
+      rest:
+        field: file_name
+        pattern: "^\\([^)]*\\)\\s+(?P<rest>.+)$"
+    actions:
+      - rename:
+          name: "rest.\\g<rest>"
+      - move:
+          destination: "Cosplay_Processed/artist.\\g<artist>"

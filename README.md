@@ -260,14 +260,29 @@ CLI or web UI dry run before enabling mutating rules:
 organizer check <watch-id> <item>
 ```
 
-For Unraid, replace the named volumes in `docker-compose.yml` with host paths, for
-example:
+For Unraid, use a Compose file that pulls the prebuilt image from GitHub
+Container Registry instead of building it. A complete example, with host paths
+for the config and data volumes:
 
 ```yaml
-volumes:
-  - /mnt/user/appdata/organizer:/config
-  - /mnt/user/data:/data
+# docker-compose.yml
+services:
+  organizer:
+    image: ghcr.io/skamallama88/organizer:latest
+    container_name: organizer
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      ORGANIZER_HOST: "0.0.0.0"
+      ORGANIZER_PORT: "8000"
+    volumes:
+      - /mnt/user/appdata/organizer:/config
+      - /mnt/user/data:/data
 ```
+
+Start it with `docker compose up -d`. Replace the `/mnt/user/...` host paths with
+the appdata and data shares you want Organizer to use.
 
 Keep `/config` separate from `/data`. Organizer's configuration volume must not be
 used as a watch folder or action destination.

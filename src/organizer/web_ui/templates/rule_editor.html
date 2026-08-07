@@ -2,17 +2,262 @@
 {% block content %}
 <h1>Rule editor: {{ watch.watch_id }}</h1>
 <p><a href="/">Back to watch folders</a></p>
-<form x-data="{ dirty: false }">
-  <input type="hidden" name="expected_revision" value="{{ revision }}">
-  <label for="rules">Rules YAML</label>
-  <textarea id="rules" name="rules" rows="24" x-on:input="dirty = true">{{ rules }}</textarea>
-  <p>
-    <button type="button" hx-post="/watches/{{ watch.watch_id }}/rules/validate" hx-include="closest form" hx-target="#feedback">Validate</button>
-    <button type="button" hx-post="/watches/{{ watch.watch_id }}/rules/save" hx-include="closest form" hx-target="#feedback">Save</button>
-  </p>
-  <p><label for="item">Item for dry run</label><input id="item" name="item" type="text" placeholder="{{ watch.watch_root }}/example.txt"></p>
-  <button type="button" hx-post="/watches/{{ watch.watch_id }}/rules/dry-run" hx-include="closest form" hx-target="#preview">Dry run</button>
-</form>
-<section id="feedback" aria-live="polite"></section>
-<section id="preview" aria-live="polite"></section>
+
+<script type="application/json" id="builder-model">{{ model|tojson }}</script>
+<div x-data="ruleBuilder()"
+     data-watch="{{ watch.watch_id }}"
+     data-revision="{{ revision }}"
+     class="rule-builder"
+     @dirpick="onDirPick($event)">
+  <input type="hidden" id="expected_revision" name="expected_revision" x-ref="revisionInput" :value="revision">
+
+  <ul class="tabs">
+    <li><button type="button" :class="{ active: tab === 'build' }" @click="tab = 'build'">Visual builder</button></li>
+    <li><button type="button" :class="{ active: tab === 'yaml' }" @click="tab = 'yaml'">YAML</button></li>
+  </ul>
+
+  <section x-show="tab === 'build'">
+    <template x-for="(rule, ri) in rules" :key="ri">
+      <fieldset class="rule-card">
+        <legend>Rule <span x-text="ri + 1"></span></legend>
+        <label class="row">Name <input x-model="rule.name" placeholder="e.g. Videos to Movies"></label>
+        <label class="check"><input type="checkbox" x-model="rule.allow_direct_deletion"> Allow direct deletion</label>
+        <label class="check"><input type="checkbox" x-model="rule.allow_hard_link_removal"> Allow hard-link removal</label>
+
+        <h3>If <span class="hint">all conditions match (AND)</span></h3>
+        <template x-for="(cond, ci) in rule.conditions" :key="ci">
+          <div class="cond-row">
+            <select x-model="cond.field" class="field-select">
+              <option value="file_name">File name</option>
+              <option value="folder_name">Folder name</option>
+              <option value="full_path">Full path</option>
+            </select>
+            <input x-model="cond.pattern" class="grow" placeholder="regex, e.g. .*\.mp4">
+            <button type="button" class="xbtn" @click="removeCondition(rule, ci)" title="Remove condition">×</button>
+          </div>
+        </template>
+        <button type="button" class="add" @click="addCondition(rule)">+ Add condition</button>
+
+        <h3>Then <span class="hint">do the following</span></h3>
+        <template x-for="(action, ai) in rule.actions" :key="ai">
+          <div class="action-row">
+            <select x-model="action.kind" class="kind-select" @change="onKind(action)">
+              <option value="move">Move to</option>
+              <option value="copy">Copy to</option>
+              <option value="rename">Rename to</option>
+              <option value="delete">Delete</option>
+              <option value="archive">Archive</option>
+              <option value="unarchive">Unarchive</option>
+            </select>
+            <input x-show="action.kind === 'move' || action.kind === 'copy'"
+                   x-model="action.params.destination" class="grow" placeholder="Destination">
+            <button type="button" class="pickbtn" x-show="action.kind === 'move' || action.kind === 'copy'"
+                    @click="openDestPicker(action); $dispatch('open-picker')">Pick</button>
+            <input x-show="action.kind === 'rename'"
+                   x-model="action.params.name" class="grow" placeholder="Name">
+            <select x-show="action.kind === 'delete'" x-model="action.params.mode">
+              <option value="direct">Direct</option>
+              <option value="quarantine">Quarantine</option>
+            </select>
+            <input x-show="action.kind === 'archive'"
+                   x-model="action.params.destination" class="grow" placeholder="Destination">
+            <button type="button" class="pickbtn" x-show="action.kind === 'archive'"
+                    @click="openDestPicker(action); $dispatch('open-picker')">Pick</button>
+            <input x-show="action.kind === 'archive'"
+                   x-model="action.params.extension" class="small" placeholder=".zip">
+            <label class="check" x-show="action.kind === 'archive'"><input type="checkbox" x-model="action.params.preserve_originals"> Keep originals</label>
+            <input x-show="action.kind === 'unarchive'"
+                   x-model="action.params.destination" class="grow" placeholder="Destination">
+            <button type="button" class="pickbtn" x-show="action.kind === 'unarchive'"
+                    @click="openDestPicker(action); $dispatch('open-picker')">Pick</button>
+            <label class="check" x-show="action.kind === 'unarchive'"><input type="checkbox" x-model="action.params.preserve_original"> Keep archive</label>
+            <input x-show="action.kind === 'unarchive'"
+                   x-model="action.params.max_depth" class="small" placeholder="Max depth">
+            <button type="button" class="xbtn" @click="removeAction(rule, ai)" title="Remove action">×</button>
+          </div>
+        </template>
+        <button type="button" class="add" @click="addAction(rule)">+ Add action</button>
+
+        <p class="rule-tools">
+          <button type="button" class="danger" @click="removeRule(ri)">Remove rule</button>
+        </p>
+      </fieldset>
+    </template>
+    <button type="button" class="add wide" @click="addRule()">+ Add rule</button>
+
+    <h3 class="test-heading">Test</h3>
+    <label class="row">Item for dry run
+      <input x-model="item" name="item" placeholder="{{ watch.watch_root }}/example.txt">
+    </label>
+    <div class="toolbar">
+      <button type="button" @click="generate()" :disabled="loading">Preview YAML</button>
+      <button type="button" @click="validate()" :disabled="loading">Validate</button>
+      <button type="button" @click="save()" :disabled="loading">Save rules</button>
+      <button type="button" @click="dryRun()" :disabled="loading">Dry run</button>
+    </div>
+
+    <div class="feedback" :class="feedbackClass" x-show="feedback" x-text="feedback" role="alert"></div>
+    <section class="preview" x-show="preview" x-html="preview"></section>
+    <pre class="yaml-preview" x-show="yamlPreview" x-text="yamlPreview"></pre>
+
+    {% include "dir_picker.html" %}
+  </section>
+
+  <section x-show="tab === 'yaml'">
+    <textarea id="rules-yaml" x-ref="yamlTextarea" name="rules" rows="24" placeholder="rules: []">{{ rules }}</textarea>
+    <p>
+      <button type="button" hx-post="/watches/{{ watch.watch_id }}/rules/validate" hx-include="#rules-yaml" hx-target="#feedback-yaml">Validate</button>
+      <button type="button" hx-post="/watches/{{ watch.watch_id }}/rules/save" hx-include="#rules-yaml, #expected_revision" hx-target="#feedback-yaml">Save</button>
+    </p>
+    <label class="row">Item for dry run
+      <input name="item" type="text" placeholder="{{ watch.watch_root }}/example.txt">
+    </label>
+    <button type="button" hx-post="/watches/{{ watch.watch_id }}/rules/dry-run" hx-include="#rules-yaml, [name=item]" hx-target="#preview-yaml">Dry run</button>
+    <section id="feedback-yaml" class="feedback" aria-live="polite"></section>
+    <section id="preview-yaml" aria-live="polite"></section>
+  </section>
+</div>
+
+<script>
+function ruleBuilder() {
+  const DEFAULTS = {
+    delete: { mode: 'quarantine' },
+    archive: { destination: '', extension: '.zip', preserve_originals: false },
+    unarchive: { destination: '.', preserve_original: false, max_depth: 0 },
+    move: { destination: '' },
+    copy: { destination: '' },
+    rename: { name: '' },
+  };
+  const modelEl = document.getElementById('builder-model');
+  let model = [];
+  if (modelEl) {
+    try { model = JSON.parse(modelEl.textContent || '[]'); } catch (e) { model = []; }
+  }
+  const rootEl = document.querySelector('[x-data="ruleBuilder()"]');
+  const revision = rootEl ? rootEl.getAttribute('data-revision') || '' : '';
+  function emptyRule() {
+    return {
+      name: '',
+      allow_direct_deletion: false,
+      allow_hard_link_removal: false,
+      conditions: [{ name: 'match', field: 'file_name', pattern: '' }],
+      actions: [],
+    };
+  }
+  function esc(value) {
+    return String(value).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+  return {
+    tab: 'build',
+    rules: model && model.length ? model : [emptyRule()],
+    revision: revision || '',
+    item: '',
+    feedback: '',
+    feedbackClass: '',
+    preview: '',
+    yamlPreview: '',
+    loading: false,
+
+    addRule() { this.rules.push(emptyRule()); },
+    removeRule(i) { this.rules.splice(i, 1); if (!this.rules.length) this.rules.push(emptyRule()); },
+    addCondition(rule) { rule.conditions.push({ name: '', field: 'file_name', pattern: '' }); },
+    removeCondition(rule, i) {
+      rule.conditions.splice(i, 1);
+      if (!rule.conditions.length) rule.conditions.push({ name: 'match', field: 'file_name', pattern: '' });
+    },
+    addAction(rule) { rule.actions.push({ kind: 'move', params: { ...DEFAULTS.move } }); },
+    removeAction(rule, i) { rule.actions.splice(i, 1); },
+    onKind(action) { action.params = { ...(DEFAULTS[action.kind] || {}) }; },
+
+    destTarget: null,
+    openDestPicker(action) { this.destTarget = action; },
+    onDirPick(e) {
+      if (this.destTarget) {
+        this.destTarget.params.destination = e.detail.path;
+        this.destTarget = null;
+      }
+    },
+
+    async api(url, body) {
+      this.loading = true;
+      this.feedback = '';
+      this.preview = '';
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        return { status: res.status, data: await res.json().catch(() => ({})) };
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    watchId() { return this.$root.dataset.watch; },
+
+    generate() {
+      this.api('/watches/' + this.watchId() + '/rules/build/generate', { model: this.rules })
+        .then(({ data }) => {
+          if (data.yaml !== undefined) {
+            this.yamlPreview = data.yaml;
+            if (this.$refs.yamlTextarea) this.$refs.yamlTextarea.value = data.yaml;
+          } else if (data.errors) {
+            this.feedback = data.errors.join('; ');
+            this.feedbackClass = 'error';
+          }
+        });
+    },
+
+    validate() {
+      this.api('/watches/' + this.watchId() + '/rules/build/validate', { model: this.rules })
+        .then(({ data }) => {
+          this.yamlPreview = data.yaml || '';
+          const errors = data.errors || [];
+          this.feedback = errors.length ? errors.join('; ') : 'Rules are valid.';
+          this.feedbackClass = errors.length ? 'error' : 'success';
+        });
+    },
+
+    save() {
+      this.api('/watches/' + this.watchId() + '/rules/build/save', {
+        model: this.rules,
+        expected_revision: this.revision,
+      }).then(({ data }) => {
+        const errors = data.errors || [];
+        this.feedback = data.message || (errors.length ? errors.join('; ') : 'Saved.');
+        this.feedbackClass = errors.length ? 'error' : 'success';
+        if (data.revision) {
+          this.revision = data.revision;
+          if (this.$refs.revisionInput) this.$refs.revisionInput.value = data.revision;
+        }
+        if (data.yaml !== undefined) this.yamlPreview = data.yaml;
+      });
+    },
+
+    dryRun() {
+      this.api('/watches/' + this.watchId() + '/rules/build/dry-run', {
+        model: this.rules,
+        item: this.item,
+      }).then(({ data }) => {
+        const errors = data.errors || [];
+        if (errors.length) {
+          this.feedback = errors.join('; ');
+          this.feedbackClass = 'error';
+          return;
+        }
+        if (data.actions && data.actions.length) {
+          this.preview = '<ul>' + data.actions.map((a) =>
+            `<li><strong>${esc(a.kind)}</strong>: ${esc(a.source)} &rarr; ${esc(a.target)}</li>`
+          ).join('') + '</ul>';
+        } else if (data.detail) {
+          this.preview = '<p>' + esc(data.detail) + '</p>';
+        }
+      });
+    },
+  };
+}
+</script>
 {% endblock %}

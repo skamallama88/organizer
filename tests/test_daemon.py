@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 from organizer.config import WatchFolderConfig
 from organizer.daemon import (
@@ -14,6 +16,8 @@ from organizer.daemon import (
     RetentionService,
     WatcherService,
     WatchMutator,
+    _filesystem_type,
+    _is_inotify_supported,
 )
 from organizer.item_processor import (
     BatchItemStatus,
@@ -481,3 +485,43 @@ def test_retention_service_stops_gracefully(tmp_path: Path) -> None:
         assert service._stop_event.is_set()
 
     asyncio.run(run())
+
+
+def test_filesystem_type_picks_longest_matching_mount(tmp_path: Path, monkeypatch: Any) -> None:
+    mounts = "\n".join(
+        [
+            "/dev/sda1 / ext4 rw 0 0",
+            "shfs /mnt/user fuse.shfs rw,nosuid,nodev,noatime 0 0",
+            "shfs /mnt/user/dls fuse.shfs rw 0 0",
+            "",
+        ]
+    )
+    monkeypatch.setattr("builtins.open", lambda *a, **k: io.StringIO(mounts))
+
+    assert _filesystem_type(Path("/mnt/user/dls")) == "fuse.shfs"
+    assert _filesystem_type(Path("/mnt/user/dls/sub/folder")) == "fuse.shfs"
+    assert _filesystem_type(Path("/etc/passwd")) == "ext4"
+
+
+def test_inotify_supported_is_false_for_fuse_and_nfs(monkeypatch: Any) -> None:
+    mounts = "\n".join(
+        [
+            "shfs /mnt/user fuse.shfs rw 0 0",
+            "host:/export /mnt/nfs nfs rw 0 0",
+            "",
+        ]
+    )
+    monkeypatch.setattr("builtins.open", lambda *a, **k: io.StringIO(mounts))
+
+    assert _is_inotify_supported(Path("/mnt/user/dls")) is False
+    assert _is_inotify_supported(Path("/mnt/nfs/share")) is False
+    assert _is_inotify_supported(Path("/etc")) is True
+
+
+def test_inotify_supported_defaults_true_when_mounts_unreadable(tmp_path: Path, monkeypatch: Any) -> None:
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("no /proc/mounts")
+
+    monkeypatch.setattr("builtins.open", _boom)
+
+    assert _is_inotify_supported(tmp_path) is True

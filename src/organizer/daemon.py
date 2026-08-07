@@ -9,6 +9,7 @@ from typing import Protocol, Sequence
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver
 
 from organizer.config import OrganizerConfig, WatchFolderConfig, rebuild_boundary_policy
 from organizer.item_processor import (
@@ -55,6 +56,64 @@ class ProcessorBatchAdapter:
         )
 
 
+def _filesystem_type(path: Path) -> str | None:
+    """Return the filesystem type backing ``path`` by scanning /proc/mounts.
+
+    Returns ``None`` when it cannot be determined (e.g. not on Linux or the
+    path is not under a recognised mount point). Uses the longest matching
+    mount point so nested mounts resolve to their own type.
+    """
+    target = path.resolve()
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as stream:
+            lines = stream.read().splitlines()
+    except OSError:
+        return None
+    best: tuple[int, str] | None = None
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mount_point = parts[1]
+        fs_type = parts[2]
+        try:
+            resolved = Path(mount_point).resolve()
+        except OSError:
+            continue
+        try:
+            target.relative_to(resolved)
+        except ValueError:
+            continue
+        depth = len(resolved.parts)
+        if best is None or depth > best[0]:
+            best = (depth, fs_type)
+    return best[1] if best is not None else None
+
+
+def _is_inotify_supported(path: Path) -> bool:
+    """Whether watchdog's inotify ``Observer`` works for ``path``.
+
+    FUSE, NFS, CIFS/SMB, and 9p mounts do not deliver inotify events (and can
+    block observer startup), so they fall back to the polling observer.
+    Non-Linux platforms and unknown mounts default to inotify.
+    """
+    fs_type = _filesystem_type(path)
+    if fs_type is None:
+        return True
+    return fs_type not in {
+        "fuse",
+        "fuse.shfs",
+        "fuse.sshfs",
+        "fuse.s3fs",
+        "fuse.glusterfs",
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smbfs",
+        "9p",
+    }
+
+
 class WatcherService:
     def __init__(self, watches: Sequence[WatchFolderConfig], processor: BatchProcessor, debounce_seconds: float = 0.5) -> None:
         self._watches = {watch.watch_id: watch for watch in watches}
@@ -95,15 +154,16 @@ class WatcherService:
         return sum(len(paths) for paths in ready.values())
 
     def start(self) -> None:
-        observer = Observer()
-        handler = _WatchdogHandler(self)
-        self._handler = handler
         with self._lock:
             watches = tuple(self._watches.values())
+        inotify_supported = all(_is_inotify_supported(watch.watch_root) for watch in watches)
+        observer: object = Observer() if inotify_supported else PollingObserver()
+        handler = _WatchdogHandler(self)
+        self._handler = handler
         for watch in watches:
             if watch.watch_root.is_dir():
-                self._handles[watch.watch_id] = observer.schedule(handler, str(watch.watch_root), recursive=True)
-        observer.start()
+                self._handles[watch.watch_id] = observer.schedule(handler, str(watch.watch_root), recursive=True)  # type: ignore[attr-defined]
+        observer.start()  # type: ignore[attr-defined]
         self._observer = observer
 
     def add_watch(self, watch: WatchFolderConfig) -> None:

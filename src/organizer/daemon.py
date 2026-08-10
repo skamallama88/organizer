@@ -31,8 +31,9 @@ class WatchMutator(Protocol):
 
 
 class ProcessorBatchAdapter:
-    def __init__(self, processor: ItemProcessor) -> None:
+    def __init__(self, processor: ItemProcessor, stability_interval: float = 0.0) -> None:
         self.processor = processor
+        self._stability_interval = stability_interval
 
     def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
         snapshots: list[ItemSnapshot] = []
@@ -51,7 +52,7 @@ class ProcessorBatchAdapter:
             watch_root=watch.watch_root,
             rules_path=watch.rules_path,
             snapshots=snapshots,
-            stability_interval=0.0,
+            stability_interval=effective_stability_interval(watch.watch_root, self._stability_interval),
             boundary_policy=watch.boundary_policy,
         )
 
@@ -383,10 +384,24 @@ def create_daemon(
         )
     return OrganizerDaemon(
         list(config.watches),
-        ProcessorBatchAdapter(processor),
+        ProcessorBatchAdapter(processor, float(config.stability_interval)),
         config.scan_interval,
         retention=retention_service,
     )
+
+
+def effective_stability_interval(watch_root: Path, stability_interval: float) -> float:
+    """Stability gating interval for a single watch root.
+
+    inotify-backed observers emit ``closed`` events, which already provide
+    correct write-completion semantics, so they keep the fast path
+    (``0.0``). Polling observers (FUSE/NFS/CIFS watch roots) never emit a
+    close event, so the stability gate is the only reliable signal and the
+    configured interval is applied.
+    """
+    if _is_inotify_supported(watch_root):
+        return 0.0
+    return stability_interval
 
 
 class DaemonWatchMutator:

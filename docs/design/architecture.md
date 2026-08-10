@@ -373,7 +373,8 @@ For actions with reliable outcome evidence, the attempt records the action resul
 ## Runtime configuration
 
 `/config/organizer.yaml` is the source of truth for watch discovery. It defines
-global `scan_interval`, `log_level`, and `retention_days` settings, mounted
+global `scan_interval`, `stability_interval`, `log_level`, and `retention_days`
+settings, mounted
 `data_roots`, a `quarantine_root`, and a non-empty `watches` list. Each watch
 has an `id`, an absolute `root`, and a `rules` path (relative paths resolve from
 the configuration file). Startup validates that watch roots are disjoint, lie
@@ -388,6 +389,7 @@ Example:
 
 ```yaml
 scan_interval: 300
+stability_interval: 5
 log_level: INFO
 retention_days: 7
 data_roots: [/data]
@@ -397,6 +399,15 @@ watches:
     root: /data/Downloads
     rules: watches/Downloads/rules.yaml
 ```
+
+`stability_interval` is the number of seconds a file's size and modification time
+must remain unchanged before it is planned and executed. On watch roots backed by
+inotify (local ext4) the write-complete (`closed`) event already provides correct
+semantics, so the fast path is kept regardless of this setting. On polling-backed
+watch roots (FUSE/Unraid user shares, NFS, CIFS/SMB, 9p), the polling observer
+never emits a close event, so this stability gate is the only reliable signal and
+is applied before any file is moved or renamed. Set it to `0` to disable the gate.
+Default is `5` seconds.
 
 ## Production deployment
 

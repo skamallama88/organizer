@@ -49,11 +49,19 @@ and a `rules` path. For example:
 data_roots:
   - /data
 quarantine_root: /data/.quarantine
+stability_interval: 5
 watches:
   - id: downloads
     root: /data/Downloads
     rules: /config/rules-downloads.yaml
 ```
+
+`stability_interval` (seconds) is how long a file must stop changing size and
+mtime before it is acted on. On watch roots backed by the polling observer
+(FUSE/Unraid user shares, NFS, CIFS/SMB), where the watcher cannot detect write
+completion, it prevents files from being moved mid-copy; inotify-backed watch
+roots keep the immediate write-complete fast path. Set to `0` to disable. See
+`docs/design/architecture.md` for details.
 
 After editing configuration, restart the service:
 

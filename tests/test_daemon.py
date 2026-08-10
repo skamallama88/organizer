@@ -16,6 +16,7 @@ from organizer.daemon import (
     RetentionService,
     WatcherService,
     WatchMutator,
+    effective_stability_interval,
     _filesystem_type,
     _is_inotify_supported,
 )
@@ -525,3 +526,63 @@ def test_inotify_supported_defaults_true_when_mounts_unreadable(tmp_path: Path, 
     monkeypatch.setattr("builtins.open", _boom)
 
     assert _is_inotify_supported(tmp_path) is True
+
+
+def test_effective_stability_interval_is_per_watch(tmp_path: Path, monkeypatch: Any) -> None:
+    mounts = "\n".join(["shfs /mnt/user fuse.shfs rw 0 0", ""])
+    monkeypatch.setattr("builtins.open", lambda *a, **k: io.StringIO(mounts))
+
+    assert effective_stability_interval(tmp_path / "local", 5.0) == 0.0
+    assert effective_stability_interval(Path("/mnt/user/dls"), 5.0) == 5.0
+    assert effective_stability_interval(tmp_path / "local", 0.0) == 0.0
+
+
+def test_processor_batch_adapter_defers_unstable_items_with_interval(tmp_path: Path, monkeypatch: Any) -> None:
+    watch_root = tmp_path / "watch"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules_path = _write_move_rules(tmp_path / "rules.yaml", str(destination))
+    configured = WatchFolderConfig(
+        watch_id="incoming",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        boundary_policy=BoundaryPolicy(data_roots=(tmp_path,), allowed_destinations=(tmp_path,), watch_roots=(watch_root,)),
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    monkeypatch.setattr("organizer.daemon._is_inotify_supported", lambda _path: False)
+    adapter = ProcessorBatchAdapter(processor, stability_interval=5.0)
+
+    batch = adapter.process_batch(configured, [item])
+
+    assert batch is not None
+    assert batch.items[0].status == BatchItemStatus.DEFERRED
+    assert item.exists()
+    assert not (destination / "movie.mkv").exists()
+
+
+def test_processor_batch_adapter_keeps_fast_path_on_inotify_roots(tmp_path: Path, monkeypatch: Any) -> None:
+    watch_root = tmp_path / "watch"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules_path = _write_move_rules(tmp_path / "rules.yaml", str(destination))
+    configured = WatchFolderConfig(
+        watch_id="incoming",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        boundary_policy=BoundaryPolicy(data_roots=(tmp_path,), allowed_destinations=(tmp_path,), watch_roots=(watch_root,)),
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    monkeypatch.setattr("organizer.daemon._is_inotify_supported", lambda _path: True)
+    adapter = ProcessorBatchAdapter(processor, stability_interval=5.0)
+
+    batch = adapter.process_batch(configured, [item])
+
+    assert batch is not None
+    assert batch.items[0].status == "executed"
+    assert (destination / "movie.mkv").read_text() == "movie"

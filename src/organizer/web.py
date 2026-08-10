@@ -33,7 +33,7 @@ from organizer.config import (
     validate_watch_id,
     validate_watch_root,
 )
-from organizer.daemon import WatchMutator
+from organizer.daemon import WatchMutator, effective_stability_interval
 from organizer.item_processor import BoundaryPolicy, ItemProcessor, ItemSnapshot
 from organizer.operational_health import OperationalHealth
 from organizer.structured_log import LogLevel, MemoryLogSink
@@ -189,6 +189,7 @@ def create_app(
     db_path: Path | None = None,
     watch_mutator: WatchMutator | None = None,
     config_path: Path | None = None,
+    stability_interval: float = 0.0,
 ) -> FastAPI:
     app = FastAPI()
     app.mount("/static", StaticFiles(directory=_WEB_ROOT / "static"), name="static")
@@ -651,7 +652,7 @@ def create_app(
                 watch_root=config.watch_root,
                 rules_path=temp_path,
                 snapshots=[snapshot],
-                stability_interval=0.0,
+                stability_interval=effective_stability_interval(config.watch_root, stability_interval),
                 boundary_policy=config.boundary_policy,
                 dry_run=True,
             )
@@ -753,7 +754,7 @@ def create_app(
                 watch_root=config.watch_root,
                 rules_path=temp_path,
                 snapshots=[snapshot],
-                stability_interval=0.0,
+                stability_interval=effective_stability_interval(config.watch_root, stability_interval),
                 boundary_policy=config.boundary_policy,
                 dry_run=True,
             )
@@ -807,7 +808,7 @@ def create_app(
             watch_root=config.watch_root,
             rules_path=config.rules_path,
             snapshots=[snapshot],
-            stability_interval=0.0,
+            stability_interval=effective_stability_interval(config.watch_root, stability_interval),
             boundary_policy=config.boundary_policy,
             dry_run=True,
         )

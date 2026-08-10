@@ -32,6 +32,7 @@ class OrganizerConfig(BaseModel):
     database_path: Path
     log_path: Path
     scan_interval: int
+    stability_interval: int
     log_level: str
     retention_days: int
     retention_interval: int
@@ -101,6 +102,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
     data_roots = _paths(document.get("data_roots", ["/data"]), "data_roots", config_path.parent)
     quarantine_root = _path(document, "quarantine_root", config_root / "quarantine", config_path.parent)
     scan_interval = _positive_int(document.get("scan_interval", 300), "scan_interval")
+    stability_interval = _non_negative_int(document.get("stability_interval", 5), "stability_interval")
     retention_days = _positive_int(document.get("retention_days", 7), "retention_days")
     retention_interval = _positive_int(document.get("retention_interval", 3600), "retention_interval")
     log_level = document.get("log_level", "INFO")
@@ -158,6 +160,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
         database_path=database_path,
         log_path=log_path,
         scan_interval=scan_interval,
+        stability_interval=stability_interval,
         log_level=log_level.upper(),
         retention_days=retention_days,
         retention_interval=retention_interval,
@@ -190,8 +193,16 @@ def _paths(value: object, key: str, base: Path) -> list[Path]:
 
 
 def _positive_int(value: object, key: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ConfigError(f"{key} must be a positive integer")
+    return _int_with_min(value, key, 1, "positive")
+
+
+def _non_negative_int(value: object, key: str) -> int:
+    return _int_with_min(value, key, 0, "non-negative")
+
+
+def _int_with_min(value: object, key: str, minimum: int, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ConfigError(f"{key} must be a {label} integer")
     return value
 
 

@@ -15,7 +15,7 @@ from organizer.attempt_review import (
     RetryFromStart,
 )
 from organizer.config import OrganizerConfig, WatchFolderConfig, load_config
-from organizer.daemon import DaemonWatchMutator, create_daemon
+from organizer.daemon import DaemonWatchMutator, create_daemon, effective_stability_interval
 from organizer.item_processor import ItemProcessor, ItemSnapshot
 
 app = typer.Typer(no_args_is_help=True)
@@ -50,7 +50,7 @@ def check(
         watch_root=watch.watch_root,
         rules_path=watch.rules_path,
         snapshots=[snapshot],
-        stability_interval=0.0,
+        stability_interval=effective_stability_interval(watch.watch_root, float(config.stability_interval)),
         boundary_policy=watch.boundary_policy,
         dry_run=True,
     )
@@ -103,6 +103,7 @@ def run(
         db_path=config.database_path,
         watch_mutator=DaemonWatchMutator(daemon),
         config_path=config_path,
+        stability_interval=float(config.stability_interval),
     )
     settings = RuntimeSettings.from_environment()
     log_startup_diagnostics(settings, logging.getLogger("organizer"))

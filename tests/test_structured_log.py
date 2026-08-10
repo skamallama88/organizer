@@ -11,6 +11,7 @@ from organizer.structured_log import (
     RotatingFileLogSink,
     StdoutLogSink,
     StructuredLogger,
+    parse_log_line,
 )
 
 
@@ -291,3 +292,109 @@ def test_rotating_file_sink_removes_old_backups(tmp_path: Path) -> None:
     sink.write(entry)
 
     assert not backup.exists()
+
+
+def test_parse_log_line_round_trips_a_formatted_entry() -> None:
+    entry = LogEntry.create(
+        level=LogLevel.ERROR,
+        watch="downloads",
+        rule="videos",
+        action="move",
+        item="/data/downloads/movie.mkv",
+        result=LogResult.FAILED,
+        detail="collision detected",
+    )
+
+    parsed = parse_log_line(entry.format_line())
+
+    assert parsed is not None
+    assert parsed.timestamp == entry.timestamp
+    assert parsed.level == LogLevel.ERROR
+    assert parsed.watch == "downloads"
+    assert parsed.rule == "videos"
+    assert parsed.action == "move"
+    assert parsed.item == "/data/downloads/movie.mkv"
+    assert parsed.result == LogResult.FAILED
+    assert parsed.detail == "collision detected"
+
+
+def test_parse_log_line_preserves_pipes_inside_detail() -> None:
+    entry = LogEntry.create(
+        level=LogLevel.INFO,
+        watch="w",
+        rule="r",
+        action="a",
+        item="item",
+        result=LogResult.OK,
+        detail="a | b | c",
+    )
+
+    parsed = parse_log_line(entry.format_line())
+
+    assert parsed is not None
+    assert parsed.detail == "a | b | c"
+
+
+def test_parse_log_line_returns_none_for_blank_or_malformed() -> None:
+    assert parse_log_line("") is None
+    assert parse_log_line("   ") is None
+    assert parse_log_line("only a few | fields") is None
+
+
+def test_rotating_file_sink_read_recent_rehydrates_entries(tmp_path: Path) -> None:
+    path = tmp_path / "organizer.log"
+    sink = RotatingFileLogSink(path)
+    for i in range(3):
+        sink.write(LogEntry.create(
+            level=LogLevel.INFO,
+            watch="downloads",
+            rule="videos",
+            action="move",
+            item=f"/data/downloads/file{i}.mkv",
+            result=LogResult.OK,
+        ))
+
+    reloaded = RotatingFileLogSink(path).read_recent()
+
+    assert [entry.item for entry in reloaded] == [
+        "/data/downloads/file0.mkv",
+        "/data/downloads/file1.mkv",
+        "/data/downloads/file2.mkv",
+    ]
+
+
+def test_rotating_file_sink_read_recent_respects_limit(tmp_path: Path) -> None:
+    path = tmp_path / "organizer.log"
+    sink = RotatingFileLogSink(path)
+    for i in range(5):
+        sink.write(LogEntry.create(
+            level=LogLevel.INFO,
+            watch="w",
+            rule="r",
+            action="a",
+            item=f"item-{i}",
+            result=LogResult.OK,
+        ))
+
+    reloaded = RotatingFileLogSink(path).read_recent(limit=2)
+
+    assert [entry.item for entry in reloaded] == ["item-3", "item-4"]
+
+
+def test_rotating_file_sink_read_recent_handles_missing_file(tmp_path: Path) -> None:
+    assert RotatingFileLogSink(tmp_path / "absent.log").read_recent() == []
+
+
+def test_memory_log_sink_hydrate_seeds_ring_with_prior_entries() -> None:
+    sink = MemoryLogSink(limit=1000)
+    prior = LogEntry.create(
+        level=LogLevel.INFO,
+        watch="downloads",
+        rule="videos",
+        action="move",
+        item="/data/downloads/movie.mkv",
+        result=LogResult.OK,
+    )
+    sink.hydrate([prior])
+
+    assert [entry.item for entry in sink.read_recent()] == ["/data/downloads/movie.mkv"]

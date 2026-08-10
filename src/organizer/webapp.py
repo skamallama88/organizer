@@ -10,8 +10,10 @@ from organizer.web import create_app
 config = load_config()
 db_path = config.database_path
 log_path = config.log_path
+file_sink = RotatingFileLogSink(log_path, retention_days=config.retention_days)
 log_sink = MemoryLogSink(limit=1000)
-logger = StructuredLogger(sinks=[StdoutLogSink(), RotatingFileLogSink(log_path, retention_days=config.retention_days), log_sink])
+log_sink.hydrate(file_sink.read_recent(1000))
+logger = StructuredLogger(sinks=[StdoutLogSink(), file_sink, log_sink])
 health_checker = OperationalHealth()
 
 app = create_app(

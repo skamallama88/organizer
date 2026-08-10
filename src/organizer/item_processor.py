@@ -555,7 +555,7 @@ class ItemProcessor:
                     raise ValueError(f"rule {rule_name} archive extension is unsupported")
                 if not isinstance(preserve_original, bool):
                     raise ValueError(f"rule {rule_name} archive preserve_original must be boolean")
-                root = Path(destination)
+                root = Path(self._expand_captures(destination, matches))
                 if not root.is_absolute():
                     root = watch_root / root
                 destination_root = self._resolve_destination(root)
@@ -579,7 +579,7 @@ class ItemProcessor:
                     raise ValueError(f"rule {rule_name} unarchive destination is required")
                 if not isinstance(preserve_original, bool):
                     raise ValueError(f"rule {rule_name} unarchive preserve_original must be boolean")
-                root = Path(destination)
+                root = Path(self._expand_captures(destination, matches))
                 if not root.is_absolute():
                     root = watch_root / root
                 destination_root = self._resolve_destination(root)
@@ -775,6 +775,7 @@ class ItemProcessor:
                     elif action.kind == "copy":
                         self._stage_validate_publish(plan, source, action.target, self._copy_to_staging)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
+                        source = action.target
                     elif action.kind == "archive":
                         self._stage_validate_publish(plan, source, action.target, self._archive_to_staging)
                         if not action.preserve_original:
@@ -784,6 +785,7 @@ class ItemProcessor:
                                 return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)]), warnings=warnings)
                             self._remove_source(source)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
+                        source = action.target
                     elif action.kind == "unarchive":
                         self._stage_validate_publish(
                             plan,
@@ -800,6 +802,7 @@ class ItemProcessor:
                                 return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results + [ActionResult(action.kind, action.target, "UNCERTAIN", "source fingerprint changed before removal", source=source, resulting_path=action.target)]), warnings=warnings)
                             self._remove_source(source)
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
+                        source = action.target
                     else:
                         action_source = source
                         self._validate_destination_item(action.target)
@@ -981,7 +984,7 @@ class ItemProcessor:
         )
 
     def _archive_to_staging(self, source: Path, target: Path) -> Path:
-        staging = self._attempts_path.parent / "staging" / f".organizer-staging-{uuid.uuid4()}{target.suffix.lower()}"
+        staging = target.parent / f".organizer-staging-{uuid.uuid4()}{target.suffix.lower()}"
         staging.parent.mkdir(parents=True, exist_ok=True)
         if target.suffix.lower() == ".7z":
             with py7zr.SevenZipFile(staging, "w") as archive:
@@ -1033,7 +1036,7 @@ class ItemProcessor:
 
     def _unarchive_to_staging(self, source: Path, target: Path, limits: tuple[int, int, int], max_depth: int = 0) -> Path:
         max_entries, max_bytes, max_entry_size = limits
-        staging = self._attempts_path.parent / "staging" / f".organizer-staging-{uuid.uuid4()}"
+        staging = target.parent / f".organizer-staging-{uuid.uuid4()}"
         staging.mkdir(parents=True)
         count = total = 0
         try:
@@ -1193,6 +1196,8 @@ class ItemProcessor:
         target.parent.mkdir(parents=True, exist_ok=True)
         source_mode = source.stat().st_mode & 0o7777 if source.is_file() and not source.is_symlink() else None
         try:
+            if source.is_dir():
+                raise OSError(errno.EXDEV, "directory move requires the staged copy path")
             os.link(source, target)
         except FileExistsError as error:
             raise FileExistsError(f"destination already exists: {target}") from error
@@ -1313,7 +1318,7 @@ class ItemProcessor:
             condition_patterns[condition_name] = re.compile(pattern_str)
         for action in actions:
             kind = next(iter(action), "")
-            if kind in {"rename", "move", "copy"} and isinstance(action[kind], dict):
+            if kind in {"rename", "move", "copy", "archive", "unarchive"} and isinstance(action[kind], dict):
                 field = "name" if kind == "rename" else "destination"
                 name = action[kind].get(field)
                 if not isinstance(name, str) or not name:
@@ -1399,7 +1404,7 @@ class ItemProcessor:
     def _validate_action_references(actions: list[dict[str, Any]], matches: dict[str, re.Match[str]]) -> None:
         for action in actions:
             kind = next(iter(action), "")
-            if kind in {"rename", "move", "copy"} and isinstance(action[kind], dict):
+            if kind in {"rename", "move", "copy", "archive", "unarchive"} and isinstance(action[kind], dict):
                 field = "name" if kind == "rename" else "destination"
                 name = action[kind].get(field)
                 if not isinstance(name, str) or not name:

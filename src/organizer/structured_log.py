@@ -78,6 +78,34 @@ class LogEntry:
         return " | ".join(parts)
 
 
+def parse_log_line(line: str) -> LogEntry | None:
+    """Parse a line emitted by ``LogEntry.format_line`` back into a LogEntry.
+
+    Returns None for empty or unparseable lines so callers can skip them.
+    """
+    line = line.strip()
+    if not line:
+        return None
+    parts = line.split(" | ", 7)
+    if len(parts) < 7:
+        return None
+    timestamp, level, watch, rule, action, item, result = parts[:7]
+    detail = parts[7] if len(parts) > 7 else ""
+    try:
+        return LogEntry(
+            timestamp=timestamp,
+            level=LogLevel(level),
+            watch=watch,
+            rule=rule,
+            action=action,
+            item=item,
+            result=LogResult(result),
+            detail=detail,
+        )
+    except ValueError:
+        return None
+
+
 class LogSink(Protocol):
     def write(self, entry: LogEntry) -> None: ...
 
@@ -88,6 +116,11 @@ class MemoryLogSink:
 
     def write(self, entry: LogEntry) -> None:
         self._entries.append(entry)
+
+    def hydrate(self, entries: Sequence[LogEntry]) -> None:
+        """Seed the memory ring with prior entries (e.g. from a persisted file)."""
+        for entry in entries:
+            self.write(entry)
 
     def read_recent(
         self,
@@ -173,6 +206,18 @@ class RotatingFileLogSink:
             stream.write(line)
             stream.flush()
             os.fsync(stream.fileno())
+
+    def read_recent(self, limit: int = 1000) -> list[LogEntry]:
+        """Read the last ``limit`` entries persisted by this sink."""
+        if not self._path.exists():
+            return []
+        entries: list[LogEntry] = []
+        with self._path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                entry = parse_log_line(line)
+                if entry is not None:
+                    entries.append(entry)
+        return entries[-limit:]
 
 
 class StructuredLogger:

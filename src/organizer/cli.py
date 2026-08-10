@@ -79,11 +79,13 @@ def run(
     config = load_config(config_path)
 
     log_level = LogLevel(config.log_level)
+    file_sink = RotatingFileLogSink(config.log_path, retention_days=config.retention_days)
     log_sink = MemoryLogSink(limit=1000)
+    log_sink.hydrate(file_sink.read_recent(1000))
     logger = StructuredLogger(
         sinks=[
             StdoutLogSink(),
-            RotatingFileLogSink(config.log_path, retention_days=config.retention_days),
+            file_sink,
             log_sink,
         ],
         level=log_level,

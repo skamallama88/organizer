@@ -22,6 +22,8 @@ import rarfile  # type: ignore[import-untyped]
 from organizer.structured_log import LogEntry, LogLevel, LogResult, StructuredLogger
 from organizer.operational_health import OperationalHealth
 
+_CAPTURE_SUPPORTED_KINDS = frozenset({"rename", "move", "copy", "archive", "unarchive"})
+
 
 class ExecutionMode(StrEnum):
     APPLY = "apply"
@@ -1318,8 +1320,8 @@ class ItemProcessor:
             condition_patterns[condition_name] = re.compile(pattern_str)
         for action in actions:
             kind = next(iter(action), "")
-            if kind in {"rename", "move", "copy", "archive", "unarchive"} and isinstance(action[kind], dict):
-                field = "name" if kind == "rename" else "destination"
+            if kind in _CAPTURE_SUPPORTED_KINDS and isinstance(action[kind], dict):
+                field = ItemProcessor._capture_field_for(kind)
                 name = action[kind].get(field)
                 if not isinstance(name, str) or not name:
                     raise ValueError(f"{kind} {field} is required")
@@ -1404,8 +1406,8 @@ class ItemProcessor:
     def _validate_action_references(actions: list[dict[str, Any]], matches: dict[str, re.Match[str]]) -> None:
         for action in actions:
             kind = next(iter(action), "")
-            if kind in {"rename", "move", "copy", "archive", "unarchive"} and isinstance(action[kind], dict):
-                field = "name" if kind == "rename" else "destination"
+            if kind in _CAPTURE_SUPPORTED_KINDS and isinstance(action[kind], dict):
+                field = ItemProcessor._capture_field_for(kind)
                 name = action[kind].get(field)
                 if not isinstance(name, str) or not name:
                     raise ValueError(f"{kind} {field} is required")
@@ -1414,9 +1416,15 @@ class ItemProcessor:
                         r"(?:(?:[A-Za-z_][A-Za-z0-9_]*)\.)?\\(?:[1-9][0-9]*|g<[^>]+>)", name
                     ):
                         condition_name, capture = ItemProcessor._split_capture_reference(reference)
+                        if condition_name not in matches:
+                            raise ValueError(f"condition '{condition_name}' not found for capture reference")
                         matches[condition_name].expand(capture)
                 except (IndexError, re.error, ValueError) as error:
                     raise ValueError(f"invalid capture reference: {error}") from error
+
+    @staticmethod
+    def _capture_field_for(kind: str) -> str:
+        return "name" if kind == "rename" else "destination"
 
     @staticmethod
     def _expand_captures(value: str, matches: dict[str, re.Match[str]]) -> str:

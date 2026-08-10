@@ -245,7 +245,11 @@ rules:
 ```
 
 Actions can be chained. Each action receives the primary result of the prior
-action, and direct deletion must be the final action:
+action, and direct deletion must be the final action. Chaining is supported for
+content-preserving follow-ups (`copy`, `rename`, `move`); a removal action
+(`delete` or an `archive`/`unarchive` with `preserve_original: false`) must be
+last in the chain, since a later action cannot act on content that was already
+removed or transformed:
 
 ```yaml
 rules:

@@ -229,3 +229,22 @@ class StructuredLogger:
         if entry.level.priority >= self._level.priority:
             for sink in self._sinks:
                 sink.write(entry)
+
+
+def build_logger(
+    *,
+    log_path: Path,
+    retention_days: int,
+    memory_limit: int = 1000,
+    level: LogLevel = LogLevel.INFO,
+) -> tuple[StructuredLogger, MemoryLogSink]:
+    """Build the shared application logger and its in-memory read-back ring.
+
+    The memory ring is hydrated from the tail of the durable file so recent
+    activity survives a process restart.
+    """
+    file_sink = RotatingFileLogSink(log_path, retention_days=retention_days)
+    memory_sink = MemoryLogSink(limit=memory_limit)
+    memory_sink.hydrate(file_sink.read_recent(memory_limit))
+    logger = StructuredLogger(sinks=[StdoutLogSink(), file_sink, memory_sink], level=level)
+    return logger, memory_sink

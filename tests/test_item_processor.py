@@ -2,6 +2,7 @@ from pathlib import Path
 import errno
 import hashlib
 import os
+import re
 import sqlite3
 import zipfile
 import py7zr
@@ -863,6 +864,35 @@ def test_move_destination_capture_reference_is_validated(tmp_path: Path) -> None
     diagnostics = ItemProcessor.validate_rules_document(rules)
 
     assert any("capture reference" in diagnostic for diagnostic in diagnostics)
+
+
+def test_move_destination_unknown_condition_capture_is_rejected_at_planning(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: move
+    match:
+      field: file_name
+      pattern: '(?P<artist>.+)'
+    actions:
+      - move:
+          destination: '../foo.\\1'
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    with pytest.raises(ValueError, match="condition 'foo' not found"):
+        ItemProcessor._validate_action_references(
+            [{"move": {"destination": "../foo.\\1"}}],
+            {"match": re.compile(r"(?P<artist>.+)").match("movie")},
+        )
+
+    with pytest.raises(ValueError):
+        processor.plan(make_request(watch_root, item, rules))
 
 
 def test_policy_rejects_overlapping_watch_roots_and_config_watch(tmp_path: Path) -> None:

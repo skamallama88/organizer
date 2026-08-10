@@ -73,21 +73,15 @@ def run(
     import uvicorn
     from organizer.operational_health import OperationalHealth
     from organizer.runtime import RuntimeSettings, log_startup_diagnostics
-    from organizer.structured_log import LogLevel, MemoryLogSink, RotatingFileLogSink, StdoutLogSink, StructuredLogger
+    from organizer.structured_log import LogLevel, build_logger
     from organizer.web import create_app
 
     config = load_config(config_path)
 
     log_level = LogLevel(config.log_level)
-    file_sink = RotatingFileLogSink(config.log_path, retention_days=config.retention_days)
-    log_sink = MemoryLogSink(limit=1000)
-    log_sink.hydrate(file_sink.read_recent(1000))
-    logger = StructuredLogger(
-        sinks=[
-            StdoutLogSink(),
-            file_sink,
-            log_sink,
-        ],
+    logger, log_sink = build_logger(
+        log_path=config.log_path,
+        retention_days=config.retention_days,
         level=log_level,
     )
     health_checker = OperationalHealth()

@@ -38,6 +38,21 @@ class RecordingProcessor:
         return None
 
 
+class FlakyProcessor:
+    """Succeeds after ``failures`` raising calls, then records calls normally."""
+
+    def __init__(self, failures: int = 0) -> None:
+        self.failures = failures
+        self.calls: list[tuple[str, Path]] = []
+
+    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+        if self.failures > 0:
+            self.failures -= 1
+            raise sqlite3.OperationalError("database is locked")
+        self.calls.extend((watch.watch_id, item) for item in items)
+        return None
+
+
 def watch(tmp_path: Path) -> WatchFolderConfig:
     root = tmp_path / "watch"
     root.mkdir()
@@ -197,6 +212,45 @@ def test_scanner_processes_root_items_on_interval(tmp_path: Path) -> None:
     asyncio.run(run())
 
     assert processor.calls.count(("incoming", item)) >= 2
+
+
+def test_scanner_survives_a_failed_batch_and_continues(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    item = configured.watch_root / "movie.mkv"
+    item.write_text("movie")
+    processor = FlakyProcessor(failures=1)
+    scanner = PeriodicScanner((configured,), processor, interval_seconds=0.01)
+
+    async def run() -> None:
+        task = asyncio.create_task(scanner.run())
+        await asyncio.sleep(0.035)
+        scanner.stop()
+        await task
+
+    asyncio.run(run())
+
+    assert processor.failures == 0
+    assert processor.calls.count(("incoming", item)) >= 1
+
+
+def test_daemon_respawns_crashed_task(tmp_path: Path) -> None:
+    daemon = OrganizerDaemon([], RecordingProcessor(), scanner_interval=60)
+    daemon._respawn_delay_seconds = 0.01
+    attempts = 0
+
+    async def flaky() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("boom")
+
+    async def run() -> None:
+        daemon._spawn(flaky, "test")
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+
+    assert attempts >= 2
 
 
 def test_daemon_stops_services_and_server(tmp_path: Path) -> None:

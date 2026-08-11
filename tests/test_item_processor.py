@@ -17,6 +17,7 @@ import pytest
 
 from organizer.item_processor import (
     _AttemptStore,
+    _open_attempts_db,
     BatchItemStatus,
     BoundaryPolicy,
     ExecutionMode,
@@ -95,6 +96,20 @@ def test_copy_preserves_file_mode_and_reports_unsupported_metadata_warning(tmp_p
     assert report.warnings == (
         "ownership, ACLs, extended attributes, and platform-specific metadata are not guaranteed to be preserved",
     )
+
+
+def test_attempt_store_enables_wal_and_busy_timeout(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    _AttemptStore(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+
+    with _open_attempts_db(db_path) as connection:
+        busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert journal_mode == "wal"
+    assert busy_timeout >= 30_000
 
 
 def test_quarantine_preserves_folder_mode(tmp_path: Path) -> None:

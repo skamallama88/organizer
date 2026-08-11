@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Any, Callable, Coroutine, Protocol, Sequence
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -18,6 +19,8 @@ from organizer.item_processor import (
     ItemSnapshot,
 )
 from organizer.retention import Retention
+
+logger = logging.getLogger(__name__)
 
 
 class BatchProcessor(Protocol):
@@ -236,9 +239,12 @@ class PeriodicScanner:
     async def run(self) -> None:
         while not self._stop_event.is_set():
             for watch in self._watches:
-                if watch.watch_root.is_dir():
-                    items = [path for path in watch.watch_root.rglob("*") if not path.name.startswith(".organizer-")]
-                    self._processor.process_batch(watch, items)
+                try:
+                    if watch.watch_root.is_dir():
+                        items = [path for path in watch.watch_root.rglob("*") if not path.name.startswith(".organizer-")]
+                        self._processor.process_batch(watch, items)
+                except Exception as error:  # noqa: BLE001 — never let one batch kill the task
+                    logger.exception("scan of watch %s failed: %s", watch.watch_id, error)
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self._interval_seconds)
             except asyncio.TimeoutError:
@@ -299,6 +305,7 @@ class OrganizerDaemon:
         self._flush_task: asyncio.Task[None] | None = None
         self._retention_task: asyncio.Task[None] | None = None
         self._stopped = False
+        self._respawn_delay_seconds = 30
 
     @property
     def stopped(self) -> bool:
@@ -329,14 +336,52 @@ class OrganizerDaemon:
 
     def start(self) -> None:
         self.watcher.start()
-        self._scanner_task = asyncio.create_task(self.scanner.run())
-        self._flush_task = asyncio.create_task(self._flush_watcher())
+        self._scanner_task = self._spawn(self.scanner.run, "scanner")
+        self._flush_task = self._spawn(self._flush_watcher, "flush")
         if self.retention is not None:
-            self._retention_task = asyncio.create_task(self.retention.run())
+            self._retention_task = self._spawn(self.retention.run, "retention")
+
+    def _spawn(self, coro_factory: Callable[[], Coroutine[Any, Any, None]], name: str) -> asyncio.Task[None]:
+        """Create a named task that logs and auto-respawns if it ever dies."""
+        task: asyncio.Task[None] = asyncio.create_task(coro_factory())
+        task.set_name(name)
+        task.add_done_callback(
+            lambda t: self._on_task_done(t, name, coro_factory)
+        )
+        return task
+
+    def _on_task_done(self, task: asyncio.Task[None], name: str, coro_factory: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        logger.error("daemon task %s crashed: %r — respawning in %.0fs", name, error, self._respawn_delay_seconds)
+        if self._stopped:
+            return
+
+        def _respawn() -> None:
+            if self._stopped:
+                return
+            replacement = self._spawn(coro_factory, name)
+            self._remember_task(name, replacement)
+
+        asyncio.get_running_loop().call_later(self._respawn_delay_seconds, _respawn)
+
+    def _remember_task(self, name: str, task: asyncio.Task[None]) -> None:
+        if name == "scanner":
+            self._scanner_task = task
+        elif name == "flush":
+            self._flush_task = task
+        elif name == "retention":
+            self._retention_task = task
 
     async def _flush_watcher(self) -> None:
         while not self._stopped:
-            self.watcher.flush()
+            try:
+                self.watcher.flush()
+            except Exception as error:  # noqa: BLE001 — never let one flush kill the task
+                logger.exception("watcher flush failed: %s", error)
             await asyncio.sleep(0.1)
 
     async def stop_async(self) -> None:

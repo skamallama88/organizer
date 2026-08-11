@@ -35,7 +35,7 @@ from organizer.config import (
 )
 from organizer.daemon import WatchMutator, effective_stability_interval
 from organizer.item_processor import BoundaryPolicy, ItemProcessor, ItemSnapshot
-from organizer.operational_health import OperationalHealth
+from organizer.operational_health import DaemonHealthSource, OperationalHealth
 from organizer.structured_log import LogLevel, MemoryLogSink
 
 __all__ = ["WatchFolderConfig", "create_app"]
@@ -190,6 +190,7 @@ def create_app(
     watch_mutator: WatchMutator | None = None,
     config_path: Path | None = None,
     stability_interval: float = 0.0,
+    daemon_health: DaemonHealthSource | None = None,
 ) -> FastAPI:
     app = FastAPI()
     app.mount("/static", StaticFiles(directory=_WEB_ROOT / "static"), name="static")
@@ -1199,7 +1200,20 @@ def create_app(
         folder_tuples = [
             (config.watch_id, config.watch_root) for config in watches
         ]
-        overall = health_checker.check_all(watch_folders=folder_tuples, db_path=db_path)
+        overall = health_checker.check_all(
+            watch_folders=folder_tuples,
+            db_path=db_path,
+            daemon=daemon_health,
+        )
+        daemon_payload: dict[str, object] | None = None
+        if overall.daemon_health is not None:
+            daemon_payload = {
+                "scanner_alive": overall.daemon_health.scanner_alive,
+                "last_scan_at": overall.daemon_health.last_scan_at,
+                "last_scan_error": overall.daemon_health.last_scan_error,
+                "crash_count": overall.daemon_health.crash_count,
+                "last_crash": overall.daemon_health.last_crash,
+            }
         return {
             "all_healthy": overall.all_healthy,
             "watch_folder_healths": [
@@ -1214,6 +1228,7 @@ def create_app(
                 "tracking_db_writable": overall.persistence_health.tracking_db_writable,
                 "detail": overall.persistence_health.detail,
             },
+            "daemon_health": daemon_payload,
         }
 
     @app.post("/watches", response_model=None)

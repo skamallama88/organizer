@@ -9,6 +9,8 @@ from typing import Any
 
 from organizer.config import WatchFolderConfig
 from organizer.daemon import (
+    DaemonHealthState,
+    DaemonTask,
     DaemonWatchMutator,
     OrganizerDaemon,
     PeriodicScanner,
@@ -27,6 +29,7 @@ from organizer.item_processor import (
     ItemProcessor,
 )
 from organizer.retention import Retention
+from organizer.structured_log import LogLevel, MemoryLogSink, StructuredLogger
 
 
 class RecordingProcessor:
@@ -36,6 +39,26 @@ class RecordingProcessor:
     def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
         self.calls.extend((watch.watch_id, item) for item in items)
         return None
+
+
+class FlakyProcessor:
+    """Succeeds after ``failures`` raising calls, then records calls normally."""
+
+    def __init__(self, failures: int = 0) -> None:
+        self.failures = failures
+        self.calls: list[tuple[str, Path]] = []
+
+    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+        if self.failures > 0:
+            self.failures -= 1
+            raise sqlite3.OperationalError("database is locked")
+        self.calls.extend((watch.watch_id, item) for item in items)
+        return None
+
+
+class AlwaysFailProcessor:
+    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+        raise sqlite3.OperationalError("database is locked")
 
 
 def watch(tmp_path: Path) -> WatchFolderConfig:
@@ -197,6 +220,125 @@ def test_scanner_processes_root_items_on_interval(tmp_path: Path) -> None:
     asyncio.run(run())
 
     assert processor.calls.count(("incoming", item)) >= 2
+
+
+def test_scanner_survives_a_failed_batch_and_continues(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    item = configured.watch_root / "movie.mkv"
+    item.write_text("movie")
+    processor = FlakyProcessor(failures=1)
+    scanner = PeriodicScanner((configured,), processor, interval_seconds=0.01)
+
+    async def run() -> None:
+        task = asyncio.create_task(scanner.run())
+        await asyncio.sleep(0.035)
+        scanner.stop()
+        await task
+
+    asyncio.run(run())
+
+    assert processor.failures == 0
+    assert processor.calls.count(("incoming", item)) >= 1
+
+
+def test_scanner_failure_emits_structured_log_and_records_health(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    processor = AlwaysFailProcessor()
+    sink = MemoryLogSink()
+    logger = StructuredLogger(sinks=[sink], level=LogLevel.ERROR)
+    health = DaemonHealthState()
+    scanner = PeriodicScanner(
+        (configured,),
+        processor,
+        interval_seconds=0.01,
+        logger=logger,
+        health=health,
+    )
+
+    async def run() -> None:
+        task = asyncio.create_task(scanner.run())
+        await asyncio.sleep(0.025)
+        scanner.stop()
+        await task
+
+    asyncio.run(run())
+
+    entries = sink.read_recent()
+    assert len(entries) >= 1
+    assert entries[0].level == LogLevel.ERROR
+    assert entries[0].action == "scan"
+    assert "database is locked" in entries[0].detail
+    assert health.last_scan_error.startswith("OperationalError")
+    assert health.scanner_alive is True
+
+
+def test_daemon_health_surfaces_last_scan_error(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    processor = AlwaysFailProcessor()
+    daemon = OrganizerDaemon(
+        [configured],
+        processor,
+        scanner_interval=0.01,
+        logger=StructuredLogger(),
+    )
+
+    async def run() -> None:
+        daemon.start()
+        await asyncio.sleep(0.04)
+        daemon.scanner.stop()
+        await daemon._scanner_task
+
+    asyncio.run(run())
+
+    health = daemon.daemon_health()
+    assert health.scanner_alive is True
+    assert health.last_scan_error != ""
+    assert "OperationalError" in health.last_scan_error
+
+
+def test_daemon_respawns_crashed_task(tmp_path: Path) -> None:
+    daemon = OrganizerDaemon([], RecordingProcessor(), scanner_interval=60)
+    daemon._respawn_delay_seconds = 0.01
+    attempts = 0
+
+    async def flaky() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("boom")
+
+    async def run() -> None:
+        daemon._spawn(flaky, DaemonTask.SCANNER)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+
+    assert attempts >= 2
+
+
+def test_flush_watcher_backs_off_on_repeated_failures(tmp_path: Path, monkeypatch: Any) -> None:
+    configured = watch(tmp_path)
+    daemon = OrganizerDaemon([configured], RecordingProcessor(), scanner_interval=60)
+
+    def _always_fail() -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(daemon.watcher, "flush", _always_fail)
+    recorded: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        recorded.append(delay)
+        if len(recorded) >= 4:
+            daemon._stopped = True
+
+    monkeypatch.setattr("organizer.daemon.asyncio.sleep", fake_sleep)
+
+    async def run() -> None:
+        await daemon._flush_watcher()
+
+    asyncio.run(run())
+
+    assert recorded[:4] == [0.1, 0.2, 0.4, 0.8]
 
 
 def test_daemon_stops_services_and_server(tmp_path: Path) -> None:

@@ -90,7 +90,7 @@ def run(
         logger=logger,
         health_checker=health_checker,
     )
-    daemon = create_daemon(config, processor, retention_days=config.retention_days, retention_interval=config.retention_interval)
+    daemon = create_daemon(config, processor, retention_days=config.retention_days, retention_interval=config.retention_interval, logger=logger)
     app = create_app(
         processor,
         log_sink=log_sink,
@@ -100,6 +100,7 @@ def run(
         watch_mutator=DaemonWatchMutator(daemon),
         config_path=config_path,
         stability_interval=float(config.stability_interval),
+        daemon_health=daemon,
     )
     settings = RuntimeSettings.from_environment()
     log_startup_diagnostics(settings, logging.getLogger("organizer"))

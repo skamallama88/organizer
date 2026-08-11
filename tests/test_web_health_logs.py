@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 from organizer.item_processor import ItemProcessor
-from organizer.operational_health import OperationalHealth
+from organizer.operational_health import DaemonTaskHealth, OperationalHealth
 from organizer.structured_log import LogEntry, LogLevel, LogResult, MemoryLogSink, StructuredLogger
 from organizer.config import WatchFolderConfig
 from organizer.web import create_app
@@ -192,6 +192,72 @@ def test_health_endpoint_returns_overall_status(tmp_path: Path) -> None:
     assert data["watch_folder_healths"][0]["watch_id"] == "downloads"
     assert data["watch_folder_healths"][0]["accessible"] is True
     assert data["persistence_health"]["tracking_db_writable"] is True
+
+
+class FakeDaemonHealth:
+    def __init__(self, daemon_health: DaemonTaskHealth) -> None:
+        self._daemon_health = daemon_health
+
+    def daemon_health(self) -> DaemonTaskHealth:
+        return self._daemon_health
+
+
+def test_health_endpoint_surfaces_daemon_task_state(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    db_path = tmp_path / "attempts.db"
+    health_checker = OperationalHealth()
+    processor = ItemProcessor(db_path, health_checker=health_checker)
+    daemon_health = FakeDaemonHealth(
+        DaemonTaskHealth(
+            scanner_alive=True,
+            last_scan_at="2026-08-11T22:00:00+00:00",
+            last_scan_error="OperationalError: database is locked",
+            crash_count=2,
+            last_crash="scanner crashed: OperationalError: database is locked",
+        )
+    )
+    app = create_app(
+        processor,
+        health_checker=health_checker,
+        watch_folders=[WatchFolderConfig(watch_id="downloads", watch_root=watch_root, rules_path=watch_root / "rules.yaml")],
+        db_path=db_path,
+        daemon_health=daemon_health,
+    )
+    client = TestClient(app)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["daemon_health"]["scanner_alive"] is True
+    assert "database is locked" in data["daemon_health"]["last_scan_error"]
+    assert data["daemon_health"]["crash_count"] == 2
+    assert data["all_healthy"] is True
+
+
+def test_health_endpoint_marks_unhealthy_when_scanner_dead(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    db_path = tmp_path / "attempts.db"
+    health_checker = OperationalHealth()
+    processor = ItemProcessor(db_path, health_checker=health_checker)
+    daemon_health = FakeDaemonHealth(DaemonTaskHealth(scanner_alive=False))
+    app = create_app(
+        processor,
+        health_checker=health_checker,
+        watch_folders=[WatchFolderConfig(watch_id="downloads", watch_root=watch_root, rules_path=watch_root / "rules.yaml")],
+        db_path=db_path,
+        daemon_health=daemon_health,
+    )
+    client = TestClient(app)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["daemon_health"]["scanner_alive"] is False
+    assert data["all_healthy"] is False
 
 
 def test_health_endpoint_reports_unhealthy_watch_folder(tmp_path: Path) -> None:

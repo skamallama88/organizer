@@ -24,6 +24,20 @@ from organizer.operational_health import OperationalHealth
 
 _CAPTURE_SUPPORTED_KINDS = frozenset({"rename", "move", "copy", "archive", "unarchive"})
 
+_DB_BUSY_TIMEOUT_MS = 30_000
+
+
+def _open_attempts_db(path: Path) -> sqlite3.Connection:
+    """Open the attempts DB with WAL-friendly settings.
+
+    A generous ``timeout``/``busy_timeout`` lets a scanner tick or web request
+    wait out a concurrent write burst instead of failing immediately with
+    ``sqlite3.OperationalError: database is locked``.
+    """
+    connection = sqlite3.connect(path, timeout=30)
+    connection.execute("PRAGMA busy_timeout=%d" % _DB_BUSY_TIMEOUT_MS)
+    return connection
+
 
 class ExecutionMode(StrEnum):
     APPLY = "apply"
@@ -155,9 +169,13 @@ class _AttemptStore:
         self._attempts_path = attempts_path
         self.initialize()
 
+    def _connect(self) -> sqlite3.Connection:
+        return _open_attempts_db(self._attempts_path)
+
     def initialize(self) -> None:
         self._attempts_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS processing_attempts (
                 attempt_id TEXT PRIMARY KEY,
@@ -226,7 +244,7 @@ class _AttemptStore:
             for action in plan.actions
         ])
         started_at = str(time.time())
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             connection.execute(
                 "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, copy_provenance, source_fingerprint, retry_of_attempt_id, processing_lineage, planned_actions, source_size, source_mtime, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (attempt_id, plan.watch_id, str(plan.source), plan.rule_name, "started", "[]", None, plan.source_fingerprint, retry_of_attempt_id, json.dumps(list(plan.processing_lineage)), planned_actions, plan.source_size, plan.source_mtime, started_at),
@@ -238,7 +256,7 @@ class _AttemptStore:
         action_results = json.dumps([{"kind": result.kind, "target": str(result.target), "result": result.result, "detail": result.detail, "source": str(result.source) if result.source else None, "resulting_path": str(result.resulting_path) if result.resulting_path else None} for result in results])
         failure_detail = results[-1].detail if status == "failed" and results else ""
         completed_at = str(time.time())
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             connection.execute(
                 "UPDATE processing_attempts SET status = ?, resulting_paths = ?, copy_provenance = ?, action_results = ?, failure_detail = ?, processing_lineage = ?, completed_at = ? WHERE attempt_id = ?",
                 (status, json.dumps(paths), provenance, action_results, failure_detail, json.dumps(list(processing_lineage)), completed_at, attempt_id),
@@ -247,7 +265,7 @@ class _AttemptStore:
     def acquire_lease(self, watch_id: str, source: Path, fingerprint: str) -> bool:
         canonical = str(self._canonical_path(source))
         try:
-            with sqlite3.connect(self._attempts_path) as connection:
+            with self._connect() as connection:
                 connection.execute(
                     "INSERT INTO processing_leases (watch_id, source_path, source_fingerprint, attempt_id, acquired_at) VALUES (?, ?, ?, ?, ?)",
                     (watch_id, canonical, fingerprint, "", str(time.time())),
@@ -258,7 +276,7 @@ class _AttemptStore:
 
     def release_lease(self, watch_id: str, source: Path, fingerprint: str) -> None:
         canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             connection.execute(
                 "DELETE FROM processing_leases WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
                 (watch_id, canonical, fingerprint),
@@ -266,7 +284,7 @@ class _AttemptStore:
 
     def has_active_lease(self, watch_id: str, source: Path, fingerprint: str) -> bool:
         canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) FROM processing_leases WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
                 (watch_id, canonical, fingerprint),
@@ -275,7 +293,7 @@ class _AttemptStore:
 
     def has_completed_attempt(self, watch_id: str, source: Path, fingerprint: str) -> bool:
         canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) FROM processing_attempts WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ? AND status = ?",
                 (watch_id, canonical, fingerprint, "completed"),
@@ -284,7 +302,7 @@ class _AttemptStore:
 
     def has_suppressed_attempt(self, watch_id: str, source: Path, fingerprint: str) -> bool:
         canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) FROM processing_suppressions WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
                 (watch_id, canonical, fingerprint),
@@ -293,7 +311,7 @@ class _AttemptStore:
 
     def create_suppression(self, watch_id: str, source: Path, fingerprint: str, attempt_id: str, reason: str) -> None:
         canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO processing_suppressions (watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason) VALUES (?, ?, ?, ?, ?, ?)",
                 (watch_id, canonical, fingerprint, attempt_id, str(time.time()), reason),
@@ -301,14 +319,14 @@ class _AttemptStore:
 
     def clear_suppression(self, watch_id: str, source: Path, fingerprint: str) -> None:
         canonical = str(self._canonical_path(source))
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             connection.execute(
                 "DELETE FROM processing_suppressions WHERE watch_id = ? AND source_path = ? AND source_fingerprint = ?",
                 (watch_id, canonical, fingerprint),
             )
 
     def list_attempts(self) -> list[dict[str, object]]:
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             rows = connection.execute(
                 "SELECT status, resulting_paths, copy_provenance, failure_detail, retry_of_attempt_id, processing_lineage FROM processing_attempts ORDER BY rowid"
             ).fetchall()
@@ -328,7 +346,7 @@ class _AttemptStore:
         return result
 
     def list_suppressions(self) -> list[dict[str, object]]:
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             rows = connection.execute(
                 "SELECT watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason FROM processing_suppressions ORDER BY suppressed_at"
             ).fetchall()
@@ -345,7 +363,7 @@ class _AttemptStore:
         ]
 
     def record_audit_event(self, attempt_id: str, command: str, detail: str) -> None:
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT audit_events FROM processing_attempts WHERE attempt_id = ?",
                 (attempt_id,),
@@ -360,7 +378,7 @@ class _AttemptStore:
             )
 
     def record_accepted_result(self, attempt_id: str, entry: dict[str, object], command: str) -> None:
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT accepted_results, audit_events FROM processing_attempts WHERE attempt_id = ?",
                 (attempt_id,),
@@ -378,7 +396,7 @@ class _AttemptStore:
 
     def is_stable(self, watch_id: str, snapshot: ItemSnapshot, *, now: float, stability_interval: float) -> bool:
         canonical = str(self._canonical_path(snapshot.path))
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT size, mtime, first_seen_at FROM item_observations WHERE watch_id = ? AND source_path = ?",
                 (watch_id, canonical),
@@ -400,7 +418,7 @@ class _AttemptStore:
 
     def recover_stale_leases(self) -> list[str]:
         recovered: list[str] = []
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             leases = connection.execute(
                 "SELECT watch_id, source_path, source_fingerprint FROM processing_leases"
             ).fetchall()
@@ -422,7 +440,7 @@ class _AttemptStore:
         return recovered
 
     def record_collision_attempt(self, attempt_id: str, watch_id: str, canonical: Path, fingerprint: str, error: Exception) -> None:
-        with sqlite3.connect(self._attempts_path) as connection:
+        with self._connect() as connection:
             connection.execute(
                 "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, action_results, source_fingerprint, failure_detail, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (attempt_id, watch_id, str(canonical), "unknown", "failed", "[]", "[]", fingerprint, str(error), str(time.time())),
@@ -430,7 +448,7 @@ class _AttemptStore:
 
     def check_writable(self) -> bool:
         try:
-            with sqlite3.connect(self._attempts_path) as connection:
+            with self._connect() as connection:
                 connection.execute("SELECT 1")
             return True
         except sqlite3.OperationalError:
@@ -1592,7 +1610,7 @@ class ItemProcessor:
         rules_path: Path,
         boundary_policy: BoundaryPolicy | None = None,
     ) -> ExecutionReport:
-        with sqlite3.connect(self._attempts_path) as connection:
+        with _open_attempts_db(self._attempts_path) as connection:
             row = connection.execute(
                 "SELECT watch_id, source_path, source_fingerprint, status FROM processing_attempts WHERE attempt_id = ?",
                 (attempt_id,),

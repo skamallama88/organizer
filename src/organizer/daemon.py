@@ -5,6 +5,8 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Protocol, Sequence
 
@@ -18,9 +20,61 @@ from organizer.item_processor import (
     ItemProcessor,
     ItemSnapshot,
 )
+from organizer.operational_health import DaemonTaskHealth
 from organizer.retention import Retention
+from organizer.structured_log import LogEntry, LogLevel, LogResult, StructuredLogger
 
 logger = logging.getLogger(__name__)
+
+
+class DaemonTask(StrEnum):
+    """Named background tasks run by :class:`OrganizerDaemon`."""
+
+    SCANNER = "scanner"
+    FLUSH = "flush"
+    RETENTION = "retention"
+
+
+_TASK_ATTRS: dict[DaemonTask, str] = {
+    DaemonTask.SCANNER: "_scanner_task",
+    DaemonTask.FLUSH: "_flush_task",
+    DaemonTask.RETENTION: "_retention_task",
+}
+
+_FLUSH_BACKOFF_BASE = 0.1
+_FLUSH_BACKOFF_MAX = 30.0
+
+
+class DaemonHealthState:
+    """Mutable liveness + recent-failure state for the daemon's background tasks.
+
+    Read by ``OrganizerDaemon.daemon_health()`` which projects it into the
+    immutable ``DaemonTaskHealth`` surfaced through ``/health``.
+    """
+
+    def __init__(self) -> None:
+        self.scanner_alive = True
+        self.last_scan_at = ""
+        self.last_scan_error = ""
+        self.crash_count = 0
+        self.last_crash = ""
+
+    def record_scan_ok(self) -> None:
+        self.last_scan_at = datetime.now(timezone.utc).isoformat()
+        self.last_scan_error = ""
+
+    def record_scan_error(self, error: Exception) -> None:
+        self.last_scan_error = f"{type(error).__name__}: {error}"
+
+    def record_crash(self, name: DaemonTask, error: BaseException) -> None:
+        self.crash_count += 1
+        self.last_crash = f"{name.value} crashed: {type(error).__name__}: {error}"
+        if name == DaemonTask.SCANNER:
+            self.scanner_alive = False
+
+    def record_respawn(self, name: DaemonTask) -> None:
+        if name == DaemonTask.SCANNER:
+            self.scanner_alive = True
 
 
 class BatchProcessor(Protocol):
@@ -230,21 +284,56 @@ class _WatchdogHandler(FileSystemEventHandler):
 
 
 class PeriodicScanner:
-    def __init__(self, watches: Sequence[WatchFolderConfig], processor: BatchProcessor, interval_seconds: float = 300) -> None:
+    def __init__(
+        self,
+        watches: Sequence[WatchFolderConfig],
+        processor: BatchProcessor,
+        interval_seconds: float = 300,
+        logger: StructuredLogger | None = None,
+        health: DaemonHealthState | None = None,
+    ) -> None:
         self._watches = list(watches)
         self._processor = processor
         self._interval_seconds = interval_seconds
         self._stop_event = asyncio.Event()
+        self._logger = logger
+        self._health = health
+
+    def _log_scan_failure(self, watch_id: str, error: Exception) -> None:
+        if self._health is not None:
+            self._health.record_scan_error(error)
+        if self._logger is not None:
+            self._logger.log(
+                LogEntry.create(
+                    level=LogLevel.ERROR,
+                    watch=watch_id,
+                    rule="",
+                    action="scan",
+                    item="",
+                    result=LogResult.FAILED,
+                    detail=f"scan failed: {type(error).__name__}: {error}",
+                )
+            )
 
     async def run(self) -> None:
+        """Periodically scan each watch root for new items.
+
+        The per-batch ``try/except`` is the PRIMARY resilience guard: one bad
+        batch (e.g. a transient ``database is locked``) is logged and the loop
+        simply continues on the next tick. The task only dies if something
+        escapes this loop body, which ``OrganizerDaemon._on_task_done`` treats
+        as a crash and respawns.
+        """
         while not self._stop_event.is_set():
             for watch in self._watches:
                 try:
                     if watch.watch_root.is_dir():
                         items = [path for path in watch.watch_root.rglob("*") if not path.name.startswith(".organizer-")]
                         self._processor.process_batch(watch, items)
+                        if self._health is not None:
+                            self._health.record_scan_ok()
                 except Exception as error:  # noqa: BLE001 — never let one batch kill the task
-                    logger.exception("scan of watch %s failed: %s", watch.watch_id, error)
+                    self._log_scan_failure(watch.watch_id, error)
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self._interval_seconds)
             except asyncio.TimeoutError:
@@ -296,16 +385,33 @@ class OrganizerDaemon:
     processor: BatchProcessor
     scanner_interval: float = 300
     retention: RetentionService | None = None
+    logger: StructuredLogger | None = None
 
     def __post_init__(self) -> None:
         self.watches = list(self.watches)
+        self.health = DaemonHealthState()
         self.watcher = WatcherService(self.watches, self.processor)
-        self.scanner = PeriodicScanner(self.watches, self.processor, self.scanner_interval)
+        self.scanner = PeriodicScanner(
+            self.watches,
+            self.processor,
+            self.scanner_interval,
+            logger=self.logger,
+            health=self.health,
+        )
         self._scanner_task: asyncio.Task[None] | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._retention_task: asyncio.Task[None] | None = None
         self._stopped = False
         self._respawn_delay_seconds = 30
+
+    def daemon_health(self) -> DaemonTaskHealth:
+        return DaemonTaskHealth(
+            scanner_alive=self.health.scanner_alive,
+            last_scan_at=self.health.last_scan_at,
+            last_scan_error=self.health.last_scan_error,
+            crash_count=self.health.crash_count,
+            last_crash=self.health.last_crash,
+        )
 
     @property
     def stopped(self) -> bool:
@@ -336,52 +442,97 @@ class OrganizerDaemon:
 
     def start(self) -> None:
         self.watcher.start()
-        self._scanner_task = self._spawn(self.scanner.run, "scanner")
-        self._flush_task = self._spawn(self._flush_watcher, "flush")
+        self._scanner_task = self._spawn(self.scanner.run, DaemonTask.SCANNER)
+        self._flush_task = self._spawn(self._flush_watcher, DaemonTask.FLUSH)
         if self.retention is not None:
-            self._retention_task = self._spawn(self.retention.run, "retention")
+            self._retention_task = self._spawn(self.retention.run, DaemonTask.RETENTION)
 
-    def _spawn(self, coro_factory: Callable[[], Coroutine[Any, Any, None]], name: str) -> asyncio.Task[None]:
-        """Create a named task that logs and auto-respawns if it ever dies."""
+    def _spawn(self, coro_factory: Callable[[], Coroutine[Any, Any, None]], name: DaemonTask) -> asyncio.Task[None]:
+        """Create a named task that logs and auto-respawns if it ever dies.
+
+        This is a DEFENSIVE safety net. The loop bodies (scanner ``run`` and
+        ``_flush_watcher``) already catch per-batch/per-flush failures, so a
+        task normally exits cleanly on stop; this respawn only fires for a
+        crash that escapes those hardened bodies.
+        """
         task: asyncio.Task[None] = asyncio.create_task(coro_factory())
-        task.set_name(name)
+        task.set_name(name.value)
         task.add_done_callback(
             lambda t: self._on_task_done(t, name, coro_factory)
         )
         return task
 
-    def _on_task_done(self, task: asyncio.Task[None], name: str, coro_factory: Callable[[], Coroutine[Any, Any, None]]) -> None:
+    def _on_task_done(self, task: asyncio.Task[None], name: DaemonTask, coro_factory: Callable[[], Coroutine[Any, Any, None]]) -> None:
         if task.cancelled():
             return
         error = task.exception()
         if error is None:
             return
-        logger.error("daemon task %s crashed: %r — respawning in %.0fs", name, error, self._respawn_delay_seconds)
+        self._log_task_crash(name, error)
         if self._stopped:
             return
 
         def _respawn() -> None:
             if self._stopped:
                 return
+            self.health.record_respawn(name)
             replacement = self._spawn(coro_factory, name)
             self._remember_task(name, replacement)
 
         asyncio.get_running_loop().call_later(self._respawn_delay_seconds, _respawn)
 
-    def _remember_task(self, name: str, task: asyncio.Task[None]) -> None:
-        if name == "scanner":
-            self._scanner_task = task
-        elif name == "flush":
-            self._flush_task = task
-        elif name == "retention":
-            self._retention_task = task
+    def _log_task_crash(self, name: DaemonTask, error: BaseException) -> None:
+        self.health.record_crash(name, error)
+        detail = f"daemon task {name.value} crashed: {type(error).__name__}: {error} — respawning in {self._respawn_delay_seconds:.0f}s"
+        if self.logger is not None:
+            self.logger.log(
+                LogEntry.create(
+                    level=LogLevel.ERROR,
+                    watch="",
+                    rule="",
+                    action=f"daemon.{name.value}",
+                    item="",
+                    result=LogResult.FAILED,
+                    detail=detail,
+                )
+            )
+        else:
+            logger.error("%s", detail)
+
+    def _remember_task(self, name: DaemonTask, task: asyncio.Task[None]) -> None:
+        attr = _TASK_ATTRS.get(name)
+        if attr is not None:
+            setattr(self, attr, task)
+
+    def _log_flush_failure(self, error: Exception) -> None:
+        detail = f"watcher flush failed: {type(error).__name__}: {error}"
+        if self.logger is not None:
+            self.logger.log(
+                LogEntry.create(
+                    level=LogLevel.ERROR,
+                    watch="",
+                    rule="",
+                    action="flush",
+                    item="",
+                    result=LogResult.FAILED,
+                    detail=detail,
+                )
+            )
+        else:
+            logger.error("%s", detail)
 
     async def _flush_watcher(self) -> None:
+        consecutive_failures = 0
         while not self._stopped:
             try:
                 self.watcher.flush()
+                consecutive_failures = 0
             except Exception as error:  # noqa: BLE001 — never let one flush kill the task
-                logger.exception("watcher flush failed: %s", error)
+                consecutive_failures += 1
+                self._log_flush_failure(error)
+                backoff = min(_FLUSH_BACKOFF_MAX, _FLUSH_BACKOFF_BASE * (2 ** (consecutive_failures - 1)))
+                await asyncio.sleep(backoff)
+                continue
             await asyncio.sleep(0.1)
 
     async def stop_async(self) -> None:
@@ -419,6 +570,7 @@ def create_daemon(
     processor: ItemProcessor,
     retention_days: int | None = None,
     retention_interval: float | None = None,
+    logger: StructuredLogger | None = None,
 ) -> OrganizerDaemon:
     retention_service: RetentionService | None = None
     if retention_days is not None and retention_days > 0:
@@ -432,6 +584,7 @@ def create_daemon(
         ProcessorBatchAdapter(processor, float(config.stability_interval)),
         config.scan_interval,
         retention=retention_service,
+        logger=logger,
     )
 
 

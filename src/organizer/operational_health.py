@@ -4,6 +4,7 @@ import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 
 @dataclass(frozen=True)
@@ -20,10 +21,36 @@ class PersistenceHealth:
 
 
 @dataclass(frozen=True)
+class DaemonTaskHealth:
+    """Liveness and recent-failure state of the background daemon tasks.
+
+    Surfaced in ``/health`` so a crashed or erroring scanner/flush task is
+    visible even though the process keeps running.
+    """
+
+    scanner_alive: bool
+    last_scan_at: str = ""
+    last_scan_error: str = ""
+    crash_count: int = 0
+    last_crash: str = ""
+
+
+class DaemonHealthSource(Protocol):
+    """Duck-typed provider of daemon task health (implemented by OrganizerDaemon).
+
+    Defined here rather than importing the daemon to avoid a circular import
+    (daemon -> item_processor -> operational_health).
+    """
+
+    def daemon_health(self) -> DaemonTaskHealth: ...
+
+
+@dataclass(frozen=True)
 class OverallHealth:
     all_healthy: bool
     watch_folder_healths: tuple[WatchFolderHealth, ...]
     persistence_health: PersistenceHealth
+    daemon_health: DaemonTaskHealth | None = None
 
 
 class OperationalHealth:
@@ -76,18 +103,22 @@ class OperationalHealth:
         self,
         watch_folders: list[tuple[str, Path]],
         db_path: Path,
+        daemon: DaemonHealthSource | None = None,
     ) -> OverallHealth:
         watch_healths = tuple(
             self.check_watch_folder(watch_id, root)
             for watch_id, root in watch_folders
         )
         persistence = self.check_persistence(db_path)
+        daemon_health = daemon.daemon_health() if daemon is not None else None
         all_healthy = (
             all(h.accessible for h in watch_healths)
             and persistence.tracking_db_writable
+            and (daemon_health is None or daemon_health.scanner_alive)
         )
         return OverallHealth(
             all_healthy=all_healthy,
             watch_folder_healths=watch_healths,
             persistence_health=persistence,
+            daemon_health=daemon_health,
         )

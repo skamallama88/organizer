@@ -4,14 +4,12 @@ from organizer.item_processor import ItemProcessor
 from organizer.config import load_config
 from organizer.operational_health import OperationalHealth
 from organizer.runtime import RuntimeSettings, log_startup_diagnostics
-from organizer.structured_log import MemoryLogSink, RotatingFileLogSink, StdoutLogSink, StructuredLogger
+from organizer.structured_log import build_logger
 from organizer.web import create_app
 
 config = load_config()
 db_path = config.database_path
-log_path = config.log_path
-log_sink = MemoryLogSink(limit=1000)
-logger = StructuredLogger(sinks=[StdoutLogSink(), RotatingFileLogSink(log_path, retention_days=config.retention_days), log_sink])
+logger, log_sink = build_logger(log_path=config.log_path, retention_days=config.retention_days)
 health_checker = OperationalHealth()
 
 app = create_app(

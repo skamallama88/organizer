@@ -2,6 +2,7 @@ from pathlib import Path
 import errno
 import hashlib
 import os
+import re
 import sqlite3
 import zipfile
 import py7zr
@@ -865,6 +866,35 @@ def test_move_destination_capture_reference_is_validated(tmp_path: Path) -> None
     assert any("capture reference" in diagnostic for diagnostic in diagnostics)
 
 
+def test_move_destination_unknown_condition_capture_is_rejected_at_planning(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: move
+    match:
+      field: file_name
+      pattern: '(?P<artist>.+)'
+    actions:
+      - move:
+          destination: '../foo.\\1'
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    with pytest.raises(ValueError, match="condition 'foo' not found"):
+        ItemProcessor._validate_action_references(
+            [{"move": {"destination": "../foo.\\1"}}],
+            {"match": re.compile(r"(?P<artist>.+)").match("movie")},
+        )
+
+    with pytest.raises(ValueError):
+        processor.plan(make_request(watch_root, item, rules))
+
+
 def test_policy_rejects_overlapping_watch_roots_and_config_watch(tmp_path: Path) -> None:
     data = tmp_path / "data"
     config = tmp_path / "config"
@@ -1238,8 +1268,8 @@ def test_action_chain_uses_primary_result_and_stops_after_failure(tmp_path: Path
     report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
 
     assert report.status == "completed"
-    assert not item.exists()
-    assert (destination / "movie.mkv").exists()
+    assert item.exists()
+    assert not (destination / "movie.mkv").exists()
     assert not (destination / "renamed.mkv").exists()
     assert [result.kind for result in report.actions] == ["copy", "rename", "delete"]
 
@@ -1828,6 +1858,157 @@ def test_unarchive_rejects_zip_symlink_entry(tmp_path: Path) -> None:
 
     assert report.status == "failed"
     assert "symlink" in report.actions[-1].detail
+
+
+def test_archive_stages_on_target_volume_not_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_archive_rules(watch_root / "rules.yaml", "../archives")
+    processor = ItemProcessor(config_dir / "organizer.db")
+    original_publish = ItemProcessor._publish_staged
+    staged_paths: list[Path] = []
+
+    def capture_publish(staging: Path, target: Path) -> None:
+        staged_paths.append(staging)
+        original_publish(staging, target)
+
+    monkeypatch.setattr(ItemProcessor, "_publish_staged", staticmethod(capture_publish))
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    assert report.status == "completed"
+    assert (destination / "movie.mkv.zip").exists()
+    assert staged_paths
+    assert staged_paths[0].parent == destination
+
+
+def test_unarchive_stages_on_target_volume_not_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    watch_root.mkdir()
+    archive = watch_root / "bundle.zip"
+    make_zip(archive, {"folder/file.txt": "content"})
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(config_dir / "organizer.db")
+    original_publish = ItemProcessor._publish_staged
+    staged_paths: list[Path] = []
+
+    def capture_publish(staging: Path, target: Path) -> None:
+        staged_paths.append(staging)
+        original_publish(staging, target)
+
+    monkeypatch.setattr(ItemProcessor, "_publish_staged", staticmethod(capture_publish))
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "completed"
+    assert (watch_root / "bundle" / "folder" / "file.txt").read_text() == "content"
+    assert staged_paths
+    assert staged_paths[0].parent == watch_root
+
+
+def test_unarchive_chained_move_operates_on_extraction(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    processed = tmp_path / "processed"
+    watch_root.mkdir()
+    processed.mkdir()
+    archive = watch_root / "bundle.zip"
+    make_zip(archive, {"folder/file.txt": "content"})
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: extract and sort
+    match:
+      field: file_name
+      pattern: '(?i)\\.zip$'
+    actions:
+      - unarchive:
+          destination: ../staging
+          preserve_original: false
+      - move:
+          destination: ../processed
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "completed"
+    assert not archive.exists()
+    assert not (tmp_path / "staging" / "bundle").exists()
+    assert (processed / "bundle" / "folder" / "file.txt").read_text() == "content"
+
+
+def test_unarchive_destination_capture_expands(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.zip"
+    make_zip(archive, {"file.txt": "content"})
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: extract
+    match:
+      field: file_name
+      pattern: '([a-z]+)\\.zip$'
+    actions:
+      - unarchive:
+          destination: '../\\1'
+"""
+    )
+
+    plan = ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, archive, rules))
+
+    assert plan.actions[0].target == tmp_path / "bundle" / "bundle"
+
+
+def test_archive_destination_capture_expands(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie [finance].mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: archive
+    match:
+      field: file_name
+      pattern: '.*\\[([^]]+)\\].*'
+    actions:
+      - archive:
+          destination: '../\\1'
+"""
+    )
+
+    plan = ItemProcessor(tmp_path / "attempts.db").plan(make_request(watch_root, item, rules))
+
+    assert plan.actions[0].target == tmp_path / "finance" / "movie [finance].mkv.zip"
+
+
+def test_validate_rules_document_rejects_invalid_archive_capture(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: archive
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - archive:
+          destination: '../\\g<missing>'
+"""
+    )
+
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+
+    assert any("capture reference" in diagnostic for diagnostic in diagnostics)
 
 
 def test_ui_rule_save_uses_compare_and_swap_revision(tmp_path: Path) -> None:

@@ -17,6 +17,11 @@ def test_validate_watch_id_rejects_duplicate_ids() -> None:
         validate_watch_id("downloads", ["downloads"])
 
 
+def test_validate_watch_id_rejects_case_insensitive_duplicate_ids() -> None:
+    with pytest.raises(ConfigError, match="duplicate watch id: Downloads"):
+        validate_watch_id("Downloads", ["downloads"])
+
+
 def test_validate_watch_root_rejects_config_volume_and_overlaps(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="config volume"):
         validate_watch_root(tmp_path / "config" / "watch", tmp_path / "config", [tmp_path], [])

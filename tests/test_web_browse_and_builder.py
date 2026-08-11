@@ -126,6 +126,24 @@ def test_browse_lists_directories_only(tmp_path: Path) -> None:
     assert body["parent"] == ""
 
 
+def test_browse_lists_files_with_size_and_mtime(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+    (tmp_path / "notes.txt").write_text("hello")
+    (tmp_path / "subdir").mkdir()
+
+    response = client.get("/browse/tree", params={"path": str(tmp_path)})
+
+    assert response.status_code == 200
+    body = response.json()
+    file_names = [f["name"] for f in body["files"]]
+    assert "notes.txt" in file_names
+    assert "subdir" not in file_names
+    notes = next(f for f in body["files"] if f["name"] == "notes.txt")
+    assert notes["size"] == 5
+    assert isinstance(notes["mtime"], (int, float))
+    assert all(d["name"] != "notes.txt" for d in body["dirs"])
+
+
 def test_browse_defaults_to_first_data_root(tmp_path: Path) -> None:
     client, _ = _make_client(tmp_path)
     (tmp_path / "alpha").mkdir()

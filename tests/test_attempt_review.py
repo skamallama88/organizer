@@ -19,6 +19,7 @@ from organizer.attempt_review import (
 from organizer.item_processor import (
     ItemProcessor,
     ItemSnapshot,
+    iso_timestamp,
 )
 
 
@@ -248,6 +249,14 @@ def test_list_returns_empty_when_no_matches(tmp_path: Path) -> None:
 
     summaries = review.list(AttemptFilters(statuses=("needs-reconciliation",)))
     assert summaries == []
+
+
+def test_iso_timestamp_converts_epoch_string_to_iso(tmp_path: Path) -> None:
+    assert iso_timestamp("") == ""
+    assert iso_timestamp("1786471480.84").endswith("+00:00")
+    assert "T" in iso_timestamp("1786471480.84")
+    assert iso_timestamp("already-iso") == "already-iso"
+    assert iso_timestamp("not-a-number") == "not-a-number"
 
 
 def test_inspect_returns_full_details(tmp_path: Path) -> None:

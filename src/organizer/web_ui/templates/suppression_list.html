@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Suppressed items</h1>
+<form method="get" action="/suppressions" class="filters">
+  <label>Watch <select name="watch_id"><option value="">All watches</option>{% for watch in watches %}<option value="{{ watch.watch_id }}"{% if watch_id == watch.watch_id %} selected{% endif %}>{{ watch.watch_id }}</option>{% endfor %}</select></label>
+  <button type="submit">Filter</button>
+</form>
+{% if suppressions %}<table><thead><tr><th>Source</th><th>Watch</th><th>Reason</th><th>Suppressed at</th><th></th></tr></thead><tbody>
+{% for suppression in suppressions %}<tr><td>{{ suppression.source_path }}</td><td>{{ suppression.watch_id }}</td><td>{{ suppression.reason }}</td><td>{{ suppression.suppressed_at }}</td><td><form method="post" action="/suppressions/{{ suppression.attempt_id }}/clear" hx-post="/suppressions/{{ suppression.attempt_id }}/clear" hx-target="#command-feedback"><input type="hidden" name="watch_id" value="{{ suppression.watch_id }}"><input type="hidden" name="source_path" value="{{ suppression.source_path }}"><input type="hidden" name="source_fingerprint" value="{{ suppression.source_fingerprint }}"><button type="submit">Clear</button></form></td></tr>{% endfor %}
+</tbody></table><p id="command-feedback"></p>{% else %}<p>No suppressed items.</p>{% endif %}
+{% endblock %}

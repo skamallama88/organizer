@@ -11,6 +11,7 @@ import time
 import uuid
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,22 @@ from organizer.operational_health import OperationalHealth
 _CAPTURE_SUPPORTED_KINDS = frozenset({"rename", "move", "copy", "archive", "unarchive"})
 
 _DB_BUSY_TIMEOUT_MS = 30_000
+
+
+def iso_timestamp(value: str) -> str:
+    """Normalize a stored timestamp to ISO-8601 UTC.
+
+    Attempt and suppression timestamps were historically persisted as Unix
+    epoch strings (e.g. "1786471480.84"). Convert those to the ISO-8601 format
+    used elsewhere in the API so date filters and consumers behave uniformly.
+    Non-epoch strings are returned unchanged.
+    """
+    if not value:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        return value
 
 
 def _open_attempts_db(path: Path) -> sqlite3.Connection:
@@ -82,6 +99,7 @@ class PlannedAction:
     preserve_original: bool = True
     limits: tuple[int, int, int] = (10000, 1024 * 1024 * 1024, 1024 * 1024 * 1024)
     max_depth: int = 0
+    delete_empty_dirs: bool = False
 
 
 @dataclass(frozen=True)
@@ -356,7 +374,7 @@ class _AttemptStore:
                 "source_path": source_path,
                 "source_fingerprint": source_fingerprint,
                 "attempt_id": attempt_id,
-                "suppressed_at": suppressed_at,
+                "suppressed_at": iso_timestamp(suppressed_at),
                 "reason": reason,
             }
             for watch_id, source_path, source_fingerprint, attempt_id, suppressed_at, reason in rows
@@ -613,9 +631,13 @@ class ItemProcessor:
                 continue
             if kind not in {"move", "copy"} or not isinstance(action.get(kind), dict):
                 raise ValueError(f"rule {rule_name} has unsupported action")
-            destination = action[kind].get("destination")
+            params = action[kind]
+            destination = params.get("destination")
+            delete_empty_dirs = params.get("delete_empty_dirs", False)
             if not isinstance(destination, str) or not destination:
                 raise ValueError(f"rule {rule_name} move destination is required")
+            if not isinstance(delete_empty_dirs, bool):
+                raise ValueError(f"rule {rule_name} delete_empty_dirs must be boolean")
             root = Path(self._expand_captures(destination, matches))
             if not root.is_absolute():
                 root = watch_root / root
@@ -633,7 +655,7 @@ class ItemProcessor:
                 diagnostics.append(f"resulting-path handoff to watch {destination_watch}")
             elif destination_root in {self._canonical_path(root) for root in policy.watch_roots}:
                 diagnostics.append(f"destination is another watch folder: {destination_root}")
-            planned.append(PlannedAction(kind=kind, target=current))
+            planned.append(PlannedAction(kind=kind, target=current, delete_empty_dirs=delete_empty_dirs))
 
         stat = item.stat()
         return Plan(
@@ -835,6 +857,8 @@ class ItemProcessor:
                                 self._finish_attempt(attempt_id, "needs-reconciliation", results, plan.processing_lineage)
                                 self._emit(plan, result)
                                 return ExecutionReport(status="needs-reconciliation", dry_run=False, actions=tuple(results), warnings=warnings)
+                            if action.delete_empty_dirs:
+                                self._prune_empty_ancestors(action_source, plan.watch_root)
                         source = action.target
                         result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
                     results.append(result)
@@ -1245,6 +1269,28 @@ class ItemProcessor:
             raise NeedsReconciliationError(f"source removal uncertain: {error}") from error
 
     @classmethod
+    def _prune_empty_ancestors(cls, source: Path, watch_root: Path | None) -> None:
+        """Remove now-empty ancestor directories of a removed item.
+
+        Walks upward from ``source.parent`` toward (but not including) the watch
+        root, removing each directory once it is empty. Stops at the first
+        non-empty directory. When no watch root is available, does nothing.
+        """
+        if watch_root is None:
+            return
+        root = watch_root.resolve()
+        current = source.parent.resolve()
+        try:
+            while current != root and root in current.parents:
+                try:
+                    current.rmdir()
+                except OSError:
+                    break
+                current = current.parent
+        except OSError:
+            return
+
+    @classmethod
     def validate_rules_document(cls, rules_path: Path, policy: BoundaryPolicy | None = None, watch_root: Path | None = None) -> list[str]:
         """Validate a rules document without requiring an item match.
 
@@ -1613,17 +1659,11 @@ class ItemProcessor:
         rules_path: Path,
         boundary_policy: BoundaryPolicy | None = None,
     ) -> ExecutionReport:
-        with _open_attempts_db(self._attempts_path) as connection:
-            row = connection.execute(
-                "SELECT watch_id, source_path, source_fingerprint, status FROM processing_attempts WHERE attempt_id = ?",
-                (attempt_id,),
-            ).fetchone()
-        if row is None:
-            raise ValueError(f"attempt not found: {attempt_id}")
-        db_watch_id, source_path, source_fingerprint, status = row
+        db_watch_id, source, source_fingerprint, status = self._lookup_attempt(
+            self._attempts_path, attempt_id
+        )
         if status not in ("failed", "needs-reconciliation"):
             raise ValueError(f"attempt {attempt_id} is not retryable: {status}")
-        source = self._canonical_path(Path(source_path))
         request = PlanRequest(
             watch_id=db_watch_id,
             watch_root=self._canonical_path(watch_root),
@@ -1656,6 +1696,45 @@ class ItemProcessor:
         plan = self.plan(request)
         return self.execute(plan)
 
+    def reprocess_attempt(
+        self,
+        attempt_id: str,
+        watch_root: Path,
+        rules_path: Path,
+        boundary_policy: BoundaryPolicy | None = None,
+    ) -> ExecutionReport:
+        """Re-run a completed or suppressed attempt with a fresh plan.
+
+        Unlike ``retry_attempt``, this deliberately has no status gate: stale
+        ``completed`` records from an old rules era and suppressed items should
+        both be re-planned and re-executed so a corrected rule can take effect.
+        """
+        db_watch_id, source, _fingerprint, _status = self._lookup_attempt(
+            self._attempts_path, attempt_id
+        )
+        return self.reprocess_item(
+            watch_id=db_watch_id,
+            watch_root=watch_root,
+            item=source,
+            rules_path=rules_path,
+            boundary_policy=boundary_policy,
+        )
+
+    @staticmethod
+    def _lookup_attempt(
+        attempts_path: Path, attempt_id: str
+    ) -> tuple[str, Path, str, str]:
+        """Resolve an attempt to (watch_id, canonical source, fingerprint, status)."""
+        with _open_attempts_db(attempts_path) as connection:
+            row = connection.execute(
+                "SELECT watch_id, source_path, source_fingerprint, status FROM processing_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"attempt not found: {attempt_id}")
+        db_watch_id, source_path, source_fingerprint, status = row
+        return db_watch_id, ItemProcessor._canonical_path(Path(source_path)), source_fingerprint, status
+
     def is_stable(self, watch_id: str, snapshot: ItemSnapshot, *, now: float, stability_interval: float) -> bool:
         return self._store.is_stable(watch_id, snapshot, now=now, stability_interval=stability_interval)
 
@@ -1682,6 +1761,7 @@ class ItemProcessor:
         results: list[BatchItemResult] = []
         diagnostics_set: set[str] = set()
         has_deferred = False
+        no_match_sources: list[Path] = []
         quarantine_root = boundary_policy.quarantine_root if boundary_policy else None
         for snapshot in snapshots:
             canonical = self._canonical_path(snapshot.path)
@@ -1689,7 +1769,11 @@ class ItemProcessor:
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.SKIPPED, detail="organizer-managed path"))
                 continue
             if not self.is_stable(watch_id, snapshot, now=current_time, stability_interval=stability_interval):
-                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.DEFERRED, detail="unstable item"))
+                detail = (
+                    f"unstable: first observation at {time.strftime('%H:%M:%S', time.localtime(current_time))}, "
+                    f"stability interval {stability_interval:g}s; will re-check on next scan tick"
+                )
+                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.DEFERRED, detail=detail))
                 has_deferred = True
                 continue
             fingerprint = self._fingerprint(canonical)
@@ -1720,11 +1804,33 @@ class ItemProcessor:
                     attempt_id = str(uuid.uuid4())
                     self._create_suppression(watch_id, canonical, fingerprint, attempt_id, "collision")
                     self._store.record_collision_attempt(attempt_id, watch_id, canonical, fingerprint, error)
+                elif "no valid rule matched" in str(error):
+                    no_match_sources.append(canonical)
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
             except OSError as error:
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
         if has_deferred:
             diagnostics_set.add("deferred: unstable items withheld from planning")
+        if no_match_sources:
+            names = ", ".join(path.name for path in no_match_sources[:5])
+            suffix = "" if len(no_match_sources) <= 5 else f" (and {len(no_match_sources) - 5} more)"
+            diagnostics_set.add(
+                f"{len(no_match_sources)} item(s) matched no rule: {names}{suffix}"
+            )
+        if self._logger is not None:
+            for diagnostic in diagnostics_set:
+                if "matched no rule" in diagnostic or "deferred: unstable" in diagnostic:
+                    self._logger.log(
+                        LogEntry.create(
+                            level=LogLevel.WARN,
+                            watch=watch_id,
+                            rule="",
+                            action="scan",
+                            item="",
+                            result=LogResult.SKIPPED,
+                            detail=diagnostic,
+                        )
+                    )
         return DiscoveryBatch(
             watch_id=watch_id,
             items=tuple(results),

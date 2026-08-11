@@ -484,6 +484,7 @@ def create_app(
         if not current.is_dir():
             raise HTTPException(status_code=422, detail="path is not a directory")
         dirs: list[tuple[str, str]] = []
+        files: list[dict[str, object]] = []
         try:
             children = sorted(current.iterdir(), key=lambda path: path.name.lower())
         except OSError as error:
@@ -491,12 +492,25 @@ def create_app(
                 status_code=422, detail=f"cannot list directory: {error}"
             ) from error
         for child in children:
-            if child.name.startswith(".") or not child.is_dir():
+            if child.name.startswith("."):
                 continue
             resolved = child.resolve()
             if not _resolved_within(resolved, current_root):
                 continue
-            dirs.append((child.name, str(resolved)))
+            if child.is_dir():
+                dirs.append((child.name, str(resolved)))
+            else:
+                try:
+                    stat = child.stat()
+                except OSError:
+                    continue
+                files.append(
+                    {
+                        "name": child.name,
+                        "size": stat.st_size,
+                        "mtime": stat.st_mtime,
+                    }
+                )
         relative = current.relative_to(current_root)
         crumb: list[tuple[str, str]] = [(current_root.name or str(current_root), str(current_root))]
         ancestor = current_root
@@ -515,6 +529,7 @@ def create_app(
             "relative": "" if relative == Path(".") else relative.as_posix(),
             "crumb": crumb,
             "dirs": dirs,
+            "files": files,
             "parent": parent_path,
         }
 
@@ -530,6 +545,7 @@ def create_app(
         roots = cast("list[Path]", context["data_roots"])
         crumb = cast("list[tuple[str, str]]", context["crumb"])
         dirs = cast("list[tuple[str, str]]", context["dirs"])
+        files = cast("list[dict[str, object]]", context["files"])
         return {
             "data_roots": [str(root) for root in roots],
             "current_root": context["current_root"],
@@ -538,6 +554,7 @@ def create_app(
             "parent": context["parent"],
             "crumb": [{"name": name, "path": path} for name, path in crumb],
             "dirs": [{"name": name, "path": path} for name, path in dirs],
+            "files": files,
         }
 
     @app.post("/browse/create", response_model=None)
@@ -826,12 +843,23 @@ def create_app(
 
     @app.put("/watches/{watch_id}/rules", response_model=None)
     def save_rules(
-        watch_id: str, expected_revision: str, body: bytes = Body(...)
+        request: Request,
+        watch_id: str,
+        expected_revision: str,
+        body: bytes = Body(...),
     ) -> dict[str, str] | JSONResponse:
         config = _watch_config(watch_id)
         if config is None:
             return JSONResponse(
                 status_code=404, content={"detail": "watch folder not configured"}
+            )
+        content_type = request.headers.get("content-type", "")
+        if content_type.startswith("application/x-www-form-urlencoded"):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": "expected raw YAML body; send with `--data-binary @file`"
+                },
             )
         rules_path = config.rules_path
         try:
@@ -1139,6 +1167,95 @@ def create_app(
             "status": result.status,
             "detail": result.detail,
             "new_attempt_id": result.new_attempt_id,
+        }
+
+    @app.post("/attempts/{attempt_id}/reprocess", response_model=None)
+    def reprocess_attempt(
+        request: Request, attempt_id: str
+    ) -> dict[str, object] | HTMLResponse | JSONResponse:
+        try:
+            details = review.inspect(attempt_id)
+        except ValueError as error:
+            return JSONResponse(status_code=404, content={"detail": str(error)})
+        config = _watch_config(details.watch_id)
+        if config is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "watch folder not configured"},
+            )
+        try:
+            report = processor.reprocess_attempt(
+                attempt_id,
+                watch_root=config.watch_root,
+                rules_path=config.rules_path,
+                boundary_policy=config.boundary_policy,
+            )
+        except ValueError as error:
+            return JSONResponse(status_code=422, content={"detail": str(error)})
+        payload: dict[str, object] = {
+            "attempt_id": attempt_id,
+            "status": report.status,
+            "dry_run": report.dry_run,
+            "actions": [
+                {
+                    "kind": action.kind,
+                    "result": action.result,
+                    "source": str(action.source),
+                    "target": str(action.target),
+                }
+                for action in report.actions
+            ],
+        }
+        if _is_html_request(request):
+            return _fragment(
+                request, "command_feedback.html",
+                result={"success": True, "detail": f"Reprocessed attempt {attempt_id}: {report.status}"},
+                attempt_id=attempt_id,
+            )
+        return payload
+
+    @app.get("/suppressions", response_model=None)
+    def list_suppressions(
+        request: Request, watch_id: str = ""
+    ) -> list[dict[str, object]] | HTMLResponse | JSONResponse:
+        suppressions = processor.suppressed_attempts()
+        if watch_id:
+            suppressions = [
+                entry for entry in suppressions if entry.get("watch_id") == watch_id
+            ]
+        if _is_html_request(request):
+            return _fragment(
+                request,
+                "suppression_list.html",
+                suppressions=suppressions,
+                watch_id=watch_id,
+                watches=_watch_snapshot(),
+            )
+        return suppressions
+
+    @app.post("/suppressions/{attempt_id}/clear", response_model=None)
+    def clear_suppression(
+        request: Request, attempt_id: str, body: bytes = Body(...)
+    ) -> dict[str, object] | HTMLResponse | JSONResponse:
+        try:
+            payload = _form_or_json(body)
+            watch_id = str(payload["watch_id"])
+            source_path = str(payload["source_path"])
+            source_fingerprint = str(payload["source_fingerprint"])
+        except (json.JSONDecodeError, KeyError, ValueError) as error:
+            return JSONResponse(status_code=422, content={"detail": str(error)})
+        processor.clear_suppression(
+            watch_id, Path(source_path), source_fingerprint
+        )
+        if _is_html_request(request):
+            return _fragment(
+                request, "command_feedback.html",
+                result={"success": True, "detail": f"Suppression cleared for {source_path}"},
+                attempt_id=attempt_id,
+            )
+        return {
+            "success": True,
+            "detail": f"Suppression cleared for {source_path}",
         }
 
     @app.get("/logs", response_model=None)

@@ -467,6 +467,68 @@ def test_plans_first_matching_move_as_immutable_preview(tmp_path: Path) -> None:
     assert item.exists()
 
 
+def test_move_with_delete_empty_dirs_prunes_empty_ancestors(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "processed"
+    watch_root.mkdir()
+    nested = watch_root / "artist" / "title" / "shell"
+    nested.mkdir(parents=True)
+    item = nested / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        f"""rules:
+  - name: flatten
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move:
+          destination: {destination}
+          delete_empty_dirs: true
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    assert report.status == "completed"
+    assert (destination / "movie.mkv").read_text() == "movie"
+    assert not (watch_root / "artist" / "title" / "shell").exists()
+    assert not (watch_root / "artist" / "title").exists()
+    assert not (watch_root / "artist").exists()
+    assert watch_root.exists()
+
+
+def test_move_without_delete_empty_dirs_keeps_ancestors(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "processed"
+    watch_root.mkdir()
+    nested = watch_root / "artist" / "title"
+    nested.mkdir(parents=True)
+    item = nested / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        f"""rules:
+  - name: flatten
+    match:
+      field: file_name
+      pattern: '.*'
+    actions:
+      - move:
+          destination: {destination}
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    assert report.status == "completed"
+    assert nested.exists()
+    assert (watch_root / "artist").exists()
+
+
 def test_invalid_rule_does_not_prevent_valid_rule_from_planning(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()
@@ -2082,6 +2144,27 @@ def test_ui_rule_save_rejects_invalid_rules(tmp_path: Path) -> None:
     assert rules.read_text() == "rules: []\n"
 
 
+def test_ui_rule_save_form_encoded_returns_actionable_error(tmp_path: Path) -> None:
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    rules = tmp_path / "rules.yaml"
+    rules.write_text("rules: []\n")
+    revision = hashlib.sha256(rules.read_bytes()).hexdigest()
+    client = TestClient(create_app(
+        processor,
+        watch_folders=[WatchFolderConfig(watch_id="downloads", watch_root=tmp_path, rules_path=rules)],
+    ))
+
+    response = client.put(
+        "/watches/downloads/rules",
+        params={"expected_revision": revision},
+        data={"rules": "rules: []\n"},
+    )
+
+    assert response.status_code == 422
+    assert "raw YAML" in response.json()["detail"]
+    assert "--data-binary" in response.json()["detail"]
+
+
 def test_ui_rule_save_rejects_unknown_watch_id(tmp_path: Path) -> None:
     processor = ItemProcessor(tmp_path / "attempts.db")
     rules = tmp_path / "rules.yaml"
@@ -2472,6 +2555,53 @@ def test_process_batch_dry_run_reports_no_match(tmp_path: Path) -> None:
     assert "no valid rule" in batch.items[0].detail
 
 
+def test_process_batch_adds_no_match_diagnostic(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "nomatch.txt"
+    item.write_text("no matching rule")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: videos
+    match:
+      field: file_name
+      pattern: '\\.mkv$'
+    actions:
+      - move:
+          destination: ../videos
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshot = ItemSnapshot(path=item, size=16, mtime=item.stat().st_mtime)
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, [snapshot],
+        stability_interval=0.0, now=1000.0, dry_run=True,
+    )
+
+    assert any("matched no rule" in d and "nomatch.txt" in d for d in batch.diagnostics)
+
+
+def test_process_batch_deferral_message_explains_stability_gate(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshot = ItemSnapshot(path=item, size=5, mtime=item.stat().st_mtime)
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, [snapshot],
+        stability_interval=5.0, now=1000.0, dry_run=True,
+    )
+
+    assert batch.items[0].status == "deferred"
+    assert "stability interval" in batch.items[0].detail
+    assert "next scan tick" in batch.items[0].detail
+
+
 def test_rule_with_match_and_conditions_honors_match_for_folders(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()
@@ -2728,6 +2858,32 @@ def test_execute_collision_creates_suppression(tmp_path: Path) -> None:
     assert processor.has_suppressed_attempt("downloads", item, plan.source_fingerprint) is True
 
 
+def test_reprocess_attempt_clears_suppression_and_retries(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    plan = processor.plan(make_request(watch_root, item, rules))
+    (destination / "movie.mkv").write_text("existing")
+    report = processor.execute(plan)
+    assert report.status == "failed"
+    import sqlite3
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        row = conn.execute("SELECT attempt_id FROM processing_attempts WHERE status = ?", ("failed",)).fetchone()
+    collision_attempt_id = row[0]
+
+    (destination / "movie.mkv").unlink()
+    reprocessed = processor.reprocess_attempt(collision_attempt_id, watch_root, rules)
+
+    assert reprocessed.status == "completed"
+    assert (destination / "movie.mkv").read_text() == "movie"
+    assert processor.has_suppressed_attempt("downloads", item, plan.source_fingerprint) is False
+
+
 def test_retry_attempt_creates_linked_fresh_plan(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     destination = tmp_path / "videos"
@@ -2807,6 +2963,36 @@ def test_retry_attempt_rejects_completed_attempt(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="not retryable"):
         processor.retry_attempt(row[0], watch_root, rules)
+
+
+def test_reprocess_attempt_reruns_completed_attempt(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    fingerprint = processor._fingerprint(item)
+    import sqlite3
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        conn.execute(
+            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, source_fingerprint, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("stale-completed", "downloads", str(item), "move", "completed", "[]", fingerprint, "1000.0"),
+        )
+
+    report = processor.reprocess_attempt("stale-completed", watch_root, rules)
+
+    assert report.status == "completed"
+    assert (destination / "movie.mkv").read_text() == "movie"
+
+
+def test_reprocess_attempt_rejects_nonexistent_attempt(tmp_path: Path) -> None:
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    with pytest.raises(ValueError, match="attempt not found"):
+        processor.reprocess_attempt("nonexistent", tmp_path, tmp_path / "rules.yaml")
 
 
 def test_retry_attempt_reports_missing_source(tmp_path: Path) -> None:

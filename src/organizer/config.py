@@ -52,7 +52,9 @@ def validate_watch_id(watch_id: str, existing_ids: list[str]) -> None:
         raise ConfigError(
             f"invalid watch id: {watch_id!r} (only A-Za-z0-9 _ - allowed)"
         )
-    if watch_id in existing_ids:
+    if any(
+        watch_id.lower() == existing.lower() for existing in existing_ids
+    ):
         raise ConfigError(f"duplicate watch id: {watch_id}")
 
 

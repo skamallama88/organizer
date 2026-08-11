@@ -73,8 +73,11 @@ def run(
     import uvicorn
     from organizer.operational_health import OperationalHealth
     from organizer.runtime import RuntimeSettings, log_startup_diagnostics
+    from organizer.startup import apply_group_writable_umask
     from organizer.structured_log import LogLevel, build_logger
     from organizer.web import create_app
+
+    apply_group_writable_umask()
 
     config = load_config(config_path)
 

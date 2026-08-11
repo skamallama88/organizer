@@ -167,6 +167,18 @@ actions:
       destination: ../Videos
 ```
 
+After a `move`/`copy` hoists files out of a nested tree, set
+`delete_empty_dirs: true` to prune the now-empty ancestor directories up to
+(but not including) the watch root. Off by default for users who rely on the
+folder structure:
+
+```yaml
+actions:
+  - move:
+      destination: /data/Processed
+      delete_empty_dirs: true
+```
+
 Copy an item and keep the original in place:
 
 ```yaml

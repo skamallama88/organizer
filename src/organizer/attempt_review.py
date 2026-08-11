@@ -5,7 +5,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-from organizer.item_processor import BoundaryPolicy, ItemProcessor, Plan, PlannedAction, PlanRequest
+from organizer.item_processor import (
+    BoundaryPolicy,
+    ItemProcessor,
+    Plan,
+    PlannedAction,
+    PlanRequest,
+    iso_timestamp,
+)
 
 
 @dataclass(frozen=True)
@@ -136,7 +143,7 @@ class AttemptReview:
                 rule_name=row[4],
                 status=row[5],
                 failure_detail=row[6] or "",
-                created_at=row[7] or "",
+                created_at=iso_timestamp(row[7] or ""),
                 retry_of_attempt_id=row[8] if row[8] else None,
             )
             for row in rows
@@ -179,8 +186,8 @@ class AttemptReview:
             audit_events=tuple(json.loads(audit_json or "[]")),
             retry_of_attempt_id=retry_of_attempt_id or None,
             abandoned_reason=abandoned_reason or "",
-            created_at=started_at or "",
-            completed_at=completed_at or "",
+            created_at=iso_timestamp(started_at or ""),
+            completed_at=iso_timestamp(completed_at or ""),
         )
 
     def _filesystem_evidence(self, source_path: str, resulting_paths_json: str | None) -> List[dict[str, object]]:

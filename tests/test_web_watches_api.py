@@ -457,3 +457,94 @@ def test_post_watch_without_config_path_returns_success_without_persistence(tmp_
     response = client.post("/watches", json={"id": "incoming", "root": str(new_root), "rules_path": str(tmp_path / "r.yaml")})
 
     assert response.status_code == 200
+
+
+def test_suppressions_list_and_clear(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text("rules: []\n")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    source = watch_root / "bad.rar"
+    processor._create_suppression("downloads", source, "fp123", "sup-1", "collision")
+    config = WatchFolderConfig(
+        watch_id="downloads",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        boundary_policy=BoundaryPolicy(
+            data_roots=(tmp_path,),
+            config_root=tmp_path / "config",
+            allowed_destinations=(tmp_path,),
+            watch_roots=(watch_root,),
+        ),
+    )
+    client = TestClient(create_app(processor, watch_folders=[config]))
+
+    listed = client.get("/suppressions")
+
+    assert listed.status_code == 200
+    entries = listed.json()
+    assert len(entries) == 1
+    assert entries[0]["watch_id"] == "downloads"
+    assert entries[0]["reason"] == "collision"
+    assert entries[0]["source_path"] == str(source)
+    assert "T" in entries[0]["suppressed_at"]
+
+    cleared = client.post(
+        "/suppressions/sup-1/clear",
+        data={
+            "watch_id": "downloads",
+            "source_path": str(source),
+            "source_fingerprint": "fp123",
+        },
+    )
+
+    assert cleared.status_code == 200
+    assert cleared.json()["success"] is True
+    assert client.get("/suppressions").json() == []
+
+
+def test_reprocess_attempt_endpoint_reruns_completed_attempt(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        """rules:
+  - name: move
+    match: {field: file_name, pattern: '.*'}
+    actions:
+      - move: {destination: ../videos}
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    fingerprint = processor._fingerprint(item)
+    import sqlite3
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        conn.execute(
+            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, source_fingerprint, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("stale-completed", "downloads", str(item), "move", "completed", "[]", fingerprint, "1000.0"),
+        )
+    config = WatchFolderConfig(
+        watch_id="downloads",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        boundary_policy=BoundaryPolicy(
+            data_roots=(tmp_path,),
+            config_root=tmp_path / "config",
+            allowed_destinations=(tmp_path,),
+            watch_roots=(watch_root,),
+        ),
+    )
+    client = TestClient(create_app(processor, watch_folders=[config]))
+
+    response = client.post("/attempts/stale-completed/reprocess")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert len(payload["actions"]) >= 1
+    assert (destination / "movie.mkv").read_text() == "movie"

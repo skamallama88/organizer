@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 DEFAULT_CONFIG = """# Organizer runtime configuration
@@ -24,3 +25,14 @@ def ensure_config_file(config_path: Path = Path("/config/organizer.yaml")) -> bo
     except FileExistsError:
         return False
     return True
+
+
+def apply_group_writable_umask() -> None:
+    """Ensure app-created files and directories are group-writable.
+
+    The Docker image runs as root with the inherited umask 022, so directories
+    it creates are 755 (root-owned) and not writable by a non-root host user
+    browsing the mounted volumes. A 002 umask yields 775 directories so group
+    members can write into app-created output folders.
+    """
+    os.umask(0o002)

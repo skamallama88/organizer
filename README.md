@@ -296,6 +296,24 @@ services:
 Start it with `docker compose up -d`. Replace the `/mnt/user/...` host paths with
 the appdata and data shares you want Organizer to use.
 
+#### File permissions on shared mounts
+
+By default the container runs as root, so directories Organizer creates under a
+mounted share are `755` (root-owned) and a non-root host user (for example an SMB
+account) cannot move or create files inside them. Organizer applies a `002` umask
+at startup so app-created directories are `775` (group-writable). On a NAS that
+runs the app with a dedicated share owner, run the container as that identity so
+created files carry it:
+
+```yaml
+    user: "99:100"        # Unraid convention: nobody:users
+```
+
+If the app runs as root and the share owner differs from the container uid,
+`chown` the share once so group ownership lines up, or mount with a matching uid:
+the `002` umask still gives group members write access to app-created
+directories regardless of the container's uid.
+
 Keep `/config` separate from `/data`. Organizer's configuration volume must not be
 used as a watch folder or action destination.
 

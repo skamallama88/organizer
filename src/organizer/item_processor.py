@@ -1395,9 +1395,12 @@ class ItemProcessor:
         if not isinstance(match, dict):
             raise ValueError("match is required")
         if conditions is None:
-            conditions = {"match": match}
-        if not isinstance(conditions, dict) or not conditions:
+            conditions = {}
+        elif not isinstance(conditions, dict) or not conditions:
             raise ValueError("conditions are required")
+        merged = dict(conditions)
+        merged["match"] = match
+        conditions = merged
         parsed_conditions: dict[str, tuple[str, str]] = {}
         for condition_name, condition in conditions.items():
             if not isinstance(condition_name, str) or not condition_name or not isinstance(condition, dict):

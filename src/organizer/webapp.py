@@ -4,6 +4,7 @@ from organizer.item_processor import ItemProcessor
 from organizer.config import load_config
 from organizer.operational_health import OperationalHealth
 from organizer.runtime import RuntimeSettings, log_startup_diagnostics
+from organizer.startup import apply_group_writable_umask
 from organizer.structured_log import build_logger
 from organizer.web import create_app
 
@@ -27,5 +28,7 @@ log_startup_diagnostics(settings, logging.getLogger("organizer"))
 
 def run() -> None:
     import uvicorn
+
+    apply_group_writable_umask()
 
     uvicorn.run(app, host=settings.host, port=settings.port)

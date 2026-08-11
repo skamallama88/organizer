@@ -2472,6 +2472,72 @@ def test_process_batch_dry_run_reports_no_match(tmp_path: Path) -> None:
     assert "no valid rule" in batch.items[0].detail
 
 
+def test_rule_with_match_and_conditions_honors_match_for_folders(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    folder = watch_root / "Cosplay_Extracted"
+    folder.mkdir()
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: sort
+    match:
+      field: file_name
+      pattern: '(?i)\\.'
+    conditions:
+      artist:
+        field: folder_name
+        pattern: '.+'
+    actions:
+      - move:
+          destination: ../processed
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    batch = processor.process_batch(
+        "downloads",
+        watch_root,
+        rules,
+        [ItemSnapshot(path=folder, size=0, mtime=folder.stat().st_mtime)],
+        stability_interval=0.0,
+        now=1000.0,
+        dry_run=True,
+    )
+
+    assert batch.items[0].status == "failed"
+    assert "no valid rule" in batch.items[0].detail
+
+
+def test_rule_with_match_and_conditions_matches_file(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: sort
+    match:
+      field: file_name
+      pattern: '(?i)\\.'
+    conditions:
+      artist:
+        field: folder_name
+        pattern: '.+'
+    actions:
+      - move:
+          destination: ../processed
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    plan = processor.plan(make_request(watch_root, item, rules))
+
+    assert plan.rule_name == "sort"
+    assert plan.actions[0].kind == "move"
+
+
 def test_recover_stale_leases_moves_started_attempt_to_reconciliation(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()

@@ -548,3 +548,47 @@ def test_reprocess_attempt_endpoint_reruns_completed_attempt(tmp_path: Path) -> 
     assert payload["status"] == "completed"
     assert len(payload["actions"]) >= 1
     assert (destination / "movie.mkv").read_text() == "movie"
+
+
+def test_reprocess_attempt_endpoint_returns_422_when_source_missing(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        """rules:
+  - name: move
+    match: {field: file_name, pattern: '.*'}
+    actions:
+      - move: {destination: ../videos}
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    fingerprint = processor._fingerprint(item)
+    import sqlite3
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        conn.execute(
+            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, source_fingerprint, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("stale-completed", "downloads", str(item), "move", "completed", "[]", fingerprint, "1000.0"),
+        )
+    item.unlink()
+    config = WatchFolderConfig(
+        watch_id="downloads",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        boundary_policy=BoundaryPolicy(
+            data_roots=(tmp_path,),
+            config_root=tmp_path / "config",
+            allowed_destinations=(tmp_path,),
+            watch_roots=(watch_root,),
+        ),
+    )
+    client = TestClient(create_app(processor, watch_folders=[config]))
+
+    response = client.post("/attempts/stale-completed/reprocess")
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert "source no longer exists" in payload["detail"]
+    assert "movie.mkv" in payload["detail"]

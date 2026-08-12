@@ -301,6 +301,37 @@ def test_rule_editor_save_returns_conflict_feedback_without_overwriting(tmp_path
     assert rules_path.read_bytes() == original
 
 
+def test_rules_put_accepts_urlencoded_content_type(tmp_path: Path) -> None:
+    client, rules_path, _ = make_client(tmp_path)
+    document = "rules: []\n"
+    expected_revision = hashlib.sha256(rules_path.read_bytes()).hexdigest()
+
+    response = client.put(
+        f"/watches/downloads/rules?expected_revision={expected_revision}",
+        content=document,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["revision"] == hashlib.sha256(document.encode()).hexdigest()
+    assert rules_path.read_text() == document
+
+
+def test_rules_put_rejects_malformed_yaml_with_422(tmp_path: Path) -> None:
+    client, rules_path, _ = make_client(tmp_path)
+    expected_revision = hashlib.sha256(rules_path.read_bytes()).hexdigest()
+
+    response = client.put(
+        f"/watches/downloads/rules?expected_revision={expected_revision}",
+        content="rules: [broken",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 422
+    assert "invalid rules document" in response.json()["detail"]
+    assert rules_path.read_text() == "rules: []\n"
+
+
 def test_attempt_and_log_pages_render_html(tmp_path: Path) -> None:
     client, rules_path, log_sink = make_client(tmp_path)
     item = tmp_path / "downloads" / "movie.txt"

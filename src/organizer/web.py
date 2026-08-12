@@ -843,7 +843,6 @@ def create_app(
 
     @app.put("/watches/{watch_id}/rules", response_model=None)
     def save_rules(
-        request: Request,
         watch_id: str,
         expected_revision: str,
         body: bytes = Body(...),
@@ -853,14 +852,6 @@ def create_app(
             return JSONResponse(
                 status_code=404, content={"detail": "watch folder not configured"}
             )
-        content_type = request.headers.get("content-type", "")
-        if content_type.startswith("application/x-www-form-urlencoded"):
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "detail": "expected raw YAML body; send with `--data-binary @file`"
-                },
-            )
         rules_path = config.rules_path
         try:
             processor._resolve_destination(rules_path)
@@ -868,7 +859,12 @@ def create_app(
             return JSONResponse(
                 status_code=500, content={"detail": f"unsafe rules path: {error}"}
             )
-        loaded = yaml.safe_load(body) or {}
+        try:
+            loaded = yaml.safe_load(body) or {}
+        except yaml.YAMLError as error:
+            return JSONResponse(
+                status_code=422, content={"detail": f"invalid rules document: {error}"}
+            )
         if not isinstance(loaded, dict) or not isinstance(
             loaded.get("rules", []), list
         ):

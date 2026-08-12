@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import errno
 import hashlib
+import lzma
 import os
 import re
 import shutil
@@ -863,7 +864,7 @@ class ItemProcessor:
                         result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
                     results.append(result)
                     self._emit(plan, result)
-            except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, py7zr.exceptions.ArchiveError, rarfile.Error, rarfile.RarCannotExec) as error:
+            except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, lzma.LZMAError, py7zr.exceptions.ArchiveError, rarfile.Error, rarfile.RarCannotExec) as error:
                 classification = "password-protected archive" if isinstance(error, (RuntimeError, rarfile.PasswordRequired)) else type(error).__name__
                 detail = f"{classification}: {error}"
                 result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", detail, source=source)
@@ -1684,6 +1685,8 @@ class ItemProcessor:
         boundary_policy: BoundaryPolicy | None = None,
     ) -> ExecutionReport:
         source = self._canonical_path(item)
+        if not source.exists():
+            raise ValueError(f"source no longer exists: {source}")
         fingerprint = self._fingerprint(source)
         self.clear_suppression(watch_id, source, fingerprint)
         request = PlanRequest(

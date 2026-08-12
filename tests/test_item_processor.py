@@ -1919,6 +1919,70 @@ def test_unarchive_classifies_corrupt_archive_and_suppresses_retry(tmp_path: Pat
     assert processor.has_suppressed_attempt("downloads", archive, processor._fingerprint(archive)) is True
 
 
+def make_corrupt_7z(path: Path) -> None:
+    """Write a valid .7z then flip bytes in its compressed stream so that
+    decompression raises the stdlib ``lzma.LZMAError`` (as py7zr propagates it)."""
+    source = path.with_suffix(".src.txt")
+    source.write_text("hello world" * 1000)
+    with py7zr.SevenZipFile(path, "w") as archive:
+        archive.write(source, "folder/file.txt")
+    data = bytearray(path.read_bytes())
+    mid = len(data) // 2
+    for index in range(mid, min(mid + 64, len(data))):
+        data[index] ^= 0xFF
+    path.write_bytes(bytes(data))
+    source.unlink()
+
+
+def test_unarchive_7z_corrupt_lzma_fails_per_item_and_suppresses(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.7z"
+    make_corrupt_7z(archive)
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    rules.write_text(rules.read_text().replace("\\.zip$", "\\.(zip|7z)$"))
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "failed"
+    assert "LZMAError" in report.actions[-1].detail
+    assert archive.exists()
+    assert processor.has_suppressed_attempt("downloads", archive, processor._fingerprint(archive)) is True
+
+
+def test_process_batch_survives_corrupt_7z_and_processes_rest(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    bad = watch_root / "bundle.7z"
+    make_corrupt_7z(bad)
+    good = watch_root / "good.zip"
+    make_zip(good, {"ok.txt": "content"})
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    rules.write_text(rules.read_text().replace("\\.zip$", "\\.(zip|7z)$"))
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshots = [
+        ItemSnapshot(path=bad, size=bad.stat().st_size, mtime=bad.stat().st_mtime),
+        ItemSnapshot(path=good, size=good.stat().st_size, mtime=good.stat().st_mtime),
+    ]
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=0.0, now=1000.0,
+    )
+
+    by_source = {item.source: item for item in batch.items}
+    bad_item = by_source[bad]
+    good_item = by_source[good]
+    assert bad_item.status == "executed"
+    assert bad_item.report is not None
+    assert bad_item.report.status == "failed"
+    assert "LZMAError" in bad_item.report.actions[-1].detail
+    assert good_item.status == "executed"
+    assert good_item.report is not None
+    assert good_item.report.status == "completed"
+    assert (watch_root / "good" / "ok.txt").read_text() == "content"
+
+
 def test_unarchive_rejects_zip_symlink_entry(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()
@@ -2144,7 +2208,7 @@ def test_ui_rule_save_rejects_invalid_rules(tmp_path: Path) -> None:
     assert rules.read_text() == "rules: []\n"
 
 
-def test_ui_rule_save_form_encoded_returns_actionable_error(tmp_path: Path) -> None:
+def test_ui_rule_save_form_encoded_accepts_yaml_body(tmp_path: Path) -> None:
     processor = ItemProcessor(tmp_path / "attempts.db")
     rules = tmp_path / "rules.yaml"
     rules.write_text("rules: []\n")
@@ -2153,16 +2217,17 @@ def test_ui_rule_save_form_encoded_returns_actionable_error(tmp_path: Path) -> N
         processor,
         watch_folders=[WatchFolderConfig(watch_id="downloads", watch_root=tmp_path, rules_path=rules)],
     ))
+    document = "rules: []\n"
 
     response = client.put(
         "/watches/downloads/rules",
         params={"expected_revision": revision},
-        data={"rules": "rules: []\n"},
+        content=document,
+        headers={"content-type": "application/x-www-form-urlencoded"},
     )
 
-    assert response.status_code == 422
-    assert "raw YAML" in response.json()["detail"]
-    assert "--data-binary" in response.json()["detail"]
+    assert response.status_code == 200
+    assert rules.read_text() == document
 
 
 def test_ui_rule_save_rejects_unknown_watch_id(tmp_path: Path) -> None:
@@ -2993,6 +3058,26 @@ def test_reprocess_attempt_rejects_nonexistent_attempt(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="attempt not found"):
         processor.reprocess_attempt("nonexistent", tmp_path, tmp_path / "rules.yaml")
+
+
+def test_reprocess_attempt_reports_missing_source(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    fingerprint = processor._fingerprint(item)
+    import sqlite3
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        conn.execute(
+            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, source_fingerprint, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("stale-completed", "downloads", str(item), "move", "completed", "[]", fingerprint, "1000.0"),
+        )
+    item.unlink()
+
+    with pytest.raises(ValueError, match="source no longer exists"):
+        processor.reprocess_attempt("stale-completed", watch_root, rules)
 
 
 def test_retry_attempt_reports_missing_source(tmp_path: Path) -> None:

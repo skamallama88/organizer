@@ -1,9 +1,13 @@
 from pathlib import Path
 import errno
 import hashlib
+import lzma
 import os
 import re
+import shutil
 import sqlite3
+import struct
+import subprocess
 import zipfile
 import py7zr
 import rarfile  # type: ignore[import-untyped]
@@ -1981,6 +1985,122 @@ def test_process_batch_survives_corrupt_7z_and_processes_rest(tmp_path: Path) ->
     assert good_item.report is not None
     assert good_item.report.status == "completed"
     assert (watch_root / "good" / "ok.txt").read_text() == "content"
+
+
+def make_mismatch_zip(path: Path, name: str = "real_name_inside.jpg") -> None:
+    """Write a zip whose local file header filename differs from its central
+    directory entry — the signature stdlib ``zipfile`` rejects on read that
+    7-Zip/libarchive tolerate."""
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(name, b"content")
+    data = bytearray(path.read_bytes())
+    sig = b"\x50\x4b\x03\x04"
+    idx = data.find(sig)
+    namelen = struct.unpack("<H", data[idx + 26 : idx + 28])[0]
+    data[idx + 30 : idx + 30 + namelen] = b"X" * namelen
+    path.write_bytes(bytes(data))
+
+
+def fake_7z(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect the ``7z`` fallback to the system ``bsdtar`` (libarchive), which
+    tolerates the same archives 7-Zip handles."""
+    if shutil.which("bsdtar") is None:
+        pytest.skip("bsdtar (libarchive) not available")
+    real_which = shutil.which
+    real_run = subprocess.run
+
+    def which(name: str) -> str | None:
+        if name == "7z":
+            return "bsdtar"
+        return real_which(name)
+
+    def run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        outdir = next(arg[2:] for arg in cmd if arg.startswith("-o"))
+        source = cmd[-1]
+        return real_run(["bsdtar", "-xf", source, "-C", outdir], **kwargs)
+
+    monkeypatch.setattr(shutil, "which", which)
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+def test_unarchive_falls_back_to_7z_for_nonconformant_zip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_7z(monkeypatch)
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.zip"
+    make_mismatch_zip(archive)
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    with zipfile.ZipFile(archive) as z:
+        with pytest.raises(zipfile.BadZipFile):
+            z.read(z.infolist()[0].filename)
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "completed"
+    assert list(watch_root.glob("bundle/*"))
+
+
+def test_unarchive_falls_back_to_7z_for_strict_decoder_7z(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_7z(monkeypatch)
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.7z"
+    source = tmp_path / "source.txt"
+    source.write_text("content")
+    with py7zr.SevenZipFile(archive, "w") as seven_zip:
+        seven_zip.write(source, "folder/file.txt")
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    rules.write_text(rules.read_text().replace("\\.zip$", "\\.(zip|7z)$"))
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    def fail_stdlib(_source: Path, _staging: Path, _limits: tuple[int, int, int]) -> None:
+        raise lzma.LZMAError("Corrupt input data")
+
+    monkeypatch.setattr(processor, "_extract_entries_stdlib", fail_stdlib)
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "completed"
+    assert (watch_root / "bundle" / "folder" / "file.txt").read_text() == "content"
+
+
+def test_7z_fallback_does_not_mask_safety_rejection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.zip"
+    archive.write_bytes(b"zip")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    def fail_stdlib(_source: Path, _staging: Path, _limits: tuple[int, int, int]) -> None:
+        raise zipfile.BadZipFile("File name in directory and header differ")
+
+    monkeypatch.setattr(processor, "_extract_entries_stdlib", fail_stdlib)
+    monkeypatch.setattr(processor, "_extract_with_7z", lambda _source, _staging: None)
+
+    def reject_unsafe(_staging: Path, _limits: tuple[int, int, int]) -> None:
+        raise ValueError("archive symlink rejected")
+
+    monkeypatch.setattr(processor, "_validate_staged_archive", reject_unsafe)
+
+    with pytest.raises(ValueError, match="archive symlink rejected"):
+        processor._unarchive_to_staging(archive, watch_root, (100, 100_000, 100_000))
+
+
+def test_validate_staged_archive_enforces_limits(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "a.txt").write_text("x" * 10)
+    (staging / "dir").mkdir()
+    (staging / "dir" / "b.txt").write_text("y" * 5)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    with pytest.raises(ValueError, match="resource limit"):
+        processor._validate_staged_archive(staging, (1, 1000, 1000))
+    with pytest.raises(ValueError, match="resource limit"):
+        processor._validate_staged_archive(staging, (10, 5, 1000))
+
+    processor._validate_staged_archive(staging, (10, 1000, 1000))
 
 
 def test_unarchive_rejects_zip_symlink_entry(tmp_path: Path) -> None:

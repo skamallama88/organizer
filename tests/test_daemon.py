@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -202,6 +203,47 @@ def test_daemon_watch_mutator_adapter_implements_protocol(tmp_path: Path) -> Non
     mutator.remove_watch(configured.watch_id)
 
     assert daemon.watches == []
+
+
+def test_scanner_offloads_batch_to_worker_thread(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    item = configured.watch_root / "movie.mkv"
+    item.write_text("movie")
+    loop_ref: list[asyncio.AbstractEventLoop] = []
+    batch_thread: threading.Thread | None = None
+    started = asyncio.Event()
+    release = threading.Event()
+    blocked_once = False
+
+    class BlockingProcessor:
+        def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+            nonlocal batch_thread, blocked_once
+            batch_thread = threading.current_thread()
+            loop_ref[0].call_soon_threadsafe(started.set)
+            if not blocked_once:
+                blocked_once = True
+                release.wait(timeout=5)
+            return None
+
+    scanner = PeriodicScanner((configured,), BlockingProcessor(), interval_seconds=0.01)
+
+    async def run() -> None:
+        loop_ref.append(asyncio.get_running_loop())
+        task = asyncio.create_task(scanner.run())
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await asyncio.wait_for(asyncio.sleep(0.05), timeout=1)
+        responsive = True
+        release.set()
+        scanner.stop()
+        await task
+        return responsive
+
+    responsive = asyncio.run(run())
+
+    assert responsive
+    assert batch_thread is not None
+    assert batch_thread is not threading.main_thread()
+    assert batch_thread is not loop_ref[0]
 
 
 def test_scanner_processes_root_items_on_interval(tmp_path: Path) -> None:

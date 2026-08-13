@@ -329,7 +329,7 @@ class PeriodicScanner:
                 try:
                     if watch.watch_root.is_dir():
                         items = [path for path in watch.watch_root.rglob("*") if not path.name.startswith(".organizer-")]
-                        self._processor.process_batch(watch, items)
+                        await asyncio.to_thread(self._processor.process_batch, watch, items)
                         if self._health is not None:
                             self._health.record_scan_ok()
                 except Exception as error:  # noqa: BLE001 — never let one batch kill the task
@@ -525,7 +525,7 @@ class OrganizerDaemon:
         consecutive_failures = 0
         while not self._stopped:
             try:
-                self.watcher.flush()
+                await asyncio.to_thread(self.watcher.flush)
                 consecutive_failures = 0
             except Exception as error:  # noqa: BLE001 — never let one flush kill the task
                 consecutive_failures += 1

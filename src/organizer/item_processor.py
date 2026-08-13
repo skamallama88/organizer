@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import time
 import uuid
 import zipfile
@@ -27,6 +28,10 @@ from organizer.operational_health import OperationalHealth
 _CAPTURE_SUPPORTED_KINDS = frozenset({"rename", "move", "copy", "archive", "unarchive"})
 
 _DB_BUSY_TIMEOUT_MS = 30_000
+
+
+class _SevenZipExtractionError(Exception):
+    """The system 7z tool failed to extract an archive."""
 
 
 def iso_timestamp(value: str) -> str:
@@ -1083,45 +1088,100 @@ class ItemProcessor:
         max_entries, max_bytes, max_entry_size = limits
         staging = target.parent / f".organizer-staging-{uuid.uuid4()}"
         staging.mkdir(parents=True)
-        count = total = 0
         try:
-            with self._open_archive(source) as archive:
-                for info in self._archive_info(source, archive):
-                    count += 1
-                    entry_size = self._entry_size(info)
-                    total += entry_size
-                    if count > max_entries or total > max_bytes or entry_size > max_entry_size:
-                        raise ValueError("archive resource limit exceeded")
-                    relative = Path(self._entry_name(info))
-                    destination = staging / relative
-                    if relative.is_absolute() or ".." in relative.parts:
-                        raise ValueError("archive path traversal rejected")
-                    if self._entry_is_dir(info):
-                        destination.mkdir(parents=True, exist_ok=True)
-                        continue
-                    if self._entry_is_symlink(info):
-                        raise ValueError("archive symlink rejected")
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    copied = 0
-                    if isinstance(archive, py7zr.SevenZipFile):
-                        extracted = archive.read([self._entry_name(info)])
-                        input_stream = extracted[self._entry_name(info)] if extracted else None
-                        if input_stream is None:
-                            raise OSError(f"archive entry unavailable: {self._entry_name(info)}")
-                    else:
-                        input_stream = self._open_entry(archive, info)
-                    with input_stream, destination.open("wb") as output_stream:
-                        while chunk := input_stream.read(1024 * 1024):
-                            copied += len(chunk)
-                            if copied > max_entry_size or total - entry_size + copied > max_bytes:
-                                raise ValueError("archive resource limit exceeded")
-                            output_stream.write(chunk)
+            try:
+                self._extract_entries_stdlib(source, staging, limits)
+            except (zipfile.BadZipFile, lzma.LZMAError, py7zr.exceptions.ArchiveError) as original:
+                # The stdlib reader rejected a structurally-inconsistent zip or
+                # an archive the stdlib decoder is stricter about (e.g. a .7z the
+                # strict lzma coder rejects but 7-Zip extracts fine). Fall back to
+                # the 7z tool, which tolerates both, then validate its output. If
+                # 7z also fails the archive is genuinely corrupt — surface the
+                # original stdlib error so the diagnostic stays meaningful. A
+                # safety rejection from validating 7z's output is NOT masked; it
+                # propagates so the attempt fails for the real reason.
+                self._remove_tree(staging)
+                try:
+                    self._extract_with_7z(source, staging)
+                except _SevenZipExtractionError as error:
+                    raise original from error
+                self._validate_staged_archive(staging, limits)
             if max_depth > 0:
                 self._extract_nested_archives(staging, limits, max_depth, 1)
             return staging
-        except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, py7zr.exceptions.ArchiveError, rarfile.Error, rarfile.RarCannotExec):
+        except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, lzma.LZMAError, py7zr.exceptions.ArchiveError, rarfile.Error, rarfile.RarCannotExec):
             self._remove_tree(staging)
             raise
+
+    def _extract_entries_stdlib(self, source: Path, staging: Path, limits: tuple[int, int, int]) -> None:
+        max_entries, max_bytes, max_entry_size = limits
+        count = total = 0
+        with self._open_archive(source) as archive:
+            for info in self._archive_info(source, archive):
+                count += 1
+                entry_size = self._entry_size(info)
+                total += entry_size
+                if count > max_entries or total > max_bytes or entry_size > max_entry_size:
+                    raise ValueError("archive resource limit exceeded")
+                relative = Path(self._entry_name(info))
+                destination = staging / relative
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("archive path traversal rejected")
+                if self._entry_is_dir(info):
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                if self._entry_is_symlink(info):
+                    raise ValueError("archive symlink rejected")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                copied = 0
+                if isinstance(archive, py7zr.SevenZipFile):
+                    extracted = archive.read([self._entry_name(info)])
+                    input_stream = extracted[self._entry_name(info)] if extracted else None
+                    if input_stream is None:
+                        raise OSError(f"archive entry unavailable: {self._entry_name(info)}")
+                else:
+                    input_stream = self._open_entry(archive, info)
+                with input_stream, destination.open("wb") as output_stream:
+                    while chunk := input_stream.read(1024 * 1024):
+                        copied += len(chunk)
+                        if copied > max_entry_size or total - entry_size + copied > max_bytes:
+                            raise ValueError("archive resource limit exceeded")
+                        output_stream.write(chunk)
+
+    def _extract_with_7z(self, source: Path, staging: Path) -> None:
+        """Extract ``source`` with the system 7z tool, which tolerates zips the
+        stdlib reader rejects and archives the strict stdlib decoder won't
+        extract. The caller validates the staged output against the safety
+        limits."""
+        executable = shutil.which("7z")
+        if executable is None:
+            raise _SevenZipExtractionError("7z tool unavailable for archive extraction")
+        staging.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [executable, "x", "-y", "-bd", f"-o{staging}", "--", str(source)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise _SevenZipExtractionError(f"7z extraction failed: {detail}")
+
+    def _validate_staged_archive(self, staging: Path, limits: tuple[int, int, int]) -> None:
+        max_entries, max_bytes, max_entry_size = limits
+        count = total = 0
+        for path in sorted(staging.rglob("*")):
+            if path.is_symlink():
+                raise ValueError("archive symlink rejected")
+            if path.is_dir():
+                continue
+            relative = path.relative_to(staging)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("archive path traversal rejected")
+            size = path.stat().st_size
+            count += 1
+            total += size
+            if count > max_entries or total > max_bytes or size > max_entry_size:
+                raise ValueError("archive resource limit exceeded")
 
     def _extract_nested_archives(self, tree: Path, limits: tuple[int, int, int], max_depth: int, current_depth: int) -> None:
         if current_depth > max_depth:

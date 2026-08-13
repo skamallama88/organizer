@@ -191,6 +191,7 @@ def create_app(
     config_path: Path | None = None,
     stability_interval: float = 0.0,
     daemon_health: DaemonHealthSource | None = None,
+    scan_interval: float = 300.0,
 ) -> FastAPI:
     app = FastAPI()
     app.mount("/static", StaticFiles(directory=_WEB_ROOT / "static"), name="static")
@@ -203,6 +204,14 @@ def create_app(
                 if config.watch_id == watch_id:
                     return config
         return None
+
+    def _replace_runtime_watch(
+        watch_id: str, replacement: WatchFolderConfig
+    ) -> None:
+        for index, existing in enumerate(_runtime_watches):
+            if existing.watch_id == watch_id:
+                _runtime_watches[index] = replacement
+                return
 
     def _watch_snapshot() -> list[WatchFolderConfig]:
         with _RUNTIME_WATCHES_LOCK:
@@ -266,13 +275,22 @@ def create_app(
             "HX-Request"
         ) == "true" or "text/html" in request.headers.get("accept", "")
 
+    def _is_htmx(request: Request) -> bool:
+        """Strict htmx check for fragment-returning mutating endpoints."""
+        return request.headers.get("HX-Request") == "true"
+
     def _form_or_json(body: bytes) -> dict[str, object]:
         try:
             return dict(json.loads(body))
         except (json.JSONDecodeError, TypeError, ValueError):
             from urllib.parse import parse_qs
 
-            return {key: values[-1] for key, values in parse_qs(body.decode()).items()}
+            return {
+                key: values[-1]
+                for key, values in parse_qs(
+                    body.decode(), keep_blank_values=True
+                ).items()
+            }
 
     def _update_watches_on_disk(
         transform: Callable[[list[dict[str, object]]], list[dict[str, object]]]
@@ -379,6 +397,9 @@ def create_app(
             status_code=422,
         )
 
+    def _scan_minutes(seconds: int) -> int:
+        return max(1, round(seconds / 60))
+
     def _build_watches() -> list[dict[str, object]]:
         health_by_watch = _health_by_watch()
         watches = []
@@ -402,8 +423,44 @@ def create_app(
                     "health_detail": detail,
                     "rule_count": _rule_count(config.rules_path),
                     "recent_activity": entries[-1] if entries else None,
+                    "enabled": config.enabled,
+                    "scan_interval_minutes": (
+                        _scan_minutes(config.scan_interval)
+                        if config.scan_interval is not None
+                        else None
+                    ),
+                    "scan_interval_default_minutes": _scan_minutes(
+                        int(scan_interval)
+                    ),
                 }
             )
+        return watches
+
+    def _watch_patch_error(
+        request: Request, message: str
+    ) -> HTMLResponse | JSONResponse:
+        if _is_htmx(request):
+            return _fragment(
+                request,
+                "watch_list.html",
+                watches=_build_watches(),
+                watch_error=message,
+            )
+        return JSONResponse(status_code=422, content={"detail": message})
+
+    def _apply_watch_updates(
+        watches: list[dict[str, object]],
+        watch_id: str,
+        updated: WatchFolderConfig,
+    ) -> list[dict[str, object]]:
+        for watch in watches:
+            if watch.get("id") != watch_id:
+                continue
+            watch["enabled"] = updated.enabled
+            if updated.scan_interval is None:
+                watch.pop("scan_interval", None)
+            else:
+                watch["scan_interval"] = updated.scan_interval
         return watches
 
     def _require_watch(watch_id: str) -> WatchFolderConfig:
@@ -1512,5 +1569,135 @@ def create_app(
             else None,
             "status": "removed",
         }
+
+    @app.patch("/watches/{watch_id}", response_model=None)
+    async def update_watch(
+        request: Request, watch_id: str
+    ) -> dict[str, object] | JSONResponse | HTMLResponse:
+        watch = _watch_config(watch_id)
+        if watch is None:
+            if _is_htmx(request):
+                return HTMLResponse(
+                    f"<p>Watch folder not found: {html.escape(watch_id)}</p>",
+                    status_code=404,
+                )
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"watch folder not found: {watch_id}"},
+            )
+
+        body = await request.body()
+        payload = _form_or_json(body)
+        updates: dict[str, object] = {}
+        if "enabled" in payload:
+            raw_enabled = payload["enabled"]
+            if isinstance(raw_enabled, bool):
+                enabled = raw_enabled
+            elif raw_enabled in ("true", "on", "1"):
+                enabled = True
+            elif raw_enabled in ("false", "off", "0"):
+                enabled = False
+            else:
+                return _watch_patch_error(
+                    request, "enabled must be true or false"
+                )
+            updates["enabled"] = enabled
+        if "scan_interval" in payload:
+            raw_interval = payload["scan_interval"]
+            if isinstance(raw_interval, str) and not raw_interval.strip():
+                updates["scan_interval"] = None
+            elif isinstance(raw_interval, bool):
+                return _watch_patch_error(
+                    request,
+                    "scan_interval must be a positive number of minutes",
+                )
+            else:
+                try:
+                    minutes = int(str(raw_interval))
+                except (TypeError, ValueError):
+                    return _watch_patch_error(
+                        request,
+                        "scan_interval must be a positive number of minutes",
+                    )
+                if minutes < 1:
+                    return _watch_patch_error(
+                        request,
+                        "scan_interval must be a positive number of minutes",
+                    )
+                updates["scan_interval"] = minutes * 60
+        if not updates:
+            if _is_htmx(request):
+                return _fragment(
+                    request, "watch_list.html", watches=_build_watches()
+                )
+            return {"id": watch_id, "enabled": watch.enabled}
+
+        updated = watch.model_copy(update=updates)
+        with _RUNTIME_WATCHES_LOCK:
+            _replace_runtime_watch(watch_id, updated)
+            rebuild_boundary_policy(_runtime_watches)
+            if watch_mutator is not None:
+                runtime_updated = next(
+                    (
+                        candidate
+                        for candidate in _runtime_watches
+                        if candidate.watch_id == watch_id
+                    ),
+                    updated,
+                )
+                watch_mutator.update_watch(runtime_updated)
+            try:
+                _update_watches_on_disk(
+                    lambda watches: _apply_watch_updates(
+                        watches, watch_id, updated
+                    )
+                )
+            except BaseException:
+                _replace_runtime_watch(watch_id, watch)
+                rebuild_boundary_policy(_runtime_watches)
+                if watch_mutator is not None:
+                    watch_mutator.update_watch(watch)
+                raise
+
+        if _is_htmx(request):
+            return _fragment(request, "watch_list.html", watches=_build_watches())
+        return {
+            "id": watch_id,
+            "enabled": updated.enabled,
+            "scan_interval": updated.scan_interval,
+        }
+
+    @app.post("/watches/{watch_id}/scan", response_model=None)
+    async def scan_watch_now(
+        request: Request, watch_id: str
+    ) -> dict[str, object] | HTMLResponse | JSONResponse:
+        config = _watch_config(watch_id)
+        if config is None:
+            if _is_htmx(request):
+                return HTMLResponse(
+                    f'<p class="feedback error">Watch folder not found: {html.escape(watch_id)}</p>',
+                    status_code=404,
+                )
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"watch folder not found: {watch_id}"},
+            )
+        if watch_mutator is None:
+            message = (
+                "no daemon running; start `organizer run` to enable scan/operate"
+            )
+            if _is_htmx(request):
+                return HTMLResponse(
+                    f'<p class="feedback error">{html.escape(message)}</p>',
+                    status_code=501,
+                )
+            return JSONResponse(status_code=501, content={"detail": message})
+        watch_mutator.trigger_scan(watch_id)
+        detail = f"Scan triggered for {watch_id}."
+        if _is_htmx(request):
+            return HTMLResponse(
+                f'<p class="feedback success">{html.escape(detail)}</p>'
+            )
+        return {"watch_id": watch_id, "detail": detail}
 
     return app

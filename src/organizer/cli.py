@@ -104,6 +104,7 @@ def run(
         config_path=config_path,
         stability_interval=float(config.stability_interval),
         daemon_health=daemon,
+        scan_interval=float(config.scan_interval),
     )
     settings = RuntimeSettings.from_environment()
     log_startup_diagnostics(settings, logging.getLogger("organizer"))

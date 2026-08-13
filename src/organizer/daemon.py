@@ -44,6 +44,8 @@ _TASK_ATTRS: dict[DaemonTask, str] = {
 _FLUSH_BACKOFF_BASE = 0.1
 _FLUSH_BACKOFF_MAX = 30.0
 
+_ORGANIZER_PREFIX = ".organizer-"
+
 
 class DaemonHealthState:
     """Mutable liveness + recent-failure state for the daemon's background tasks.
@@ -85,6 +87,10 @@ class WatchMutator(Protocol):
     def add_watch(self, watch: WatchFolderConfig) -> None: ...
 
     def remove_watch(self, watch_id: str) -> None: ...
+
+    def update_watch(self, watch: WatchFolderConfig) -> None: ...
+
+    def trigger_scan(self, watch_id: str) -> None: ...
 
 
 class ProcessorBatchAdapter:
@@ -188,9 +194,9 @@ class WatcherService:
             return
         with self._lock:
             watch = self._watches.get(watch_id)
-        if watch is None:
+        if watch is None or not watch.enabled:
             return
-        if not path.is_relative_to(watch.watch_root) or path.name.startswith(".organizer-"):
+        if not path.is_relative_to(watch.watch_root) or path.name.startswith(_ORGANIZER_PREFIX):
             return
         with self._lock:
             self._pending[(watch_id, path)] = time.monotonic() + self._debounce_seconds
@@ -207,7 +213,7 @@ class WatcherService:
         for watch_id, paths in ready.items():
             with self._lock:
                 watch = self._watches.get(watch_id)
-            if watch is not None:
+            if watch is not None and watch.enabled:
                 self._processor.process_batch(watch, paths)
         return sum(len(paths) for paths in ready.values())
 
@@ -296,6 +302,9 @@ class PeriodicScanner:
         self._processor = processor
         self._interval_seconds = interval_seconds
         self._stop_event = asyncio.Event()
+        self._trigger_event = asyncio.Event()
+        self._pending_triggers: set[str] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._logger = logger
         self._health = health
 
@@ -315,8 +324,87 @@ class PeriodicScanner:
                 )
             )
 
+    def trigger(self, watch_id: str) -> None:
+        """Schedule an immediate scan of one watch root.
+
+        Safe to call from any thread while the scanner is running. Triggers are
+        coalesced per watch and processed on the next loop iteration.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._schedule_trigger, watch_id)
+
+    def _schedule_trigger(self, watch_id: str) -> None:
+        self._pending_triggers.add(watch_id)
+        self._trigger_event.set()
+
+    def _wake(self) -> None:
+        """Wake the run loop so it recomputes due watches without scanning."""
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._trigger_event.set)
+
+    def _watch_interval(self, watch: WatchFolderConfig) -> float:
+        if watch.scan_interval is not None:
+            return float(watch.scan_interval)
+        return self._interval_seconds
+
+    def _due_watches(self, last_scans: dict[str, float]) -> list[WatchFolderConfig]:
+        now = time.monotonic()
+        due: list[WatchFolderConfig] = []
+        for watch in self._watches:
+            if not watch.enabled:
+                continue
+            interval = self._watch_interval(watch)
+            if now - last_scans.get(watch.watch_id, 0.0) >= interval:
+                due.append(watch)
+        return due
+
+    def _find_watch(self, watch_id: str) -> WatchFolderConfig | None:
+        for watch in self._watches:
+            if watch.watch_id == watch_id:
+                return watch
+        return None
+
+    def _timeout_until_next(self, last_scans: dict[str, float]) -> float:
+        now = time.monotonic()
+        best: float | None = None
+        for watch in self._watches:
+            if not watch.enabled:
+                continue
+            interval = self._watch_interval(watch)
+            remaining = max(0.0, interval - (now - last_scans.get(watch.watch_id, 0.0)))
+            if best is None or remaining < best:
+                best = remaining
+        if best is None:
+            return self._interval_seconds
+        return best
+
+    async def _scan_watch(self, watch: WatchFolderConfig, last_scans: dict[str, float]) -> None:
+        last_scans[watch.watch_id] = time.monotonic()
+        try:
+            if watch.watch_root.is_dir():
+                items = [
+                    path
+                    for path in watch.watch_root.rglob("*")
+                    if not path.name.startswith(_ORGANIZER_PREFIX)
+                ]
+                await asyncio.to_thread(self._processor.process_batch, watch, items)
+                if self._health is not None:
+                    self._health.record_scan_ok()
+        except Exception as error:  # noqa: BLE001 — never let one batch kill the task
+            self._log_scan_failure(watch.watch_id, error)
+
     async def run(self) -> None:
-        """Periodically scan each watch root for new items.
+        """Periodically scan each enabled watch root for new items.
+
+        Each watch is scanned when its own interval has elapsed since its last
+        scan, falling back to the global interval when the watch has no
+        per-watch override. Disabled watches are never scanned periodically, but
+        an explicit manual ``trigger`` still scans the requested watch. Pending
+        ``trigger`` requests are processed immediately on the next loop
+        iteration, so a manual "scan now" does not wait for the interval.
 
         The per-batch ``try/except`` is the PRIMARY resilience guard: one bad
         batch (e.g. a transient ``database is locked``) is logged and the loop
@@ -324,35 +412,43 @@ class PeriodicScanner:
         escapes this loop body, which ``OrganizerDaemon._on_task_done`` treats
         as a crash and respawns.
         """
+        self._loop = asyncio.get_running_loop()
+        last_scans: dict[str, float] = {}
         while not self._stop_event.is_set():
-            for watch in self._watches:
-                try:
-                    if watch.watch_root.is_dir():
-                        items = [path for path in watch.watch_root.rglob("*") if not path.name.startswith(".organizer-")]
-                        await asyncio.to_thread(self._processor.process_batch, watch, items)
-                        if self._health is not None:
-                            self._health.record_scan_ok()
-                except Exception as error:  # noqa: BLE001 — never let one batch kill the task
-                    self._log_scan_failure(watch.watch_id, error)
+            for watch in self._due_watches(last_scans):
+                await self._scan_watch(watch, last_scans)
+            pending, self._pending_triggers = self._pending_triggers, set()
+            for watch_id in pending:
+                triggered_watch = self._find_watch(watch_id)
+                if triggered_watch is not None:
+                    await self._scan_watch(triggered_watch, last_scans)
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=self._interval_seconds)
+                await asyncio.wait_for(
+                    self._trigger_event.wait(),
+                    timeout=self._timeout_until_next(last_scans),
+                )
             except asyncio.TimeoutError:
                 pass
+            self._trigger_event.clear()
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._trigger_event.set()
 
     def add_watch(self, watch: WatchFolderConfig) -> None:
         self._watches[:] = [existing for existing in self._watches if existing.watch_id != watch.watch_id]
         self._watches.append(watch)
+        self._wake()
 
     def remove_watch(self, watch_id: str) -> None:
         self._watches[:] = [watch for watch in self._watches if watch.watch_id != watch_id]
+        self._wake()
 
     def update_watch(self, watch: WatchFolderConfig) -> None:
         for index, existing in enumerate(self._watches):
             if existing.watch_id == watch.watch_id:
                 self._watches[index] = watch
+                self._wake()
                 return
 
 
@@ -432,6 +528,17 @@ class OrganizerDaemon:
         self.scanner.remove_watch(watch_id)
         self.watches[:] = [watch for watch in self.watches if watch.watch_id != watch_id]
         self._rebuild_boundary_policy()
+
+    def update_watch(self, watch: WatchFolderConfig) -> None:
+        for index, existing in enumerate(self.watches):
+            if existing.watch_id == watch.watch_id:
+                self.watches[index] = watch
+                break
+        self._rebuild_boundary_policy()
+
+    def trigger_scan(self, watch_id: str) -> None:
+        """Request an immediate scan/operate cycle for one watch root."""
+        self.scanner.trigger(watch_id)
 
     def _rebuild_boundary_policy(self) -> None:
         rebuild_boundary_policy(self.watches)
@@ -611,3 +718,9 @@ class DaemonWatchMutator:
 
     def remove_watch(self, watch_id: str) -> None:
         self._daemon.remove_watch(watch_id)
+
+    def update_watch(self, watch: WatchFolderConfig) -> None:
+        self._daemon.update_watch(watch)
+
+    def trigger_scan(self, watch_id: str) -> None:
+        self._daemon.trigger_scan(watch_id)

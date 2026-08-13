@@ -14,12 +14,20 @@ class RecordingMutator:
     def __init__(self) -> None:
         self.added: list[WatchFolderConfig] = []
         self.removed: list[str] = []
+        self.updated: list[WatchFolderConfig] = []
+        self.scanned: list[str] = []
 
     def add_watch(self, watch: WatchFolderConfig) -> None:
         self.added.append(watch)
 
     def remove_watch(self, watch_id: str) -> None:
         self.removed.append(watch_id)
+
+    def update_watch(self, watch: WatchFolderConfig) -> None:
+        self.updated.append(watch)
+
+    def trigger_scan(self, watch_id: str) -> None:
+        self.scanned.append(watch_id)
 
 
 def _make_client(
@@ -592,3 +600,179 @@ def test_reprocess_attempt_endpoint_returns_422_when_source_missing(tmp_path: Pa
     payload = response.json()
     assert "source no longer exists" in payload["detail"]
     assert "movie.mkv" in payload["detail"]
+
+
+def test_patch_watch_disables_and_persists(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    client, config_path = _make_client(tmp_path, mutator=mutator)
+
+    response = client.patch("/watches/downloads", data={"enabled": "false"})
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is False
+    assert len(mutator.updated) == 1
+    assert mutator.updated[0].enabled is False
+    import yaml
+    document = yaml.safe_load(config_path.read_text())
+    entry = [w for w in document["watches"] if w["id"] == "downloads"][0]
+    assert entry["enabled"] is False
+
+
+def test_patch_watch_sets_scan_interval_minutes(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    client, config_path = _make_client(tmp_path, mutator=mutator)
+
+    response = client.patch("/watches/downloads", data={"scan_interval": "10"})
+
+    assert response.status_code == 200
+    assert response.json()["scan_interval"] == 600
+    assert mutator.updated[0].scan_interval == 600
+    import yaml
+    document = yaml.safe_load(config_path.read_text())
+    entry = [w for w in document["watches"] if w["id"] == "downloads"][0]
+    assert entry["scan_interval"] == 600
+
+
+def test_patch_watch_clears_scan_interval(tmp_path: Path) -> None:
+    client, config_path = _make_client(tmp_path)
+    client.patch("/watches/downloads", data={"scan_interval": "10"})
+    client.patch("/watches/downloads", data={"scan_interval": ""})
+
+    import yaml
+    document = yaml.safe_load(config_path.read_text())
+    entry = [w for w in document["watches"] if w["id"] == "downloads"][0]
+    assert "scan_interval" not in entry
+
+
+def test_patch_watch_rejects_invalid_scan_interval(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+
+    response = client.patch("/watches/downloads", data={"scan_interval": "0"})
+
+    assert response.status_code == 422
+    assert "positive number of minutes" in response.json()["detail"]
+
+
+def test_patch_watch_rejects_invalid_enabled_value(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+
+    response = client.patch("/watches/downloads", data={"enabled": "banana"})
+
+    assert response.status_code == 422
+    assert "enabled must be true or false" in response.json()["detail"]
+
+
+def test_patch_watch_returns_404_for_unknown(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+
+    response = client.patch("/watches/unknown", data={"enabled": "true"})
+
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"]
+
+
+def test_patch_watch_htmx_returns_watch_list(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+
+    response = client.patch(
+        "/watches/downloads",
+        data={"enabled": "false"},
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 200
+    assert 'id="watch-list"' in response.text
+    assert "scan_interval" in response.text
+
+
+def test_scan_now_triggers_via_mutator(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    response = client.post("/watches/downloads/scan")
+
+    assert response.status_code == 200
+    assert response.json()["detail"] == "Scan triggered for downloads."
+    assert mutator.scanned == ["downloads"]
+
+
+def test_scan_now_allowed_on_disabled_watch(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    client, _ = _make_client(tmp_path, mutator=mutator)
+    client.patch("/watches/downloads", data={"enabled": "false"})
+
+    response = client.post("/watches/downloads/scan")
+
+    assert response.status_code == 200
+    assert response.json()["detail"] == "Scan triggered for downloads."
+    assert mutator.scanned == ["downloads"]
+
+
+def test_scan_now_returns_404_for_unknown(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+
+    response = client.post("/watches/unknown/scan")
+
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"]
+
+
+def test_scan_now_htmx_returns_feedback(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    response = client.post(
+        "/watches/downloads/scan", headers={"HX-Request": "true"}
+    )
+
+    assert response.status_code == 200
+    assert "Scan triggered for downloads." in response.text
+
+
+def test_scan_now_without_mutator_returns_501(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path, mutator=None)
+
+    response = client.post("/watches/downloads/scan")
+
+    assert response.status_code == 501
+    assert "no daemon running" in response.json()["detail"]
+
+
+def test_scan_now_text_html_accept_returns_json(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    response = client.post(
+        "/watches/downloads/scan",
+        headers={"accept": "text/html"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"watch_id": "downloads", "detail": "Scan triggered for downloads."}
+    assert "<p" not in response.text
+    assert mutator.scanned == ["downloads"]
+
+
+def test_dashboard_lists_enabled_and_scan_interval(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'name="enabled"' in response.text
+    assert 'name="scan_interval"' in response.text
+    assert 'hx-post="/watches/downloads/scan"' in response.text
+
+
+def test_dashboard_shows_interval_default_placeholder_and_override(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    default_html = client.get("/").text
+    assert 'placeholder="Default (5 min)"' in default_html
+
+    client.patch("/watches/downloads", data={"scan_interval": "10"})
+
+    override_html = client.get("/").text
+    assert 'value="10"' in override_html
+    assert 'placeholder="Default (5 min)"' in override_html

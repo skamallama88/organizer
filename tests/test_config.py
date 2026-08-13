@@ -94,3 +94,59 @@ watches:
 
     with pytest.raises(ConfigError, match="config volume"):
         load_config(config_path)
+
+
+def test_load_config_parses_enabled_and_scan_interval_per_watch(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules/downloads.yaml
+    enabled: false
+    scan_interval: 120
+  - id: incoming
+    root: /data/incoming
+    rules: rules/incoming.yaml
+"""
+    )
+
+    config = load_config(config_path)
+
+    assert config.watches[0].enabled is False
+    assert config.watches[0].scan_interval == 120
+    assert config.watches[1].enabled is True
+    assert config.watches[1].scan_interval is None
+
+
+def test_load_config_rejects_non_boolean_enabled(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules.yaml
+    enabled: "yes"
+"""
+    )
+
+    with pytest.raises(ConfigError, match="enabled must be a boolean"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_watch_scan_interval(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules.yaml
+    scan_interval: -1
+"""
+    )
+
+    with pytest.raises(ConfigError, match="scan_interval must be a positive"):
+        load_config(config_path)

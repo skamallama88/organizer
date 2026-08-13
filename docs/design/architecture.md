@@ -377,7 +377,12 @@ global `scan_interval`, `stability_interval`, `log_level`, and `retention_days`
 settings, mounted
 `data_roots`, a `quarantine_root`, and a non-empty `watches` list. Each watch
 has an `id`, an absolute `root`, and a `rules` path (relative paths resolve from
-the configuration file). Startup validates that watch roots are disjoint, lie
+the configuration file). A watch may also set `enabled` (default `true`) and a
+per-watch `scan_interval` in seconds that overrides the global `scan_interval`.
+Disabled watches are never periodically scanned and ignore filesystem events, so
+Organizer does not automatically operate on them; manual "Scan now" and explicit
+reprocess/retry commands still work. Startup validates
+that watch roots are disjoint, lie
 within a data root, and do not enter the config volume. The loader resolves each
 watch to a `WatchFolderConfig` and `BoundaryPolicy`; CLI and web callers accept
 only a watch identifier and resolve these values from the loaded configuration.
@@ -398,7 +403,18 @@ watches:
   - id: downloads
     root: /data/Downloads
     rules: watches/Downloads/rules.yaml
+    enabled: true
+    scan_interval: 600
 ```
+
+The dashboard exposes per-watch schedule controls: an enable toggle, a rescan
+interval in minutes, and a "Scan now" action that requests an immediate
+scan/operate cycle for that watch root. Leaving the interval field empty keeps a
+watch on the global default (shown as a placeholder); typing whole minutes
+stores a per-watch override, and clearing it removes the override. "Scan now"
+works even on a disabled watch, since it is a manual action. Changes update the
+runtime daemon (periodic scanner and filesystem watcher) and are persisted to
+the YAML config.
 
 `stability_interval` is the number of seconds a file's size and modification time
 must remain unchanged before it is planned and executed. On watch roots backed by

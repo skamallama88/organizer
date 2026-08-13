@@ -23,6 +23,8 @@ class WatchFolderConfig(BaseModel):
     watch_root: Path
     rules_path: Path
     boundary_policy: BoundaryPolicy = BoundaryPolicy()
+    enabled: bool = True
+    scan_interval: int | None = None
 
 
 class OrganizerConfig(BaseModel):
@@ -114,15 +116,33 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
     if not isinstance(raw_watches, list) or not raw_watches:
         raise ConfigError("watches must be a non-empty list")
 
-    watch_roots: list[Path] = []
-    watch_ids: list[str] = []
+    if document.get("quarantine_root") is not None and (_within(quarantine_root, config_root) or not any(_within(quarantine_root, data_root) for data_root in data_roots)):
+        raise ConfigError("quarantine root must be within a data volume and outside the config volume")
+
+    base_policy = BoundaryPolicy(
+        data_roots=tuple(data_roots),
+        config_root=config_root,
+        allowed_destinations=tuple(data_roots),
+        quarantine_root=quarantine_root,
+    )
+    watches: list[WatchFolderConfig] = []
     for raw_watch in raw_watches:
         if not isinstance(raw_watch, dict):
             raise ConfigError("watch must be a mapping")
         watch_id = raw_watch.get("id")
         if not isinstance(watch_id, str) or not watch_id:
             raise ConfigError("watch id is required")
-        validate_watch_id(watch_id, watch_ids)
+        validate_watch_id(watch_id, [watch.watch_id for watch in watches])
+        enabled = raw_watch.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigError(f"watch {watch_id} enabled must be a boolean")
+        raw_scan_interval = raw_watch.get("scan_interval")
+        if raw_scan_interval is None:
+            watch_scan_interval = None
+        else:
+            watch_scan_interval = _positive_int(
+                raw_scan_interval, f"watch {watch_id} scan_interval"
+            )
         root = _required_path(raw_watch, "root", f"watch {watch_id}", config_path.parent)
         rules_value = raw_watch.get("rules", "rules.yaml")
         if not isinstance(rules_value, str) or not rules_value:
@@ -130,32 +150,24 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
         rules_path = Path(rules_value)
         if not rules_path.is_absolute():
             rules_path = config_path.parent / rules_path
-        validate_watch_root(root, config_root, data_roots, watch_roots, watch_id)
-        watch_roots.append(root)
-        watch_ids.append(watch_id)
-
-    if document.get("quarantine_root") is not None and (_within(quarantine_root, config_root) or not any(_within(quarantine_root, data_root) for data_root in data_roots)):
-        raise ConfigError("quarantine root must be within a data volume and outside the config volume")
-
-    boundary_policy = BoundaryPolicy(
-        data_roots=tuple(data_roots),
-        config_root=config_root,
-        watch_roots=tuple(watch_roots),
-        allowed_destinations=tuple(data_roots),
-        quarantine_root=quarantine_root,
-        watch_ids=tuple(watch_ids),
-    )
-    watches = tuple(
-        WatchFolderConfig(
-            watch_id=watch_id,
-            watch_root=root,
-            rules_path=(config_path.parent / Path(raw_watch.get("rules", "rules.yaml"))).resolve()
-            if not Path(raw_watch.get("rules", "rules.yaml")).is_absolute()
-            else Path(raw_watch.get("rules", "rules.yaml")).resolve(),
-            boundary_policy=boundary_policy,
+        validate_watch_root(
+            root,
+            config_root,
+            data_roots,
+            [watch.watch_root for watch in watches],
+            watch_id,
         )
-        for raw_watch, watch_id, root in zip(raw_watches, watch_ids, watch_roots)
-    )
+        watches.append(
+            WatchFolderConfig(
+                watch_id=watch_id,
+                watch_root=root,
+                rules_path=rules_path.resolve(),
+                boundary_policy=base_policy,
+                enabled=enabled,
+                scan_interval=watch_scan_interval,
+            )
+        )
+    rebuild_boundary_policy(watches)
     return OrganizerConfig(
         config_path=config_path,
         config_root=config_root,
@@ -168,7 +180,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
         retention_interval=retention_interval,
         data_roots=tuple(data_roots),
         quarantine_root=quarantine_root,
-        watches=watches,
+        watches=tuple(watches),
     )
 
 

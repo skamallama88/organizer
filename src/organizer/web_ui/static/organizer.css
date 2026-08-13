@@ -41,6 +41,13 @@ code { overflow-wrap: anywhere; }
 .rule-card .danger { color: #a00000; }
 .rule-tools { margin-top: 1rem; }
 
+/* Watch schedule controls */
+td.schedule { white-space: nowrap; }
+td.schedule form { display: flex; flex-direction: column; gap: .4rem; align-items: start; margin: 0 0 .5rem; }
+td.schedule label.check, td.schedule label.interval { display: inline-flex; gap: .35rem; align-items: center; width: auto; }
+td.schedule label.interval input { width: 4rem; }
+tr.disabled { opacity: .55; }
+
 .test-heading { margin-top: 2rem; }
 .toolbar { margin: .75rem 0; }
 .feedback { padding: .75rem; margin: .5rem 0; }

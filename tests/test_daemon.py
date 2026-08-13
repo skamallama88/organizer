@@ -166,6 +166,48 @@ def test_scanner_add_and_remove_watch_updates_watch_list(tmp_path: Path) -> None
     assert scanner._watches == []
 
 
+def test_watcher_ignores_events_for_disabled_watch(tmp_path: Path) -> None:
+    disabled_root = tmp_path / "disabled"
+    disabled_root.mkdir()
+    disabled = WatchFolderConfig(
+        watch_id="disabled",
+        watch_root=disabled_root,
+        rules_path=tmp_path / "disabled.yaml",
+        boundary_policy=BoundaryPolicy(),
+        enabled=False,
+    )
+    processor = RecordingProcessor()
+    service = WatcherService((disabled,), processor, debounce_seconds=0)
+    path = disabled_root / "movie.mkv"
+
+    service.handle_event("disabled", path, "created")
+    service.handle_event("disabled", path, "closed")
+
+    assert service.flush() == 0
+    assert processor.calls == []
+
+
+def test_watcher_resumes_disabled_watch_after_update(tmp_path: Path) -> None:
+    root = tmp_path / "watch"
+    root.mkdir()
+    configured = WatchFolderConfig(
+        watch_id="incoming",
+        watch_root=root,
+        rules_path=tmp_path / "rules.yaml",
+        boundary_policy=BoundaryPolicy(),
+        enabled=False,
+    )
+    processor = RecordingProcessor()
+    service = WatcherService((configured,), processor, debounce_seconds=0)
+    path = root / "movie.mkv"
+
+    service.update_watch(configured.model_copy(update={"enabled": True}))
+    service.handle_event("incoming", path, "created")
+
+    assert service.flush() == 1
+    assert processor.calls == [("incoming", path)]
+
+
 def test_daemon_mutator_cascades_and_rebuilds_boundary_policy(tmp_path: Path) -> None:
     first = watch(tmp_path)
     second_root = tmp_path / "second"
@@ -203,6 +245,34 @@ def test_daemon_watch_mutator_adapter_implements_protocol(tmp_path: Path) -> Non
     mutator.remove_watch(configured.watch_id)
 
     assert daemon.watches == []
+
+
+def test_daemon_update_watch_replaces_runtime_config(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    daemon = OrganizerDaemon([configured], RecordingProcessor(), scanner_interval=60)
+    updated = configured.model_copy(update={"enabled": False, "scan_interval": 600})
+
+    daemon.update_watch(updated)
+
+    assert daemon.watches[0].enabled is False
+    assert daemon.watches[0].scan_interval == 600
+    assert daemon.watcher._watches["incoming"].enabled is False
+    assert daemon.scanner._watches[0].enabled is False
+
+
+def test_daemon_trigger_scan_delegates_to_scanner(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    daemon = OrganizerDaemon([configured], RecordingProcessor(), scanner_interval=60)
+    triggered: list[str] = []
+
+    def _record(watch_id: str) -> None:
+        triggered.append(watch_id)
+
+    daemon.scanner.trigger = _record  # type: ignore[method-assign]
+
+    daemon.trigger_scan("incoming")
+
+    assert triggered == ["incoming"]
 
 
 def test_scanner_offloads_batch_to_worker_thread(tmp_path: Path) -> None:
@@ -262,6 +332,183 @@ def test_scanner_processes_root_items_on_interval(tmp_path: Path) -> None:
     asyncio.run(run())
 
     assert processor.calls.count(("incoming", item)) >= 2
+
+
+def test_scanner_uses_per_watch_interval_override(tmp_path: Path) -> None:
+    fast_root = tmp_path / "fast"
+    slow_root = tmp_path / "slow"
+    fast_root.mkdir()
+    slow_root.mkdir()
+    fast = WatchFolderConfig(
+        watch_id="fast",
+        watch_root=fast_root,
+        rules_path=tmp_path / "fast.yaml",
+        boundary_policy=BoundaryPolicy(),
+        scan_interval=1,
+    )
+    slow = WatchFolderConfig(
+        watch_id="slow",
+        watch_root=slow_root,
+        rules_path=tmp_path / "slow.yaml",
+        boundary_policy=BoundaryPolicy(),
+        scan_interval=3600,
+    )
+    scanner = PeriodicScanner((fast, slow), RecordingProcessor(), interval_seconds=60)
+
+    assert scanner._watch_interval(fast) == 1
+    assert scanner._watch_interval(slow) == 3600
+
+    now = time.monotonic()
+    last_scans = {"fast": now - 2, "slow": now - 2}
+    due = {w.watch_id for w in scanner._due_watches(last_scans)}
+    assert due == {"fast"}
+
+    last_scans = {"fast": now - 2, "slow": now - 3601}
+    due = {w.watch_id for w in scanner._due_watches(last_scans)}
+    assert due == {"fast", "slow"}
+
+
+def test_scanner_scans_each_watch_once_on_startup(tmp_path: Path) -> None:
+    fast_root = tmp_path / "fast"
+    slow_root = tmp_path / "slow"
+    fast_root.mkdir()
+    slow_root.mkdir()
+    fast_item = fast_root / "a.mkv"
+    slow_item = slow_root / "b.mkv"
+    fast_item.write_text("a")
+    slow_item.write_text("b")
+    fast = WatchFolderConfig(
+        watch_id="fast",
+        watch_root=fast_root,
+        rules_path=tmp_path / "fast.yaml",
+        boundary_policy=BoundaryPolicy(),
+        scan_interval=3600,
+    )
+    slow = WatchFolderConfig(
+        watch_id="slow",
+        watch_root=slow_root,
+        rules_path=tmp_path / "slow.yaml",
+        boundary_policy=BoundaryPolicy(),
+        scan_interval=3600,
+    )
+    processor = RecordingProcessor()
+    scanner = PeriodicScanner((fast, slow), processor, interval_seconds=3600)
+
+    async def run() -> None:
+        task = asyncio.create_task(scanner.run())
+        await asyncio.sleep(0.03)
+        scanner.stop()
+        await task
+
+    asyncio.run(run())
+
+    assert ("fast", fast_item) in processor.calls
+    assert ("slow", slow_item) in processor.calls
+
+
+def test_scanner_skips_disabled_watches(tmp_path: Path) -> None:
+    enabled_root = tmp_path / "enabled"
+    disabled_root = tmp_path / "disabled"
+    enabled_root.mkdir()
+    disabled_root.mkdir()
+    enabled_item = enabled_root / "a.mkv"
+    disabled_item = disabled_root / "b.mkv"
+    enabled_item.write_text("a")
+    disabled_item.write_text("b")
+    enabled_config = WatchFolderConfig(
+        watch_id="enabled",
+        watch_root=enabled_root,
+        rules_path=tmp_path / "enabled.yaml",
+        boundary_policy=BoundaryPolicy(),
+    )
+    disabled_config = WatchFolderConfig(
+        watch_id="disabled",
+        watch_root=disabled_root,
+        rules_path=tmp_path / "disabled.yaml",
+        boundary_policy=BoundaryPolicy(),
+        enabled=False,
+    )
+    processor = RecordingProcessor()
+    scanner = PeriodicScanner((enabled_config, disabled_config), processor, interval_seconds=0.01)
+
+    async def run() -> None:
+        task = asyncio.create_task(scanner.run())
+        await asyncio.sleep(0.025)
+        scanner.stop()
+        await task
+
+    asyncio.run(run())
+
+    assert ("enabled", enabled_item) in processor.calls
+    assert ("disabled", disabled_item) not in processor.calls
+
+
+def test_scanner_trigger_scans_watch_immediately(tmp_path: Path) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_item = first_root / "a.mkv"
+    second_item = second_root / "b.mkv"
+    first_item.write_text("a")
+    second_item.write_text("b")
+    first = WatchFolderConfig(
+        watch_id="first",
+        watch_root=first_root,
+        rules_path=tmp_path / "first.yaml",
+        boundary_policy=BoundaryPolicy(),
+        scan_interval=3600,
+    )
+    second = WatchFolderConfig(
+        watch_id="second",
+        watch_root=second_root,
+        rules_path=tmp_path / "second.yaml",
+        boundary_policy=BoundaryPolicy(),
+        scan_interval=3600,
+    )
+    processor = RecordingProcessor()
+    scanner = PeriodicScanner((first, second), processor, interval_seconds=3600)
+
+    async def run() -> None:
+        task = asyncio.create_task(scanner.run())
+        await asyncio.sleep(0.02)
+        scanner.trigger("second")
+        await asyncio.sleep(0.05)
+        scanner.stop()
+        await task
+
+    asyncio.run(run())
+
+    assert ("second", second_item) in processor.calls
+
+
+def test_scanner_trigger_scans_disabled_watch(tmp_path: Path) -> None:
+    disabled_root = tmp_path / "disabled"
+    disabled_root.mkdir()
+    disabled_item = disabled_root / "b.mkv"
+    disabled_item.write_text("b")
+    disabled_config = WatchFolderConfig(
+        watch_id="disabled",
+        watch_root=disabled_root,
+        rules_path=tmp_path / "disabled.yaml",
+        boundary_policy=BoundaryPolicy(),
+        scan_interval=3600,
+        enabled=False,
+    )
+    processor = RecordingProcessor()
+    scanner = PeriodicScanner((disabled_config,), processor, interval_seconds=3600)
+
+    async def run() -> None:
+        task = asyncio.create_task(scanner.run())
+        await asyncio.sleep(0.02)
+        scanner.trigger("disabled")
+        await asyncio.sleep(0.05)
+        scanner.stop()
+        await task
+
+    asyncio.run(run())
+
+    assert ("disabled", disabled_item) in processor.calls
 
 
 def test_scanner_survives_a_failed_batch_and_continues(tmp_path: Path) -> None:

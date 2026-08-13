@@ -2,20 +2,32 @@
 {% if orphaned_rules %}
 <p class="feedback">Note: rules file left in place: <code>{{ orphaned_rules }}</code></p>
 {% endif %}
+{% if watch_error %}
+<p class="feedback error">Could not update watch: {{ watch_error }}</p>
+{% endif %}
 {% if watches %}
 <table>
-  <thead><tr><th>Watch</th><th>Health</th><th>Rules</th><th>Recent activity</th><th>Actions</th></tr></thead>
+  <thead><tr><th>Watch</th><th>Health</th><th>Rules</th><th>Recent activity</th><th>Schedule</th><th>Actions</th></tr></thead>
   <tbody>
   {% for watch in watches %}
-    <tr>
+    <tr{% if not watch.enabled %} class="disabled"{% endif %}>
       <td><strong>{{ watch.id }}</strong><br><small>{{ watch.root }}</small></td>
       <td>{% if watch.healthy %}Healthy{% else %}Unhealthy{% endif %}{% if watch.health_detail %}<br><small>{{ watch.health_detail }}</small>{% endif %}</td>
       <td>{{ watch.rule_count }} rule{% if watch.rule_count != 1 %}s{% endif %}</td>
       <td>{% if watch.recent_activity %}{{ watch.recent_activity.timestamp }}: {{ watch.recent_activity.rule }} {{ watch.recent_activity.action }}{% else %}No activity{% endif %}</td>
+      <td class="schedule">
+        <form hx-patch="/watches/{{ watch.id }}" hx-target="#watch-list" hx-swap="outerHTML">
+          <label class="check"><input type="hidden" name="enabled" value="false"><input type="checkbox" name="enabled" value="true"{% if watch.enabled %} checked{% endif %} onchange="this.form.requestSubmit()"> Enabled</label>
+          <label class="interval">Scan every <input type="number" name="scan_interval"{% if watch.scan_interval_minutes %} value="{{ watch.scan_interval_minutes }}"{% endif %} min="1" step="1" placeholder="Default ({{ watch.scan_interval_default_minutes }} min)"> min</label>
+          <button type="submit">Save</button>
+        </form>
+        <button hx-post="/watches/{{ watch.id }}/scan" hx-target="#watch-feedback" hx-swap="innerHTML">Scan now</button>
+      </td>
       <td><a href="/watches/{{ watch.id }}/rules">Rules</a> <a href="/logs?watch={{ watch.id }}">Logs</a> <button hx-delete="/watches/{{ watch.id }}" hx-confirm="Remove watch '{{ watch.id }}'?" hx-target="#watch-list" hx-swap="outerHTML">Remove</button></td>
     </tr>
   {% endfor %}
   </tbody>
 </table>
+<div id="watch-feedback"></div>
 {% else %}<p>No watch folders configured.</p>{% endif %}
 </section>

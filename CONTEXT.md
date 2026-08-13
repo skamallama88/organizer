@@ -213,6 +213,14 @@ _Avoid_: Lowercased path, filename style
 An access, mount, or permission failure affecting a watch folder or its configured destination root. Organizer pauses that watch folder's planning and execution rather than creating per-item failures.
 _Avoid_: Item failure, unavailable file
 
+**Enabled watch folder**:
+A watch folder whose automatic operation is switched on. Disabled watch folders are never periodically scanned and ignore filesystem events, so Organizer does not automatically plan or execute work for them until they are re-enabled. Manual or forced operations (a "Scan now" request, or an explicit reprocess or retry command) remain available on a disabled watch folder.
+_Avoid_: Active watch, unpaused watch
+
+**Scan interval**:
+The per-watch period between automatic scan/operate cycles, overridable in minutes from the dashboard. It falls back to the global `scan_interval` when a watch does not define its own.
+_Avoid_: Rescan time, cron schedule
+
 **Stable tree**:
 A folder and complete subtree whose tree fingerprint remains unchanged for the configured stability interval. Organizer may quarantine or directly delete a folder only after confirming a stable tree immediately before mutation.
 _Avoid_: Stable folder, recursive delete target

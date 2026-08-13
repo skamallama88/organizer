@@ -20,6 +20,8 @@ app = create_app(
     watch_folders=config.watches,
     db_path=db_path,
     config_path=config.config_path,
+    stability_interval=float(config.stability_interval),
+    scan_interval=float(config.scan_interval),
 )
 
 settings = RuntimeSettings.from_environment()

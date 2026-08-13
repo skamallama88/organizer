@@ -406,6 +406,17 @@ def test_scanner_scans_each_watch_once_on_startup(tmp_path: Path) -> None:
     assert ("slow", slow_item) in processor.calls
 
 
+def test_scanner_never_scanned_watch_is_due_on_fresh_clock(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    configured = watch(tmp_path)
+    scanner = PeriodicScanner((configured,), RecordingProcessor(), interval_seconds=3600)
+    monkeypatch.setattr("organizer.daemon.time.monotonic", lambda: 10.0)
+
+    assert scanner._due_watches({}) == [configured]
+    assert scanner._timeout_until_next({}) == 0.0
+
+
 def test_scanner_skips_disabled_watches(tmp_path: Path) -> None:
     enabled_root = tmp_path / "enabled"
     disabled_root = tmp_path / "disabled"

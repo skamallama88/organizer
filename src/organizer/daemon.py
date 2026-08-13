@@ -357,7 +357,7 @@ class PeriodicScanner:
             if not watch.enabled:
                 continue
             interval = self._watch_interval(watch)
-            if now - last_scans.get(watch.watch_id, 0.0) >= interval:
+            if now - last_scans.get(watch.watch_id, float("-inf")) >= interval:
                 due.append(watch)
         return due
 
@@ -374,7 +374,9 @@ class PeriodicScanner:
             if not watch.enabled:
                 continue
             interval = self._watch_interval(watch)
-            remaining = max(0.0, interval - (now - last_scans.get(watch.watch_id, 0.0)))
+            remaining = max(
+                0.0, interval - (now - last_scans.get(watch.watch_id, float("-inf")))
+            )
             if best is None or remaining < best:
                 best = remaining
         if best is None:

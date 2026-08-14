@@ -299,7 +299,7 @@ class AttemptReview:
     def command(self, attempt_id, command) -> CommandResult: ...
 ```
 
-Bulk actions, live updates, dashboards, and rich archive-content previews are outside the initial UI scope.
+Bulk actions and rich archive-content previews are outside the initial UI scope.
 
 ## Tracking DB
 

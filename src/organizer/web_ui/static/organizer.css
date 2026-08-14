@@ -50,6 +50,15 @@ tr.disabled { opacity: .55; }
 
 .test-heading { margin-top: 2rem; }
 .toolbar { margin: .75rem 0; }
+
+/* Current activity indicator */
+#current-activity { border: 1px solid #888; border-radius: 6px; padding: .5rem .75rem; margin: .5rem 0 1rem; }
+#current-activity h2 { margin: 0 0 .25rem; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; color: #666; }
+#current-activity .activity { margin: 0; }
+#current-activity .activity.operating { color: #4a6; font-weight: 600; }
+#current-activity .activity.waiting { color: #a06a00; }
+#current-activity .activity.idle { color: #888; }
+
 .feedback { padding: .75rem; margin: .5rem 0; }
 .feedback.error { color: #a00000; }
 .feedback.success { color: #006400; }

@@ -16,6 +16,7 @@ from watchdog.observers.polling import PollingObserver
 
 from organizer.config import OrganizerConfig, WatchFolderConfig, rebuild_boundary_policy
 from organizer.item_processor import (
+    BatchProgress,
     DiscoveryBatch,
     ItemProcessor,
     ItemSnapshot,
@@ -94,8 +95,26 @@ class ScanStatus:
     in_flight_batches: int
 
 
+@dataclass(frozen=True)
+class QueueStatus:
+    """Daemon-global snapshot of queued scan/operate work.
+
+    The counts are identical for every watch, so they live on a dedicated
+    read rather than being obtained from one watch's ``ScanStatus``.
+    """
+
+    pending_triggers: int
+    in_flight_batches: int
+
+
 class BatchProcessor(Protocol):
-    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None: ...
+    def process_batch(
+        self,
+        watch: WatchFolderConfig,
+        items: list[Path],
+        *,
+        progress: Callable[[BatchProgress], None] | None = None,
+    ) -> DiscoveryBatch | None: ...
 
 
 class WatchMutator(Protocol):
@@ -109,13 +128,23 @@ class WatchMutator(Protocol):
 
     def scan_status(self, watch_id: str) -> ScanStatus: ...
 
+    def queue_status(self) -> QueueStatus: ...
+
+    def batch_progress(self, watch_id: str) -> BatchProgress | None: ...
+
 
 class ProcessorBatchAdapter:
     def __init__(self, processor: ItemProcessor, stability_interval: float = 0.0) -> None:
         self.processor = processor
         self._stability_interval = stability_interval
 
-    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+    def process_batch(
+        self,
+        watch: WatchFolderConfig,
+        items: list[Path],
+        *,
+        progress: Callable[[BatchProgress], None] | None = None,
+    ) -> DiscoveryBatch | None:
         snapshots: list[ItemSnapshot] = []
         for item in items:
             if not item.exists() or not item.is_relative_to(watch.watch_root):
@@ -134,6 +163,7 @@ class ProcessorBatchAdapter:
             snapshots=snapshots,
             stability_interval=effective_stability_interval(watch.watch_root, self._stability_interval),
             boundary_policy=watch.boundary_policy,
+            progress=progress,
         )
 
 
@@ -322,6 +352,7 @@ class PeriodicScanner:
         self._trigger_event = asyncio.Event()
         self._pending_triggers: set[str] = set()
         self._in_flight: dict[str, asyncio.Task[None]] = {}
+        self._progress: dict[str, BatchProgress] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._logger = logger
         self._health = health
@@ -406,6 +437,9 @@ class PeriodicScanner:
         return best
 
     async def _scan_watch(self, watch: WatchFolderConfig) -> None:
+        def report(progress: BatchProgress) -> None:
+            self._progress[watch.watch_id] = progress
+
         try:
             if watch.watch_root.is_dir():
                 items = [
@@ -413,7 +447,9 @@ class PeriodicScanner:
                     for path in watch.watch_root.rglob("*")
                     if not path.name.startswith(_ORGANIZER_PREFIX)
                 ]
-                await asyncio.to_thread(self._processor.process_batch, watch, items)
+                await asyncio.to_thread(
+                    self._processor.process_batch, watch, items, progress=report
+                )
                 if self._health is not None:
                     self._health.record_scan_ok()
         except Exception as error:  # noqa: BLE001 — never let one batch kill the task
@@ -437,11 +473,13 @@ class PeriodicScanner:
 
     def _reap_finished(self, task: asyncio.Task[None]) -> None:
         """Drop a completed batch from the in-flight guard and wake the loop."""
-        self._in_flight.pop(task.get_name(), None)
+        watch_id = task.get_name()
+        self._in_flight.pop(watch_id, None)
+        self._progress.pop(watch_id, None)
         if not task.cancelled():
             error = task.exception()
             if isinstance(error, Exception):
-                self._log_scan_failure(task.get_name(), error)
+                self._log_scan_failure(watch_id, error)
         if not self._stop_event.is_set():
             self._trigger_event.set()
 
@@ -497,6 +535,24 @@ class PeriodicScanner:
             pending_triggers=len(self._pending_triggers),
             in_flight_batches=len(self._in_flight),
         )
+
+    def queue_status(self) -> QueueStatus:
+        """Daemon-global queue counts, identical for every watch.
+
+        Safe to call from any thread: reads atomic ``len`` counts only.
+        """
+        return QueueStatus(
+            pending_triggers=len(self._pending_triggers),
+            in_flight_batches=len(self._in_flight),
+        )
+
+    def batch_progress(self, watch_id: str) -> BatchProgress | None:
+        """The latest phase/progress snapshot for one in-flight batch.
+
+        Safe to call from any thread: a single-key dict lookup written by the
+        batch worker thread via atomic reference swap.
+        """
+        return self._progress.get(watch_id)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -565,7 +621,7 @@ class OrganizerDaemon:
         self._flush_task: asyncio.Task[None] | None = None
         self._retention_task: asyncio.Task[None] | None = None
         self._stopped = False
-        self._respawn_delay_seconds = 30
+        self._respawn_delay_seconds: float = 30
 
     def daemon_health(self) -> DaemonTaskHealth:
         return DaemonTaskHealth(
@@ -609,6 +665,12 @@ class OrganizerDaemon:
 
     def scan_status(self, watch_id: str) -> ScanStatus:
         return self.scanner.scan_status(watch_id)
+
+    def queue_status(self) -> QueueStatus:
+        return self.scanner.queue_status()
+
+    def batch_progress(self, watch_id: str) -> BatchProgress | None:
+        return self.scanner.batch_progress(watch_id)
 
     def _rebuild_boundary_policy(self) -> None:
         rebuild_boundary_policy(self.watches)
@@ -797,3 +859,9 @@ class DaemonWatchMutator:
 
     def scan_status(self, watch_id: str) -> ScanStatus:
         return self._daemon.scan_status(watch_id)
+
+    def queue_status(self) -> QueueStatus:
+        return self._daemon.queue_status()
+
+    def batch_progress(self, watch_id: str) -> BatchProgress | None:
+        return self._daemon.batch_progress(watch_id)

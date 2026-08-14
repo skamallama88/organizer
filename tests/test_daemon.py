@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from collections.abc import Callable
 
 from organizer.config import WatchFolderConfig
 from organizer.daemon import (
@@ -16,6 +17,7 @@ from organizer.daemon import (
     OrganizerDaemon,
     PeriodicScanner,
     ProcessorBatchAdapter,
+    QueueStatus,
     RetentionService,
     ScanStatus,
     WatcherService,
@@ -26,6 +28,8 @@ from organizer.daemon import (
 )
 from organizer.item_processor import (
     BatchItemStatus,
+    BatchPhase,
+    BatchProgress,
     BoundaryPolicy,
     DiscoveryBatch,
     ItemProcessor,
@@ -38,7 +42,13 @@ class RecordingProcessor:
     def __init__(self) -> None:
         self.calls: list[tuple[str, Path]] = []
 
-    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+    def process_batch(
+        self,
+        watch: WatchFolderConfig,
+        items: list[Path],
+        *,
+        progress: Callable[[BatchProgress], None] | None = None,
+    ) -> DiscoveryBatch | None:
         self.calls.extend((watch.watch_id, item) for item in items)
         return None
 
@@ -50,7 +60,13 @@ class FlakyProcessor:
         self.failures = failures
         self.calls: list[tuple[str, Path]] = []
 
-    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+    def process_batch(
+        self,
+        watch: WatchFolderConfig,
+        items: list[Path],
+        *,
+        progress: Callable[[BatchProgress], None] | None = None,
+    ) -> DiscoveryBatch | None:
         if self.failures > 0:
             self.failures -= 1
             raise sqlite3.OperationalError("database is locked")
@@ -59,7 +75,13 @@ class FlakyProcessor:
 
 
 class AlwaysFailProcessor:
-    def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+    def process_batch(
+        self,
+        watch: WatchFolderConfig,
+        items: list[Path],
+        *,
+        progress: Callable[[BatchProgress], None] | None = None,
+    ) -> DiscoveryBatch | None:
         raise sqlite3.OperationalError("database is locked")
 
 
@@ -281,13 +303,20 @@ def test_scanner_offloads_batch_to_worker_thread(tmp_path: Path) -> None:
     item = configured.watch_root / "movie.mkv"
     item.write_text("movie")
     loop_ref: list[asyncio.AbstractEventLoop] = []
+    loop_thread: threading.Thread | None = None
     batch_thread: threading.Thread | None = None
     started = asyncio.Event()
     release = threading.Event()
     blocked_once = False
 
     class BlockingProcessor:
-        def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+        def process_batch(
+            self,
+            watch: WatchFolderConfig,
+            items: list[Path],
+            *,
+            progress: Callable[[BatchProgress], None] | None = None,
+        ) -> DiscoveryBatch | None:
             nonlocal batch_thread, blocked_once
             batch_thread = threading.current_thread()
             loop_ref[0].call_soon_threadsafe(started.set)
@@ -298,7 +327,9 @@ def test_scanner_offloads_batch_to_worker_thread(tmp_path: Path) -> None:
 
     scanner = PeriodicScanner((configured,), BlockingProcessor(), interval_seconds=0.01)
 
-    async def run() -> None:
+    async def run() -> bool:
+        nonlocal loop_thread
+        loop_thread = threading.current_thread()
         loop_ref.append(asyncio.get_running_loop())
         task = asyncio.create_task(scanner.run())
         await asyncio.wait_for(started.wait(), timeout=2)
@@ -313,8 +344,9 @@ def test_scanner_offloads_batch_to_worker_thread(tmp_path: Path) -> None:
 
     assert responsive
     assert batch_thread is not None
+    assert loop_thread is not None
     assert batch_thread is not threading.main_thread()
-    assert batch_thread is not loop_ref[0]
+    assert batch_thread is not loop_thread
 
 
 def test_scanner_processes_root_items_on_interval(tmp_path: Path) -> None:
@@ -571,7 +603,13 @@ def test_scanner_serves_trigger_while_other_batch_in_flight(tmp_path: Path) -> N
     seen: list[tuple[str, Path]] = []
 
     class GatedProcessor:
-        def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+        def process_batch(
+            self,
+            watch: WatchFolderConfig,
+            items: list[Path],
+            *,
+            progress: Callable[[BatchProgress], None] | None = None,
+        ) -> DiscoveryBatch | None:
             if watch.watch_id == "first":
                 loop_ref[0].call_soon_threadsafe(started.set)
                 release.wait(timeout=5)
@@ -606,7 +644,13 @@ def test_scanner_does_not_rescan_watch_while_batch_in_flight(tmp_path: Path) -> 
     batch_count = 0
 
     class GatedProcessor:
-        def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+        def process_batch(
+            self,
+            watch: WatchFolderConfig,
+            items: list[Path],
+            *,
+            progress: Callable[[BatchProgress], None] | None = None,
+        ) -> DiscoveryBatch | None:
             nonlocal batch_count
             batch_count += 1
             loop_ref[0].call_soon_threadsafe(started.set)
@@ -639,7 +683,13 @@ def test_scanner_scan_status_reflects_in_flight_batch(tmp_path: Path) -> None:
     release = threading.Event()
 
     class GatedProcessor:
-        def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+        def process_batch(
+            self,
+            watch: WatchFolderConfig,
+            items: list[Path],
+            *,
+            progress: Callable[[BatchProgress], None] | None = None,
+        ) -> DiscoveryBatch | None:
             loop_ref[0].call_soon_threadsafe(started.set)
             release.wait(timeout=5)
             return None
@@ -663,6 +713,63 @@ def test_scanner_scan_status_reflects_in_flight_batch(tmp_path: Path) -> None:
     assert status.watch_id == "incoming"
     assert status.pending_triggers == 0
     assert status.in_flight_batches == 1
+
+
+def test_scanner_batch_progress_reflects_phase_and_is_cleared(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    item = configured.watch_root / "movie.mkv"
+    item.write_text("movie")
+    loop_ref: list[asyncio.AbstractEventLoop] = []
+    started = asyncio.Event()
+    release = threading.Event()
+
+    class ProgressProcessor:
+        def process_batch(
+            self,
+            watch: WatchFolderConfig,
+            items: list[Path],
+            *,
+            progress: Callable[[BatchProgress], None] | None = None,
+        ) -> DiscoveryBatch | None:
+            if progress is not None:
+                progress(
+                    BatchProgress(
+                        phase=BatchPhase.OPERATING,
+                        watch_id=watch.watch_id,
+                        current_item=item,
+                        processed=1,
+                        total=1,
+                    )
+                )
+            loop_ref[0].call_soon_threadsafe(started.set)
+            release.wait(timeout=5)
+            return None
+
+    scanner = PeriodicScanner((configured,), ProgressProcessor(), interval_seconds=3600)
+
+    async def run() -> tuple[QueueStatus, BatchProgress | None, BatchProgress | None]:
+        loop_ref.append(asyncio.get_running_loop())
+        task = asyncio.create_task(scanner.run())
+        scanner.trigger("incoming")
+        await asyncio.wait_for(started.wait(), timeout=2)
+        queue = scanner.queue_status()
+        progress = scanner.batch_progress("incoming")
+        release.set()
+        await asyncio.sleep(0.05)
+        cleared = scanner.batch_progress("incoming")
+        scanner.stop()
+        await task
+        return queue, progress, cleared
+
+    queue, progress, cleared = asyncio.run(run())
+
+    assert queue.in_flight_batches == 1
+    assert queue.pending_triggers == 0
+    assert progress is not None
+    assert progress.phase is BatchPhase.OPERATING
+    assert progress.watch_id == "incoming"
+    assert progress.current_item == item
+    assert cleared is None
 
 
 def test_scanner_failure_emits_structured_log_and_records_health(tmp_path: Path) -> None:
@@ -710,7 +817,9 @@ def test_daemon_health_surfaces_last_scan_error(tmp_path: Path) -> None:
         daemon.start()
         await asyncio.sleep(0.04)
         daemon.scanner.stop()
-        await daemon._scanner_task
+        scanner_task = daemon._scanner_task
+        assert scanner_task is not None
+        await scanner_task
 
     asyncio.run(run())
 

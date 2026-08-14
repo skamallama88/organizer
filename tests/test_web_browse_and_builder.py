@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Any, cast
 
 from fastapi.testclient import TestClient
 
@@ -70,7 +71,7 @@ def test_model_to_yaml_and_back(tmp_path: Path) -> None:
     assert "match:" in yaml_text
     assert "move:" in yaml_text
     assert "destination: /data/videos" in yaml_text
-    parsed = _rules_yaml_to_model(yaml_text)
+    parsed = cast(list[dict[str, Any]], _rules_yaml_to_model(yaml_text))
     assert parsed[0]["name"] == "Videos"
     assert parsed[0]["conditions"][0]["name"] == "match"
     assert parsed[0]["conditions"][1]["name"] == "year"
@@ -96,7 +97,7 @@ def test_rules_yaml_to_model_handles_match_and_conditions(tmp_path: Path) -> Non
     actions:
       - copy: {destination: /data/out}
 """
-    model = _rules_yaml_to_model(rules)
+    model = cast(list[dict[str, Any]], _rules_yaml_to_model(rules))
     assert model[0]["name"] == "R"
     assert model[0]["conditions"][0]["name"] == "match"
     assert model[0]["conditions"][1]["name"] == "size"

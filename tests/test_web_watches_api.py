@@ -5,8 +5,13 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from organizer.config import WatchFolderConfig
-from organizer.daemon import ScanStatus, WatchMutator
-from organizer.item_processor import BoundaryPolicy, ItemProcessor
+from organizer.daemon import QueueStatus, ScanStatus, WatchMutator
+from organizer.item_processor import (
+    BatchPhase,
+    BatchProgress,
+    BoundaryPolicy,
+    ItemProcessor,
+)
 from organizer.web import create_app
 
 
@@ -19,6 +24,7 @@ class RecordingMutator:
         self.running: set[str] = set()
         self.pending: int = 0
         self.in_flight: int = 0
+        self.progress: dict[str, BatchProgress] = {}
 
     def add_watch(self, watch: WatchFolderConfig) -> None:
         self.added.append(watch)
@@ -39,6 +45,15 @@ class RecordingMutator:
             pending_triggers=self.pending,
             in_flight_batches=self.in_flight,
         )
+
+    def queue_status(self) -> QueueStatus:
+        return QueueStatus(
+            pending_triggers=self.pending,
+            in_flight_batches=self.in_flight,
+        )
+
+    def batch_progress(self, watch_id: str) -> BatchProgress | None:
+        return self.progress.get(watch_id)
 
 
 def _make_client(
@@ -821,7 +836,7 @@ def test_scan_now_reports_queued_behind_in_flight_batches(tmp_path: Path) -> Non
 
     assert response.status_code == 200
     assert response.json()["detail"] == (
-        "Scan triggered for downloads; queued behind 2 in-flight batch(es) and 1 pending trigger(s)."
+        "Scan triggered for downloads; queued behind 2 in-flight scan(s) and 1 queued scan(s)."
     )
     assert mutator.scanned == ["downloads"]
 
@@ -876,3 +891,86 @@ def test_dashboard_shows_interval_default_placeholder_and_override(tmp_path: Pat
     override_html = client.get("/").text
     assert 'value="10"' in override_html
     assert 'placeholder="Default (5 min)"' in override_html
+
+
+def test_dashboard_shows_idle_when_no_watch_operating(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'id="current-activity"' in response.text
+    assert "Idle" in response.text
+    assert "Scanning" not in response.text
+
+
+def test_dashboard_shows_operating_phase_for_running_watch(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    mutator.running.add("downloads")
+    mutator.progress["downloads"] = BatchProgress(
+        phase=BatchPhase.OPERATING,
+        watch_id="downloads",
+        current_item=Path("movie.mkv"),
+        processed=3,
+        total=5,
+    )
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'id="current-activity"' in response.text
+    assert "Operating on" in response.text
+    assert "<strong>downloads</strong>" in response.text
+    assert "movie.mkv" in response.text
+    assert "Idle" not in response.text
+
+
+def test_dashboard_shows_scanning_phase_default_for_running_watch(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    mutator.running.add("downloads")
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "Scanning" in response.text
+    assert "<strong>downloads</strong>" in response.text
+    assert "Idle" not in response.text
+
+
+def test_dashboard_shows_queued_scans_without_idle(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    mutator.pending = 2
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    response = client.get("/")
+
+    assert "2 scans queued" in response.text
+    assert "Idle" not in response.text
+
+
+def test_activity_poll_fragment_auto_refreshes(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    mutator.running.add("downloads")
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    response = client.get("/activity")
+
+    assert response.status_code == 200
+    assert 'id="current-activity"' in response.text
+    assert 'hx-get="/activity"' in response.text
+    assert 'hx-trigger="every 5s"' in response.text
+    assert "Scanning" in response.text
+    assert "<strong>downloads</strong>" in response.text
+
+
+def test_dashboard_without_daemon_shows_idle(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'id="current-activity"' in response.text
+    assert "Idle" in response.text

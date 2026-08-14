@@ -11,6 +11,7 @@ import subprocess
 import zipfile
 import py7zr
 import rarfile  # type: ignore[import-untyped]
+from typing import Any, cast
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
@@ -23,6 +24,8 @@ from organizer.item_processor import (
     _AttemptStore,
     _open_attempts_db,
     BatchItemStatus,
+    BatchPhase,
+    BatchProgress,
     BoundaryPolicy,
     ExecutionMode,
     ItemProcessor,
@@ -139,8 +142,6 @@ def test_quarantine_preserves_folder_mode(tmp_path: Path) -> None:
 
 
 def _resulting_paths(attempts: list[dict[str, object]], index: int = 0) -> list[str]:
-    from typing import cast
-
     return cast(list[str], attempts[index]["resulting_paths"])
 
 
@@ -966,10 +967,13 @@ def test_move_destination_unknown_condition_capture_is_rejected_at_planning(tmp_
     )
     processor = ItemProcessor(tmp_path / "attempts.db")
 
+    match = re.compile(r"(?P<artist>.+)").match("movie")
+    assert match is not None
+
     with pytest.raises(ValueError, match="condition 'foo' not found"):
         ItemProcessor._validate_action_references(
             [{"move": {"destination": "../foo.\\1"}}],
-            {"match": re.compile(r"(?P<artist>.+)").match("movie")},
+            {"match": match},
         )
 
     with pytest.raises(ValueError):
@@ -1789,7 +1793,9 @@ def test_archive_creates_7z_and_preserves_original(tmp_path: Path) -> None:
     assert report.status == "completed"
     assert item.exists()
     with py7zr.SevenZipFile(archive, "r") as seven_zip:
-        assert seven_zip.readall()["movie.mkv"].read() == b"movie"
+        extracted = seven_zip.readall()
+        assert extracted is not None
+        assert extracted["movie.mkv"].read() == b"movie"
 
 
 def test_unarchive_7z_uses_staging_and_retains_source(tmp_path: Path) -> None:
@@ -2097,7 +2103,7 @@ def fake_7z(monkeypatch: pytest.MonkeyPatch) -> None:
             return "bsdtar"
         return real_which(name)
 
-    def run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         outdir = next(arg[2:] for arg in cmd if arg.startswith("-o"))
         source = cmd[-1]
         return real_run(["bsdtar", "-xf", source, "-C", outdir], **kwargs)
@@ -2620,6 +2626,36 @@ def test_process_batch_executes_eligible_item(tmp_path: Path) -> None:
     assert batch.items[0].report is not None
     assert batch.items[0].report.status == "completed"
     assert (destination / "movie.mkv").read_text() == "movie"
+
+
+def test_process_batch_reports_scanning_then_operating_progress(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshots = [ItemSnapshot(path=item, size=5, mtime=item.stat().st_mtime)]
+    events: list[BatchProgress] = []
+
+    processor.process_batch(
+        "downloads",
+        watch_root,
+        rules,
+        snapshots,
+        stability_interval=0.0,
+        now=1000.0,
+        progress=events.append,
+    )
+
+    assert events
+    assert events[0].phase is BatchPhase.SCANNING
+    assert events[0].processed == 0
+    assert events[0].total == 1
+    assert events[-1].phase is BatchPhase.OPERATING
+    assert events[-1].current_item == item
+    assert events[-1].processed == 0
+    assert any(event.phase is BatchPhase.OPERATING for event in events)
 
 
 def test_process_batch_skips_completed_unchanged_item(tmp_path: Path) -> None:

@@ -8,6 +8,7 @@ import uuid
 import yaml
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import cast
 from fastapi import Body, FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -33,8 +34,13 @@ from organizer.config import (
     validate_watch_id,
     validate_watch_root,
 )
-from organizer.daemon import WatchMutator, effective_stability_interval
-from organizer.item_processor import BoundaryPolicy, ItemProcessor, ItemSnapshot
+from organizer.daemon import QueueStatus, WatchMutator, effective_stability_interval
+from organizer.item_processor import (
+    BatchPhase,
+    BoundaryPolicy,
+    ItemProcessor,
+    ItemSnapshot,
+)
 from organizer.operational_health import DaemonHealthSource, OperationalHealth
 from organizer.structured_log import LogLevel, MemoryLogSink
 
@@ -45,6 +51,28 @@ _TEMPLATES = Jinja2Templates(directory=str(_WEB_ROOT / "templates"))
 _RULE_SAVE_LOCK = threading.Lock()
 _WATCH_SAVE_LOCK = threading.Lock()
 _RUNTIME_WATCHES_LOCK = threading.RLock()
+
+_PHASE_LABELS: dict[str, str] = {
+    BatchPhase.SCANNING.value: "Scanning",
+    BatchPhase.OPERATING.value: "Operating on",
+}
+
+
+@dataclass(frozen=True)
+class Operation:
+    """A single watch the daemon is currently operating on, for the template."""
+
+    watch_id: str
+    label: str
+    current_item: str | None = None
+
+
+@dataclass(frozen=True)
+class CurrentActivity:
+    """Typed template model for the dashboard's current-activity panel."""
+
+    operating: tuple[Operation, ...] = ()
+    queued_scans: int = 0
 
 
 def _resolved_within(path: Path, root: Path) -> bool:
@@ -442,6 +470,45 @@ def create_app(
             )
         return watches
 
+    def _queue_status() -> QueueStatus | None:
+        """Daemon-global queued-work counts, or ``None`` when no daemon runs."""
+        if watch_mutator is None:
+            return None
+        return watch_mutator.queue_status()
+
+    def _current_activity() -> CurrentActivity:
+        """Snapshot of the daemon's currently operating work for the dashboard.
+
+        Global counts come from the dedicated ``queue_status`` read; the
+        operating-watch list and per-watch phase use atomic ``scan_status`` and
+        ``batch_progress`` reads — no daemon shared state is iterated from the
+        web thread.
+        """
+        counts = _queue_status()
+        if counts is None:
+            return CurrentActivity()
+        mutator = watch_mutator
+        assert mutator is not None
+        operating: list[Operation] = []
+        for config in _watch_snapshot():
+            if not mutator.scan_status(config.watch_id).batch_running:
+                continue
+            progress = mutator.batch_progress(config.watch_id)
+            label = _PHASE_LABELS.get(
+                progress.phase, _PHASE_LABELS[BatchPhase.SCANNING.value]
+            ) if progress is not None else _PHASE_LABELS[BatchPhase.SCANNING.value]
+            current_item = (
+                str(progress.current_item)
+                if progress is not None and progress.current_item is not None
+                else None
+            )
+            operating.append(
+                Operation(watch_id=config.watch_id, label=label, current_item=current_item)
+            )
+        return CurrentActivity(
+            operating=tuple(operating), queued_scans=counts.pending_triggers
+        )
+
     def _watch_patch_error(
         request: Request, message: str
     ) -> HTMLResponse | JSONResponse:
@@ -760,10 +827,18 @@ def create_app(
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request) -> HTMLResponse:
         data_roots, _ = _data_roots_and_config_root()
-        context = {"watches": _build_watches(), "data_roots": data_roots}
+        context = {
+            "watches": _build_watches(),
+            "data_roots": data_roots,
+            "activity": _current_activity(),
+        }
         if _is_htmx(request):
             return _fragment(request, "dashboard_content.html", **context)
         return _fragment(request, "dashboard.html", **context)
+
+    @app.get("/activity", response_class=HTMLResponse)
+    def current_activity(request: Request) -> HTMLResponse:
+        return _fragment(request, "current_activity.html", activity=_current_activity())
 
     @app.get("/watches/new", response_class=HTMLResponse)
     def new_watch_form(request: Request) -> HTMLResponse:
@@ -1522,7 +1597,11 @@ def create_app(
             return _TEMPLATES.TemplateResponse(
                 request,
                 "dashboard_content.html",
-                {"watches": _build_watches(), "data_roots": data_roots},
+                {
+                    "watches": _build_watches(),
+                    "data_roots": data_roots,
+                    "activity": _current_activity(),
+                },
             )
         return {"id": watch_id, "root": str(root_path), "rules_path": str(rules_path_value)}
 
@@ -1699,15 +1778,16 @@ def create_app(
                 )
             return JSONResponse(status_code=501, content={"detail": message})
         status = watch_mutator.scan_status(watch_id)
+        counts = _queue_status()
         if status.batch_running:
             detail = f"Scan already running for {watch_id}."
         else:
             watch_mutator.trigger_scan(watch_id)
-            if status.pending_triggers or status.in_flight_batches:
+            if counts is not None and (counts.pending_triggers or counts.in_flight_batches):
                 detail = (
                     f"Scan triggered for {watch_id}; queued behind "
-                    f"{status.in_flight_batches} in-flight batch(es) and "
-                    f"{status.pending_triggers} pending trigger(s)."
+                    f"{counts.in_flight_batches} in-flight scan(s) and "
+                    f"{counts.pending_triggers} queued scan(s)."
                 )
             else:
                 detail = f"Scan triggered for {watch_id}."

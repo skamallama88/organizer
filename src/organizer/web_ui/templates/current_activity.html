@@ -1,0 +1,10 @@
+<section id="current-activity" hx-get="/activity" hx-trigger="every 5s" hx-swap="outerHTML">
+  <h2>Current activity</h2>
+  {% if activity.operating %}
+    <p class="activity operating">{% for op in activity.operating %}{{ op.label }} <strong>{{ op.watch_id }}</strong>{% if op.current_item %} — {{ op.current_item }}{% endif %}{% if not loop.last %}; {% endif %}{% endfor %}</p>
+  {% elif activity.queued_scans %}
+    <p class="activity waiting">{{ activity.queued_scans }} scan{% if activity.queued_scans != 1 %}s{% endif %} queued</p>
+  {% else %}
+    <p class="activity idle">Idle</p>
+  {% endif %}
+</section>

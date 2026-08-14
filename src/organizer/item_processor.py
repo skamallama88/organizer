@@ -12,6 +12,7 @@ import subprocess
 import time
 import uuid
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -20,6 +21,7 @@ from typing import Any
 
 import yaml
 import py7zr
+from py7zr.exceptions import ArchiveError as _Py7zArchiveError
 import rarfile  # type: ignore[import-untyped]
 
 from organizer.structured_log import LogEntry, LogLevel, LogResult, StructuredLogger
@@ -180,6 +182,32 @@ class DiscoveryBatch:
     watch_id: str
     items: tuple[BatchItemResult, ...]
     diagnostics: tuple[str, ...]
+
+
+class BatchPhase(StrEnum):
+    """The phase an in-flight batch is currently in, reported via progress.
+
+    ``SCANNING`` covers discovering and evaluating items (stability, identity,
+    planning); ``OPERATING`` covers executing an item's planned actions.
+    """
+
+    SCANNING = "scanning"
+    OPERATING = "operating"
+
+
+@dataclass(frozen=True)
+class BatchProgress:
+    """Snapshot of an in-flight batch's phase, reported by ``process_batch``.
+
+    Written from the batch worker thread into the daemon's per-watch progress
+    slot via a callback; read atomically by the web thread.
+    """
+
+    phase: BatchPhase
+    watch_id: str
+    current_item: Path | None = None
+    processed: int = 0
+    total: int = 0
 
 
 class NeedsReconciliationError(Exception):
@@ -875,7 +903,7 @@ class ItemProcessor:
                         result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
                     results.append(result)
                     self._emit(plan, result)
-            except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, lzma.LZMAError, py7zr.exceptions.ArchiveError, rarfile.Error, rarfile.RarCannotExec) as error:
+            except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, lzma.LZMAError, _Py7zArchiveError, rarfile.Error, rarfile.RarCannotExec) as error:
                 classification = "password-protected archive" if isinstance(error, (RuntimeError, rarfile.PasswordRequired)) else type(error).__name__
                 detail = f"{classification}: {error}"
                 result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", detail, source=source)
@@ -1105,7 +1133,7 @@ class ItemProcessor:
         try:
             try:
                 self._extract_entries_stdlib(source, staging, limits)
-            except (zipfile.BadZipFile, lzma.LZMAError, py7zr.exceptions.ArchiveError) as original:
+            except (zipfile.BadZipFile, lzma.LZMAError, _Py7zArchiveError) as original:
                 # The stdlib reader rejected a structurally-inconsistent zip or
                 # an archive the stdlib decoder is stricter about (e.g. a .7z the
                 # strict lzma coder rejects but 7-Zip extracts fine). Fall back to
@@ -1123,7 +1151,7 @@ class ItemProcessor:
             if max_depth > 0:
                 self._extract_nested_archives(staging, limits, max_depth, 1)
             return staging
-        except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, lzma.LZMAError, py7zr.exceptions.ArchiveError, rarfile.Error, rarfile.RarCannotExec):
+        except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, lzma.LZMAError, _Py7zArchiveError, rarfile.Error, rarfile.RarCannotExec):
             self._remove_tree(staging)
             raise
 
@@ -1826,8 +1854,25 @@ class ItemProcessor:
         boundary_policy: BoundaryPolicy | None = None,
         now: float | None = None,
         dry_run: bool = False,
+        progress: Callable[[BatchProgress], None] | None = None,
     ) -> DiscoveryBatch:
         current_time = now if now is not None else time.time()
+        total = len(snapshots)
+        processed = 0
+
+        def emit_progress(phase: BatchPhase, current_item: Path | None = None) -> None:
+            if progress is not None:
+                progress(
+                    BatchProgress(
+                        phase=phase,
+                        watch_id=watch_id,
+                        current_item=current_item,
+                        processed=processed,
+                        total=total,
+                    )
+                )
+
+        emit_progress(BatchPhase.SCANNING)
 
         if not self.check_watch_folder_health(watch_id, watch_root):
             return self._pause_batch(watch_id, "watch folder unhealthy: paused", snapshots, diagnostic="watch folder unhealthy: processing paused")
@@ -1842,6 +1887,7 @@ class ItemProcessor:
         quarantine_root = boundary_policy.quarantine_root if boundary_policy else None
         for snapshot in snapshots:
             canonical = self._canonical_path(snapshot.path)
+            emit_progress(BatchPhase.SCANNING, canonical)
             if quarantine_root and self._is_within(canonical, self._canonical_path(quarantine_root)):
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.SKIPPED, detail="organizer-managed path"))
                 continue
@@ -1887,6 +1933,7 @@ class ItemProcessor:
             try:
                 plan = self.plan(request)
                 mode = ExecutionMode.DRY_RUN if dry_run else ExecutionMode.APPLY
+                emit_progress(BatchPhase.OPERATING, canonical)
                 report = self.execute(plan, mode)
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.EXECUTED, report=report))
             except ValueError as error:
@@ -1900,6 +1947,7 @@ class ItemProcessor:
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
             except OSError as error:
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
+            processed += 1
         if has_deferred:
             diagnostics_set.add("deferred: unstable items withheld from planning")
         if no_match_sources:

@@ -13,6 +13,7 @@ venv/
 .playwright-mcp/
 .idea/
 .vscode/
+.zed/
 *.swp
 *.swo
 *~

@@ -12,6 +12,7 @@ import subprocess
 import time
 import uuid
 import zipfile
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,6 +35,26 @@ _DB_BUSY_TIMEOUT_MS = 30_000
 
 class _SevenZipExtractionError(Exception):
     """The system 7z tool failed to extract an archive."""
+
+
+_ARCHIVE_DECODER_ERRORS = (
+    zipfile.BadZipFile,
+    lzma.LZMAError,
+    zlib.error,
+    _Py7zArchiveError,
+)
+
+_ARCHIVE_ERRORS = (
+    OSError,
+    ValueError,
+    zipfile.BadZipFile,
+    RuntimeError,
+    lzma.LZMAError,
+    zlib.error,
+    _Py7zArchiveError,
+    rarfile.Error,
+    rarfile.RarCannotExec,
+)
 
 
 def iso_timestamp(value: str) -> str:
@@ -903,7 +924,7 @@ class ItemProcessor:
                         result = ActionResult(action.kind, action.target, "OK", source=action_source, resulting_path=source)
                     results.append(result)
                     self._emit(plan, result)
-            except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, lzma.LZMAError, _Py7zArchiveError, rarfile.Error, rarfile.RarCannotExec) as error:
+            except _ARCHIVE_ERRORS as error:
                 classification = "password-protected archive" if isinstance(error, (RuntimeError, rarfile.PasswordRequired)) else type(error).__name__
                 detail = f"{classification}: {error}"
                 result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", detail, source=source)
@@ -1133,11 +1154,12 @@ class ItemProcessor:
         try:
             try:
                 self._extract_entries_stdlib(source, staging, limits)
-            except (zipfile.BadZipFile, lzma.LZMAError, _Py7zArchiveError) as original:
-                # The stdlib reader rejected a structurally-inconsistent zip or
-                # an archive the stdlib decoder is stricter about (e.g. a .7z the
-                # strict lzma coder rejects but 7-Zip extracts fine). Fall back to
-                # the 7z tool, which tolerates both, then validate its output. If
+            except _ARCHIVE_DECODER_ERRORS as original:
+                # The stdlib reader rejected a structurally-inconsistent zip,
+                # a mid-stream corrupt deflate stream, or an archive the stdlib
+                # decoder is stricter about (e.g. a .7z the strict lzma coder
+                # rejects but 7-Zip extracts fine). Fall back to the 7z tool,
+                # which tolerates all of these, then validate its output. If
                 # 7z also fails the archive is genuinely corrupt — surface the
                 # original stdlib error so the diagnostic stays meaningful. A
                 # safety rejection from validating 7z's output is NOT masked; it
@@ -1151,7 +1173,7 @@ class ItemProcessor:
             if max_depth > 0:
                 self._extract_nested_archives(staging, limits, max_depth, 1)
             return staging
-        except (zipfile.BadZipFile, RuntimeError, ValueError, OSError, lzma.LZMAError, _Py7zArchiveError, rarfile.Error, rarfile.RarCannotExec):
+        except _ARCHIVE_ERRORS:
             self._remove_tree(staging)
             raise
 
@@ -1945,8 +1967,8 @@ class ItemProcessor:
                 elif "no valid rule matched" in str(error):
                     no_match_sources.append(canonical)
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
-            except OSError as error:
-                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
+            except Exception as error:
+                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=f"{type(error).__name__}: {error}"))
             processed += 1
         if has_deferred:
             diagnostics_set.add("deferred: unstable items withheld from planning")

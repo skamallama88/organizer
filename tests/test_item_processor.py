@@ -9,6 +9,7 @@ import sqlite3
 import struct
 import subprocess
 import zipfile
+import zlib
 import py7zr
 import rarfile  # type: ignore[import-untyped]
 from typing import Any, cast
@@ -23,6 +24,7 @@ import pytest
 from organizer.item_processor import (
     _AttemptStore,
     _open_attempts_db,
+    _SevenZipExtractionError,
     BatchItemStatus,
     BatchPhase,
     BatchProgress,
@@ -1963,6 +1965,14 @@ def make_corrupt_7z(path: Path) -> None:
     source.unlink()
 
 
+def raise_corrupt_deflate(_source: Path, _staging: Path, _limits: tuple[int, int, int]) -> None:
+    raise zlib.error("Error -3 while decompressing data: invalid block type")
+
+
+def fail_7z_stub(_source: Path, _staging: Path) -> None:
+    raise _SevenZipExtractionError("7z failed")
+
+
 def test_unarchive_7z_corrupt_lzma_fails_per_item_and_suppresses(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()
@@ -2006,6 +2016,89 @@ def test_process_batch_survives_corrupt_7z_and_processes_rest(tmp_path: Path) ->
     assert bad_item.report is not None
     assert bad_item.report.status == "failed"
     assert "LZMAError" in bad_item.report.actions[-1].detail
+    assert good_item.status == "executed"
+    assert good_item.report is not None
+    assert good_item.report.status == "completed"
+    assert (watch_root / "good" / "ok.txt").read_text() == "content"
+
+
+def test_unarchive_zlib_error_classifies_and_suppresses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mid-stream corrupt deflate stream (``zlib.error``) must become a normal
+    per-item failure — a ``failed`` attempt with ``archive-input`` suppression —
+    not escape to abort the whole watch batch (issue #27)."""
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.zip"
+    make_zip(archive, {"folder/file.txt": "content"})
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    monkeypatch.setattr(processor, "_extract_entries_stdlib", raise_corrupt_deflate)
+    monkeypatch.setattr(processor, "_extract_with_7z", fail_7z_stub)
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "failed"
+    assert "Error -3 while decompressing data" in report.actions[-1].detail
+    assert archive.exists()
+    assert processor.has_suppressed_attempt("downloads", archive, processor._fingerprint(archive)) is True
+
+
+def test_unarchive_routes_corrupt_deflate_to_7z_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A corrupt deflate stream should fall back to the 7z tool, which is more
+    tolerant of damaged deflate streams than stdlib zipfile."""
+    fake_7z(monkeypatch)
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    archive = watch_root / "bundle.zip"
+    with zipfile.ZipFile(archive, "w") as seven_zip:
+        seven_zip.writestr("folder/file.txt", "content")
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    monkeypatch.setattr(processor, "_extract_entries_stdlib", raise_corrupt_deflate)
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "completed"
+    assert (watch_root / "bundle" / "folder" / "file.txt").read_text() == "content"
+
+
+def test_process_batch_survives_zlib_error_and_processes_rest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    bad = watch_root / "bundle.zip"
+    make_zip(bad, {"ok.txt": "content"})
+    good = watch_root / "good.zip"
+    make_zip(good, {"ok.txt": "content"})
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshots = [
+        ItemSnapshot(path=bad, size=bad.stat().st_size, mtime=bad.stat().st_mtime),
+        ItemSnapshot(path=good, size=good.stat().st_size, mtime=good.stat().st_mtime),
+    ]
+
+    original_stdlib = processor._extract_entries_stdlib
+
+    def fail_stdlib(source: Path, staging: Path, limits: tuple[int, int, int]) -> None:
+        if source == bad.resolve():
+            raise zlib.error("Error -3 while decompressing data: invalid block type")
+        return original_stdlib(source, staging, limits)
+
+    monkeypatch.setattr(processor, "_extract_entries_stdlib", fail_stdlib)
+    monkeypatch.setattr(processor, "_extract_with_7z", fail_7z_stub)
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=0.0, now=1000.0,
+    )
+
+    by_source = {item.source: item for item in batch.items}
+    bad_item = by_source[bad]
+    good_item = by_source[good]
+    assert bad_item.status == "executed"
+    assert bad_item.report is not None
+    assert bad_item.report.status == "failed"
+    assert "Error -3 while decompressing data" in bad_item.report.actions[-1].detail
     assert good_item.status == "executed"
     assert good_item.report is not None
     assert good_item.report.status == "completed"

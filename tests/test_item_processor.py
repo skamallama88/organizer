@@ -1643,6 +1643,25 @@ def test_archive_creates_named_file_and_records_result(tmp_path: Path) -> None:
     assert processor.attempts()[0]["resulting_paths"] == [str(archive)]
 
 
+def test_archive_of_loose_file_with_non_default_mode_succeeds(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "archives"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    item.chmod(0o666)
+    rules = write_archive_rules(watch_root / "rules.yaml", "../archives", preserve_original=False)
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    archive = destination / "movie.mkv.zip"
+    assert report.status == "completed"
+    assert archive.exists()
+    assert not item.exists()
+
+
 def test_zip_archive_preserves_empty_directories_and_symlinks(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     destination = tmp_path / "archives"
@@ -1985,6 +2004,70 @@ def test_process_batch_survives_corrupt_7z_and_processes_rest(tmp_path: Path) ->
     assert good_item.report is not None
     assert good_item.report.status == "completed"
     assert (watch_root / "good" / "ok.txt").read_text() == "content"
+
+
+def test_process_batch_survives_fingerprint_permission_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    unreadable = watch_root / "junk.mkv"
+    unreadable.write_text("junk")
+    good = watch_root / "good.mkv"
+    good.write_text("good")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshots = [
+        ItemSnapshot(path=unreadable, size=4, mtime=unreadable.stat().st_mtime),
+        ItemSnapshot(path=good, size=4, mtime=good.stat().st_mtime),
+    ]
+
+    original_fingerprint = processor._fingerprint
+
+    def failing_fingerprint(path: Path) -> str:
+        if path == unreadable.resolve():
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return original_fingerprint(path)
+
+    monkeypatch.setattr(processor, "_fingerprint", failing_fingerprint)
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=0.0, now=1000.0,
+    )
+
+    by_source = {item.source.name: item for item in batch.items}
+    assert by_source["junk.mkv"].status == "failed"
+    assert "Permission denied" in by_source["junk.mkv"].detail
+    assert by_source["good.mkv"].status == "executed"
+    assert (destination / "good.mkv").read_text() == "good"
+
+
+def test_process_batch_survives_vanish_before_fingerprint(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    vanished = watch_root / "gone.mkv"
+    vanished.write_text("gone")
+    good = watch_root / "good.mkv"
+    good.write_text("good")
+    rules = write_move_rules(watch_root / "rules.yaml", "../videos")
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    snapshots = [
+        ItemSnapshot(path=vanished, size=4, mtime=vanished.stat().st_mtime),
+        ItemSnapshot(path=good, size=4, mtime=good.stat().st_mtime),
+    ]
+    vanished.unlink()
+
+    batch = processor.process_batch(
+        "downloads", watch_root, rules, snapshots, stability_interval=0.0, now=1000.0,
+    )
+
+    by_source = {item.source.name: item for item in batch.items}
+    assert by_source["gone.mkv"].status == "skipped"
+    assert "disappeared" in by_source["gone.mkv"].detail.lower()
+    assert by_source["good.mkv"].status == "executed"
+    assert (destination / "good.mkv").read_text() == "good"
 
 
 def make_mismatch_zip(path: Path, name: str = "real_name_inside.jpg") -> None:

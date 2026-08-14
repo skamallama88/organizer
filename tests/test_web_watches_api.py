@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from organizer.config import WatchFolderConfig
-from organizer.daemon import WatchMutator
+from organizer.daemon import ScanStatus, WatchMutator
 from organizer.item_processor import BoundaryPolicy, ItemProcessor
 from organizer.web import create_app
 
@@ -16,6 +16,9 @@ class RecordingMutator:
         self.removed: list[str] = []
         self.updated: list[WatchFolderConfig] = []
         self.scanned: list[str] = []
+        self.running: set[str] = set()
+        self.pending: int = 0
+        self.in_flight: int = 0
 
     def add_watch(self, watch: WatchFolderConfig) -> None:
         self.added.append(watch)
@@ -28,6 +31,14 @@ class RecordingMutator:
 
     def trigger_scan(self, watch_id: str) -> None:
         self.scanned.append(watch_id)
+
+    def scan_status(self, watch_id: str) -> ScanStatus:
+        return ScanStatus(
+            watch_id=watch_id,
+            batch_running=watch_id in self.running,
+            pending_triggers=self.pending,
+            in_flight_batches=self.in_flight,
+        )
 
 
 def _make_client(
@@ -602,6 +613,53 @@ def test_reprocess_attempt_endpoint_returns_422_when_source_missing(tmp_path: Pa
     assert "movie.mkv" in payload["detail"]
 
 
+def test_mutating_attempt_endpoint_with_text_html_accept_returns_json(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "videos"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "movie.mkv"
+    item.write_text("movie")
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        """rules:
+  - name: move
+    match: {field: file_name, pattern: '.*'}
+    actions:
+      - move: {destination: ../videos}
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+    fingerprint = processor._fingerprint(item)
+    import sqlite3
+    with sqlite3.connect(tmp_path / "attempts.db") as conn:
+        conn.execute(
+            "INSERT INTO processing_attempts (attempt_id, watch_id, source_path, rule_name, status, resulting_paths, source_fingerprint, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("stale-completed", "downloads", str(item), "move", "completed", "[]", fingerprint, "1000.0"),
+        )
+    config = WatchFolderConfig(
+        watch_id="downloads",
+        watch_root=watch_root,
+        rules_path=rules_path,
+        boundary_policy=BoundaryPolicy(
+            data_roots=(tmp_path,),
+            config_root=tmp_path / "config",
+            allowed_destinations=(tmp_path,),
+            watch_roots=(watch_root,),
+        ),
+    )
+    client = TestClient(create_app(processor, watch_folders=[config]))
+
+    response = client.post(
+        "/attempts/stale-completed/reprocess",
+        headers={"accept": "text/html"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert "<p" not in response.text
+
+
 def test_patch_watch_disables_and_persists(tmp_path: Path) -> None:
     mutator = RecordingMutator()
     client, config_path = _make_client(tmp_path, mutator=mutator)
@@ -750,6 +808,48 @@ def test_scan_now_text_html_accept_returns_json(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.json() == {"watch_id": "downloads", "detail": "Scan triggered for downloads."}
     assert "<p" not in response.text
+    assert mutator.scanned == ["downloads"]
+
+
+def test_scan_now_reports_queued_behind_in_flight_batches(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    mutator.in_flight = 2
+    mutator.pending = 1
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    response = client.post("/watches/downloads/scan")
+
+    assert response.status_code == 200
+    assert response.json()["detail"] == (
+        "Scan triggered for downloads; queued behind 2 in-flight batch(es) and 1 pending trigger(s)."
+    )
+    assert mutator.scanned == ["downloads"]
+
+
+def test_scan_now_reports_already_running(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    mutator.running.add("downloads")
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    response = client.post("/watches/downloads/scan")
+
+    assert response.status_code == 200
+    assert response.json()["detail"] == "Scan already running for downloads."
+    assert mutator.scanned == []
+
+
+def test_scan_now_htmx_accept_text_html_returns_fragment(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    client, _ = _make_client(tmp_path, mutator=mutator)
+
+    response = client.post(
+        "/watches/downloads/scan",
+        headers={"accept": "text/html", "HX-Request": "true"},
+    )
+
+    assert response.status_code == 200
+    assert "<p" in response.text
+    assert response.text.startswith('<p class="feedback success">')
     assert mutator.scanned == ["downloads"]
 
 

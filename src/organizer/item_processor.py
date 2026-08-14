@@ -825,7 +825,13 @@ class ItemProcessor:
                         result = ActionResult(action.kind, action.target, "OK", source=source, resulting_path=action.target)
                         source = action.target
                     elif action.kind == "archive":
-                        self._stage_validate_publish(plan, source, action.target, self._archive_to_staging)
+                        self._stage_validate_publish(
+                            plan,
+                            source,
+                            action.target,
+                            self._archive_to_staging,
+                            enforce_mode_preservation=False,
+                        )
                         if not action.preserve_original:
                             try:
                                 self._ensure_source_unchanged(plan, source, action, results, attempt_id)
@@ -893,6 +899,8 @@ class ItemProcessor:
         source: Path,
         target: Path,
         stage: Any,
+        *,
+        enforce_mode_preservation: bool = True,
     ) -> None:
         staging = stage(source, target)
         try:
@@ -902,7 +910,13 @@ class ItemProcessor:
             raise OSError(str(error)) from error
         source_mode = source.stat().st_mode & 0o7777 if source.is_file() and not source.is_symlink() else None
         self._publish_staged(staging, target)
-        if source_mode is not None and not target.is_symlink() and target.is_file() and target.stat().st_mode & 0o7777 != source_mode:
+        if (
+            enforce_mode_preservation
+            and source_mode is not None
+            and not target.is_symlink()
+            and target.is_file()
+            and target.stat().st_mode & 0o7777 != source_mode
+        ):
             raise OSError(f"POSIX mode bits were not preserved: {source} -> {target}")
 
     @staticmethod
@@ -1831,15 +1845,29 @@ class ItemProcessor:
             if quarantine_root and self._is_within(canonical, self._canonical_path(quarantine_root)):
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.SKIPPED, detail="organizer-managed path"))
                 continue
-            if not self.is_stable(watch_id, snapshot, now=current_time, stability_interval=stability_interval):
-                detail = (
-                    f"unstable: first observation at {time.strftime('%H:%M:%S', time.localtime(current_time))}, "
-                    f"stability interval {stability_interval:g}s; will re-check on next scan tick"
+            try:
+                stable = self.is_stable(watch_id, snapshot, now=current_time, stability_interval=stability_interval)
+                if not stable:
+                    detail = (
+                        f"unstable: first observation at {time.strftime('%H:%M:%S', time.localtime(current_time))}, "
+                        f"stability interval {stability_interval:g}s; will re-check on next scan tick"
+                    )
+                    results.append(BatchItemResult(source=canonical, status=BatchItemStatus.DEFERRED, detail=detail))
+                    has_deferred = True
+                    continue
+                fingerprint = self._fingerprint(canonical)
+            except FileNotFoundError as error:
+                results.append(
+                    BatchItemResult(
+                        source=canonical,
+                        status=BatchItemStatus.SKIPPED,
+                        detail=f"item disappeared during scan: {error}",
+                    )
                 )
-                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.DEFERRED, detail=detail))
-                has_deferred = True
                 continue
-            fingerprint = self._fingerprint(canonical)
+            except OSError as error:
+                results.append(BatchItemResult(source=canonical, status=BatchItemStatus.FAILED, detail=str(error)))
+                continue
             if self.has_completed_attempt(watch_id, canonical, fingerprint):
                 results.append(BatchItemResult(source=canonical, status=BatchItemStatus.SKIPPED, detail="already completed"))
                 continue

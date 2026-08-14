@@ -79,6 +79,21 @@ class DaemonHealthState:
             self.scanner_alive = True
 
 
+@dataclass(frozen=True)
+class ScanStatus:
+    """Honest snapshot of the scanner's queue for one watch.
+
+    Surfaced by ``POST /watches/{id}/scan`` so the response reflects whether a
+    manual trigger was accepted, is already running, or is queued behind
+    in-flight work.
+    """
+
+    watch_id: str
+    batch_running: bool
+    pending_triggers: int
+    in_flight_batches: int
+
+
 class BatchProcessor(Protocol):
     def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None: ...
 
@@ -91,6 +106,8 @@ class WatchMutator(Protocol):
     def update_watch(self, watch: WatchFolderConfig) -> None: ...
 
     def trigger_scan(self, watch_id: str) -> None: ...
+
+    def scan_status(self, watch_id: str) -> ScanStatus: ...
 
 
 class ProcessorBatchAdapter:
@@ -304,6 +321,7 @@ class PeriodicScanner:
         self._stop_event = asyncio.Event()
         self._trigger_event = asyncio.Event()
         self._pending_triggers: set[str] = set()
+        self._in_flight: dict[str, asyncio.Task[None]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._logger = logger
         self._health = health
@@ -356,6 +374,8 @@ class PeriodicScanner:
         for watch in self._watches:
             if not watch.enabled:
                 continue
+            if watch.watch_id in self._in_flight:
+                continue
             interval = self._watch_interval(watch)
             if now - last_scans.get(watch.watch_id, float("-inf")) >= interval:
                 due.append(watch)
@@ -373,6 +393,8 @@ class PeriodicScanner:
         for watch in self._watches:
             if not watch.enabled:
                 continue
+            if watch.watch_id in self._in_flight:
+                continue
             interval = self._watch_interval(watch)
             remaining = max(
                 0.0, interval - (now - last_scans.get(watch.watch_id, float("-inf")))
@@ -383,8 +405,7 @@ class PeriodicScanner:
             return self._interval_seconds
         return best
 
-    async def _scan_watch(self, watch: WatchFolderConfig, last_scans: dict[str, float]) -> None:
-        last_scans[watch.watch_id] = time.monotonic()
+    async def _scan_watch(self, watch: WatchFolderConfig) -> None:
         try:
             if watch.watch_root.is_dir():
                 items = [
@@ -398,6 +419,32 @@ class PeriodicScanner:
         except Exception as error:  # noqa: BLE001 — never let one batch kill the task
             self._log_scan_failure(watch.watch_id, error)
 
+    def _launch_scan(self, watch: WatchFolderConfig, last_scans: dict[str, float]) -> None:
+        """Start one watch's batch as an independent task.
+
+        A per-watch in-flight guard prevents the same watch from being scanned
+        concurrently with itself. Each batch runs to completion in its own task,
+        so a long batch on one watch never blocks other watches' scans or queued
+        manual triggers.
+        """
+        if watch.watch_id in self._in_flight:
+            return
+        last_scans[watch.watch_id] = time.monotonic()
+        task = asyncio.create_task(self._scan_watch(watch))
+        task.set_name(watch.watch_id)
+        self._in_flight[watch.watch_id] = task
+        task.add_done_callback(self._reap_finished)
+
+    def _reap_finished(self, task: asyncio.Task[None]) -> None:
+        """Drop a completed batch from the in-flight guard and wake the loop."""
+        self._in_flight.pop(task.get_name(), None)
+        if not task.cancelled():
+            error = task.exception()
+            if isinstance(error, Exception):
+                self._log_scan_failure(task.get_name(), error)
+        if not self._stop_event.is_set():
+            self._trigger_event.set()
+
     async def run(self) -> None:
         """Periodically scan each enabled watch root for new items.
 
@@ -408,22 +455,27 @@ class PeriodicScanner:
         ``trigger`` requests are processed immediately on the next loop
         iteration, so a manual "scan now" does not wait for the interval.
 
-        The per-batch ``try/except`` is the PRIMARY resilience guard: one bad
-        batch (e.g. a transient ``database is locked``) is logged and the loop
-        simply continues on the next tick. The task only dies if something
-        escapes this loop body, which ``OrganizerDaemon._on_task_done`` treats
-        as a crash and respawns.
+        Batches run as independent tasks with a per-watch in-flight guard: a
+        long-running batch on one watch does not block another watch's scheduled
+        scan or a manual trigger, and no watch is ever scanned concurrently with
+        itself. The per-batch ``try/except`` is the PRIMARY resilience guard:
+        one bad batch (e.g. a transient ``database is locked``) is logged and
+        the loop simply continues on the next tick. The task only dies if
+        something escapes this loop body, which ``OrganizerDaemon._on_task_done``
+        treats as a crash and respawns.
         """
         self._loop = asyncio.get_running_loop()
         last_scans: dict[str, float] = {}
         while not self._stop_event.is_set():
-            for watch in self._due_watches(last_scans):
-                await self._scan_watch(watch, last_scans)
+            # Manual triggers are serviced BEFORE scheduled scans so a "scan
+            # now" is never starved by a sibling watch's long-running batch.
             pending, self._pending_triggers = self._pending_triggers, set()
             for watch_id in pending:
                 triggered_watch = self._find_watch(watch_id)
                 if triggered_watch is not None:
-                    await self._scan_watch(triggered_watch, last_scans)
+                    self._launch_scan(triggered_watch, last_scans)
+            for watch in self._due_watches(last_scans):
+                self._launch_scan(watch, last_scans)
             try:
                 await asyncio.wait_for(
                     self._trigger_event.wait(),
@@ -432,6 +484,19 @@ class PeriodicScanner:
             except asyncio.TimeoutError:
                 pass
             self._trigger_event.clear()
+
+    def scan_status(self, watch_id: str) -> ScanStatus:
+        """Snapshot the scanner's queue state for a watch.
+
+        Safe to call from any thread: reads atomically-copied counts from the
+        in-flight guard and pending trigger set.
+        """
+        return ScanStatus(
+            watch_id=watch_id,
+            batch_running=watch_id in self._in_flight,
+            pending_triggers=len(self._pending_triggers),
+            in_flight_batches=len(self._in_flight),
+        )
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -541,6 +606,9 @@ class OrganizerDaemon:
     def trigger_scan(self, watch_id: str) -> None:
         """Request an immediate scan/operate cycle for one watch root."""
         self.scanner.trigger(watch_id)
+
+    def scan_status(self, watch_id: str) -> ScanStatus:
+        return self.scanner.scan_status(watch_id)
 
     def _rebuild_boundary_policy(self) -> None:
         rebuild_boundary_policy(self.watches)
@@ -726,3 +794,6 @@ class DaemonWatchMutator:
 
     def trigger_scan(self, watch_id: str) -> None:
         self._daemon.trigger_scan(watch_id)
+
+    def scan_status(self, watch_id: str) -> ScanStatus:
+        return self._daemon.scan_status(watch_id)

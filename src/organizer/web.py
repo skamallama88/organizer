@@ -276,7 +276,13 @@ def create_app(
         ) == "true" or "text/html" in request.headers.get("accept", "")
 
     def _is_htmx(request: Request) -> bool:
-        """Strict htmx check for fragment-returning mutating endpoints."""
+        """Strict htmx check for fragment-returning mutating endpoints.
+
+        Dispatch rule: ``GET`` content-negotiation endpoints use the broad
+        ``_is_html_request``; every fragment-returning mutating handler routes
+        through this helper so a non-htmx client POSTing with a ``text/html``
+        ``Accept`` header still receives JSON.
+        """
         return request.headers.get("HX-Request") == "true"
 
     def _form_or_json(body: bytes) -> dict[str, object]:
@@ -755,7 +761,7 @@ def create_app(
     def dashboard(request: Request) -> HTMLResponse:
         data_roots, _ = _data_roots_and_config_root()
         context = {"watches": _build_watches(), "data_roots": data_roots}
-        if request.headers.get("HX-Request") == "true":
+        if _is_htmx(request):
             return _fragment(request, "dashboard_content.html", **context)
         return _fragment(request, "dashboard.html", **context)
 
@@ -1044,7 +1050,7 @@ def create_app(
             )
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
-        if _is_html_request(request):
+        if _is_htmx(request):
             return _fragment(
                 request, "command_feedback.html", result=result, attempt_id=attempt_id
             )
@@ -1068,7 +1074,7 @@ def create_app(
             result = review.command(attempt_id, Abandon(reason=reason))
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
-        if _is_html_request(request):
+        if _is_htmx(request):
             return _fragment(
                 request, "command_feedback.html", result=result, attempt_id=attempt_id
             )
@@ -1102,7 +1108,7 @@ def create_app(
             )
         except (KeyError, ValueError) as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
-        if _is_html_request(request):
+        if _is_htmx(request):
             return _fragment(
                 request, "command_feedback.html", result=result, attempt_id=attempt_id
             )
@@ -1136,7 +1142,7 @@ def create_app(
             )
         except (KeyError, ValueError) as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
-        if _is_html_request(request):
+        if _is_htmx(request):
             return _fragment(
                 request, "command_feedback.html", result=result, attempt_id=attempt_id
             )
@@ -1173,7 +1179,7 @@ def create_app(
             )
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
-        if _is_html_request(request):
+        if _is_htmx(request):
             return _fragment(
                 request, "command_feedback.html", result=result, attempt_id=attempt_id
             )
@@ -1210,7 +1216,7 @@ def create_app(
             )
         except ValueError as error:
             return JSONResponse(status_code=422, content={"detail": str(error)})
-        if _is_html_request(request):
+        if _is_htmx(request):
             return _fragment(
                 request, "command_feedback.html", result=result, attempt_id=attempt_id
             )
@@ -1259,7 +1265,7 @@ def create_app(
                 for action in report.actions
             ],
         }
-        if _is_html_request(request):
+        if _is_htmx(request):
             return _fragment(
                 request, "command_feedback.html",
                 result={"success": True, "detail": f"Reprocessed attempt {attempt_id}: {report.status}"},
@@ -1300,7 +1306,7 @@ def create_app(
         processor.clear_suppression(
             watch_id, Path(source_path), source_fingerprint
         )
-        if _is_html_request(request):
+        if _is_htmx(request):
             return _fragment(
                 request, "command_feedback.html",
                 result={"success": True, "detail": f"Suppression cleared for {source_path}"},
@@ -1412,7 +1418,7 @@ def create_app(
         rules_path = payload.get("rules_path")
         folder = payload.get("folder", "/")
 
-        is_htmx = request.headers.get("HX-Request") == "true"
+        is_htmx = _is_htmx(request)
 
         if not isinstance(watch_id, str) or not watch_id:
             if is_htmx:
@@ -1526,7 +1532,7 @@ def create_app(
     ) -> dict[str, object] | JSONResponse | HTMLResponse:
         watch = next((w for w in _watch_snapshot() if w.watch_id == watch_id), None)
         if watch is None:
-            if request.headers.get("HX-Request") == "true":
+            if _is_htmx(request):
                 return HTMLResponse(
                     f"<p>Watch folder not found: {html.escape(watch_id)}</p>",
                     status_code=404,
@@ -1552,7 +1558,7 @@ def create_app(
                     watch_mutator.add_watch(watch)
                 raise
 
-        if request.headers.get("HX-Request") == "true":
+        if _is_htmx(request):
             orphaned_rules = str(watch.rules_path) if watch.rules_path.exists() else ""
             return _fragment(
                 request,
@@ -1692,8 +1698,19 @@ def create_app(
                     status_code=501,
                 )
             return JSONResponse(status_code=501, content={"detail": message})
-        watch_mutator.trigger_scan(watch_id)
-        detail = f"Scan triggered for {watch_id}."
+        status = watch_mutator.scan_status(watch_id)
+        if status.batch_running:
+            detail = f"Scan already running for {watch_id}."
+        else:
+            watch_mutator.trigger_scan(watch_id)
+            if status.pending_triggers or status.in_flight_batches:
+                detail = (
+                    f"Scan triggered for {watch_id}; queued behind "
+                    f"{status.in_flight_batches} in-flight batch(es) and "
+                    f"{status.pending_triggers} pending trigger(s)."
+                )
+            else:
+                detail = f"Scan triggered for {watch_id}."
         if _is_htmx(request):
             return HTMLResponse(
                 f'<p class="feedback success">{html.escape(detail)}</p>'

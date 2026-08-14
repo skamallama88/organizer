@@ -17,6 +17,7 @@ from organizer.daemon import (
     PeriodicScanner,
     ProcessorBatchAdapter,
     RetentionService,
+    ScanStatus,
     WatcherService,
     WatchMutator,
     effective_stability_interval,
@@ -539,6 +540,129 @@ def test_scanner_survives_a_failed_batch_and_continues(tmp_path: Path) -> None:
 
     assert processor.failures == 0
     assert processor.calls.count(("incoming", item)) >= 1
+
+
+def test_scanner_serves_trigger_while_other_batch_in_flight(tmp_path: Path) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_item = first_root / "a.mkv"
+    second_item = second_root / "b.mkv"
+    first_item.write_text("a")
+    second_item.write_text("b")
+    first = WatchFolderConfig(
+        watch_id="first",
+        watch_root=first_root,
+        rules_path=tmp_path / "first.yaml",
+        boundary_policy=BoundaryPolicy(),
+        scan_interval=3600,
+    )
+    second = WatchFolderConfig(
+        watch_id="second",
+        watch_root=second_root,
+        rules_path=tmp_path / "second.yaml",
+        boundary_policy=BoundaryPolicy(),
+        scan_interval=3600,
+    )
+    loop_ref: list[asyncio.AbstractEventLoop] = []
+    started = asyncio.Event()
+    release = threading.Event()
+    seen: list[tuple[str, Path]] = []
+
+    class GatedProcessor:
+        def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+            if watch.watch_id == "first":
+                loop_ref[0].call_soon_threadsafe(started.set)
+                release.wait(timeout=5)
+            seen.extend((watch.watch_id, item) for item in items)
+            return None
+
+    scanner = PeriodicScanner((first, second), GatedProcessor(), interval_seconds=3600)
+
+    async def run() -> None:
+        loop_ref.append(asyncio.get_running_loop())
+        task = asyncio.create_task(scanner.run())
+        scanner.trigger("first")
+        await asyncio.wait_for(started.wait(), timeout=2)
+        scanner.trigger("second")
+        await asyncio.sleep(0.1)
+        release.set()
+        scanner.stop()
+        await task
+
+    asyncio.run(run())
+
+    assert ("second", second_item) in seen
+
+
+def test_scanner_does_not_rescan_watch_while_batch_in_flight(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    item = configured.watch_root / "movie.mkv"
+    item.write_text("movie")
+    loop_ref: list[asyncio.AbstractEventLoop] = []
+    started = asyncio.Event()
+    release = threading.Event()
+    batch_count = 0
+
+    class GatedProcessor:
+        def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+            nonlocal batch_count
+            batch_count += 1
+            loop_ref[0].call_soon_threadsafe(started.set)
+            release.wait(timeout=5)
+            return None
+
+    scanner = PeriodicScanner((configured,), GatedProcessor(), interval_seconds=0.1)
+
+    async def run() -> None:
+        loop_ref.append(asyncio.get_running_loop())
+        task = asyncio.create_task(scanner.run())
+        scanner.trigger("incoming")
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await asyncio.sleep(0.2)
+        release.set()
+        scanner.stop()
+        await task
+
+    asyncio.run(run())
+
+    assert batch_count == 1
+
+
+def test_scanner_scan_status_reflects_in_flight_batch(tmp_path: Path) -> None:
+    configured = watch(tmp_path)
+    item = configured.watch_root / "movie.mkv"
+    item.write_text("movie")
+    loop_ref: list[asyncio.AbstractEventLoop] = []
+    started = asyncio.Event()
+    release = threading.Event()
+
+    class GatedProcessor:
+        def process_batch(self, watch: WatchFolderConfig, items: list[Path]) -> DiscoveryBatch | None:
+            loop_ref[0].call_soon_threadsafe(started.set)
+            release.wait(timeout=5)
+            return None
+
+    scanner = PeriodicScanner((configured,), GatedProcessor(), interval_seconds=3600)
+
+    async def run() -> ScanStatus:
+        loop_ref.append(asyncio.get_running_loop())
+        task = asyncio.create_task(scanner.run())
+        scanner.trigger("incoming")
+        await asyncio.wait_for(started.wait(), timeout=2)
+        status = scanner.scan_status("incoming")
+        release.set()
+        scanner.stop()
+        await task
+        return status
+
+    status = asyncio.run(run())
+
+    assert status.batch_running is True
+    assert status.watch_id == "incoming"
+    assert status.pending_triggers == 0
+    assert status.in_flight_batches == 1
 
 
 def test_scanner_failure_emits_structured_log_and_records_health(tmp_path: Path) -> None:

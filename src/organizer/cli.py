@@ -93,7 +93,7 @@ def run(
         logger=logger,
         health_checker=health_checker,
     )
-    daemon = create_daemon(config, processor, retention_days=config.retention_days, retention_interval=config.retention_interval, logger=logger)
+    daemon = create_daemon(config, processor, retention_days=config.retention_days, retention_interval=config.retention_interval, logger=logger, poll_interval_seconds=float(config.poll_interval))
     app = create_app(
         processor,
         log_sink=log_sink,

@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from collections.abc import Callable
 
+import pytest
+
 from organizer.config import WatchFolderConfig
 from organizer.daemon import (
     DaemonHealthState,
@@ -137,6 +139,42 @@ def test_watcher_debounces_close_write_and_create(tmp_path: Path) -> None:
     assert service.flush() == 1
     assert processor.calls == [("incoming", path)]
     assert service.flush() == 0
+
+
+def test_watcher_constructs_polling_observer_with_configured_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = watch(tmp_path)
+    processor = RecordingProcessor()
+    captured: dict[str, float] = {}
+
+    class FakePollingObserver:
+        def __init__(self, *, timeout: float) -> None:
+            captured["timeout"] = timeout
+
+        def schedule(self, handler: object, path: str, recursive: bool) -> object:
+            return object()
+
+        def start(self) -> None:
+            pass
+
+    class FakeObserver:
+        def __init__(self) -> None:
+            captured["inotify_used"] = True
+
+    monkeypatch.setattr("organizer.daemon.PollingObserver", FakePollingObserver)
+    monkeypatch.setattr("organizer.daemon._is_inotify_supported", lambda path: True)
+    service = WatcherService((configured,), processor, poll_interval_seconds=7.5)
+    service.start()
+    assert "inotify_used" not in captured
+
+    captured.clear()
+    monkeypatch.setattr("organizer.daemon.Observer", FakeObserver)
+    monkeypatch.setattr("organizer.daemon._is_inotify_supported", lambda path: False)
+    service = WatcherService((configured,), processor, poll_interval_seconds=7.5)
+    service.start()
+    assert captured["timeout"] == 7.5
+    assert "inotify_used" not in captured
 
 
 def test_watcher_ignores_unconfigured_event(tmp_path: Path) -> None:

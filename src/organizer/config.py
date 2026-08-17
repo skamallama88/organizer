@@ -35,6 +35,7 @@ class OrganizerConfig(BaseModel):
     log_path: Path
     scan_interval: int
     stability_interval: int
+    poll_interval: float
     log_level: str
     retention_days: int
     retention_interval: int
@@ -107,6 +108,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
     quarantine_root = _path(document, "quarantine_root", config_root / "quarantine", config_path.parent)
     scan_interval = _positive_int(document.get("scan_interval", 300), "scan_interval")
     stability_interval = _non_negative_int(document.get("stability_interval", 5), "stability_interval")
+    poll_interval = _positive_float(document.get("poll_interval", 1.0), "poll_interval")
     retention_days = _positive_int(document.get("retention_days", 7), "retention_days")
     retention_interval = _positive_int(document.get("retention_interval", 3600), "retention_interval")
     log_level = document.get("log_level", "INFO")
@@ -175,6 +177,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
         log_path=log_path,
         scan_interval=scan_interval,
         stability_interval=stability_interval,
+        poll_interval=poll_interval,
         log_level=log_level.upper(),
         retention_days=retention_days,
         retention_interval=retention_interval,
@@ -212,6 +215,15 @@ def _positive_int(value: object, key: str) -> int:
 
 def _non_negative_int(value: object, key: str) -> int:
     return _int_with_min(value, key, 0, "non-negative")
+
+
+def _positive_float(value: object, key: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{key} must be a positive number")
+    result = float(value)
+    if result <= 0:
+        raise ConfigError(f"{key} must be a positive number")
+    return result
 
 
 def _int_with_min(value: object, key: str, minimum: int, label: str) -> int:

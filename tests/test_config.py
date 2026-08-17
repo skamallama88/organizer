@@ -55,6 +55,7 @@ watches:
     assert config.log_level == "DEBUG"
     assert config.retention_days == 14
     assert config.retention_interval == 3600
+    assert config.poll_interval == 1.0
     assert config.watches[0].rules_path == (tmp_path / "rules/downloads.yaml").resolve()
     assert config.watches[0].boundary_policy.data_roots == (Path("/data"),)
     assert config.watches[0].boundary_policy.quarantine_root == Path("/data/.quarantine")
@@ -150,3 +151,53 @@ watches:
 
     with pytest.raises(ConfigError, match="scan_interval must be a positive"):
         load_config(config_path)
+
+
+def test_load_config_parses_poll_interval(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+poll_interval: 5
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules.yaml
+"""
+    )
+
+    config = load_config(config_path)
+
+    assert config.poll_interval == 5.0
+
+
+def test_load_config_accepts_float_poll_interval(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+poll_interval: 2.5
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules.yaml
+"""
+    )
+
+    config = load_config(config_path)
+
+    assert config.poll_interval == 2.5
+
+
+def test_load_config_rejects_invalid_poll_interval(tmp_path: Path) -> None:
+    for bad in ("0", "-1", "fast", "true"):
+        config_path = tmp_path / "organizer.yaml"
+        config_path.write_text(
+            f"""data_roots: [/data]
+poll_interval: {bad}
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules.yaml
+"""
+        )
+        with pytest.raises(ConfigError, match="poll_interval must be a positive number"):
+            load_config(config_path)

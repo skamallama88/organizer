@@ -39,6 +39,7 @@ EOF
       fi
     done || true
     cat <<'EOF'
+poll_interval: 1
 quarantine_root: /data/.quarantine
 watches:
   - id: data

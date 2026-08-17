@@ -226,10 +226,17 @@ def _is_inotify_supported(path: Path) -> bool:
 
 
 class WatcherService:
-    def __init__(self, watches: Sequence[WatchFolderConfig], processor: BatchProcessor, debounce_seconds: float = 0.5) -> None:
+    def __init__(
+        self,
+        watches: Sequence[WatchFolderConfig],
+        processor: BatchProcessor,
+        debounce_seconds: float = 0.5,
+        poll_interval_seconds: float = 1.0,
+    ) -> None:
         self._watches = {watch.watch_id: watch for watch in watches}
         self._processor = processor
         self._debounce_seconds = debounce_seconds
+        self._poll_interval_seconds = poll_interval_seconds
         self._pending: dict[tuple[str, Path], float] = {}
         self._observer: object | None = None
         self._handler: _WatchdogHandler | None = None
@@ -268,7 +275,11 @@ class WatcherService:
         with self._lock:
             watches = tuple(self._watches.values())
         inotify_supported = all(_is_inotify_supported(watch.watch_root) for watch in watches)
-        observer: object = Observer() if inotify_supported else PollingObserver()
+        observer: object = (
+            Observer()
+            if inotify_supported
+            else PollingObserver(timeout=self._poll_interval_seconds)
+        )
         handler = _WatchdogHandler(self)
         self._handler = handler
         for watch in watches:
@@ -603,13 +614,18 @@ class OrganizerDaemon:
     watches: list[WatchFolderConfig]
     processor: BatchProcessor
     scanner_interval: float = 300
+    poll_interval_seconds: float = 1.0
     retention: RetentionService | None = None
     logger: StructuredLogger | None = None
 
     def __post_init__(self) -> None:
         self.watches = list(self.watches)
         self.health = DaemonHealthState()
-        self.watcher = WatcherService(self.watches, self.processor)
+        self.watcher = WatcherService(
+            self.watches,
+            self.processor,
+            poll_interval_seconds=self.poll_interval_seconds,
+        )
         self.scanner = PeriodicScanner(
             self.watches,
             self.processor,
@@ -810,6 +826,7 @@ def create_daemon(
     retention_days: int | None = None,
     retention_interval: float | None = None,
     logger: StructuredLogger | None = None,
+    poll_interval_seconds: float | None = None,
 ) -> OrganizerDaemon:
     retention_service: RetentionService | None = None
     if retention_days is not None and retention_days > 0:
@@ -822,6 +839,11 @@ def create_daemon(
         list(config.watches),
         ProcessorBatchAdapter(processor, float(config.stability_interval)),
         config.scan_interval,
+        poll_interval_seconds=(
+            float(config.poll_interval)
+            if poll_interval_seconds is None
+            else poll_interval_seconds
+        ),
         retention=retention_service,
         logger=logger,
     )

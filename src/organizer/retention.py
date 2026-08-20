@@ -3,15 +3,24 @@ from __future__ import annotations
 import shutil
 import sqlite3
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 from organizer.structured_log import LogEntry, LogLevel, LogResult, StructuredLogger
 
 
 class Retention:
-    def __init__(self, db_path: Path, logger: StructuredLogger | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        logger: StructuredLogger | None = None,
+        data_roots: tuple[Path, ...] = (),
+        staging_cleanup_age: int = 3600,
+    ) -> None:
         self._db_path = db_path
         self._logger = logger
+        self._data_roots = data_roots
+        self._staging_cleanup_age = staging_cleanup_age
 
     def _log(
         self,
@@ -76,31 +85,74 @@ class Retention:
         return completed + failed
 
     def clean_staging_artifacts(self, older_than: float) -> int:
-        staging_root = self._db_path.parent / "staging"
-        if not staging_root.is_dir():
-            return 0
+        roots = [self._db_path.parent / "staging", *self._data_roots]
         count = 0
-        for entry in list(staging_root.iterdir()):
-            if not entry.name.startswith(".organizer-staging-"):
-                continue
-            try:
-                stat = entry.stat()
-                mtime = stat.st_mtime
-                if mtime < older_than:
+        for entry in self._iter_staging_entries(roots):
+            if self._is_stale_staging(entry, older_than):
+                try:
                     if entry.is_dir():
                         shutil.rmtree(entry)
                     else:
                         entry.unlink()
                     count += 1
-            except OSError:
-                continue
+                except OSError:
+                    continue
         if count:
             self._log(level=LogLevel.INFO, item="staging", result=LogResult.OK, detail=f"cleaned {count} staging artifacts")
         return count
 
+    @staticmethod
+    def _iter_staging_entries(roots: list[Path]) -> Iterator[Path]:
+        """Yield `.organizer-staging-*` entries anywhere beneath ``roots``.
+
+        Walks directories only (never descending into unrelated organizer-managed
+        dot-directories such as the quarantine root) so the sweep stays bounded on
+        large data trees.
+        """
+        for root in roots:
+            if not root.is_dir():
+                continue
+            stack = [root]
+            while stack:
+                directory = stack.pop()
+                try:
+                    entries = list(directory.iterdir())
+                except OSError:
+                    continue
+                for entry in entries:
+                    name = entry.name
+                    if name.startswith(".organizer-staging-"):
+                        yield entry
+                    elif name.startswith(".organizer-"):
+                        continue
+                    elif entry.is_dir():
+                        stack.append(entry)
+
+    @staticmethod
+    def _is_stale_staging(entry: Path, older_than: float) -> bool:
+        """Whether a staging entry has been untouched anywhere in its tree.
+
+        Uses the newest modification time in the subtree so a large extraction
+        that is still actively writing (deep inside nested directories) is never
+        mistaken for a hung, stale artifact.
+        """
+        try:
+            newest = entry.stat().st_mtime
+            if entry.is_dir():
+                for child in entry.rglob("*"):
+                    try:
+                        if child.stat().st_mtime > newest:
+                            newest = child.stat().st_mtime
+                    except OSError:
+                        continue
+            return newest < older_than
+        except OSError:
+            return False
+
     def retention_run(self, retention_days: int, *, now: float | None = None) -> dict[str, int | list[str]]:
         _now = now if now is not None else time.time()
         older_than = _now - retention_days * 86400
+        staging_older_than = _now - self._staging_cleanup_age
         completed = 0
         failed = 0
         staging = 0
@@ -114,7 +166,7 @@ class Retention:
         except Exception as error:
             errors.append(f"failed: {error}")
         try:
-            staging = self.clean_staging_artifacts(older_than=older_than)
+            staging = self.clean_staging_artifacts(older_than=staging_older_than)
         except Exception as error:
             errors.append(f"staging: {error}")
         total = completed + failed + staging

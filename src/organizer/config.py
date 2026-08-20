@@ -54,6 +54,7 @@ class OrganizerConfig(BaseModel):
     log_level: str
     retention_days: int
     retention_interval: int
+    staging_cleanup_age: int
     data_roots: tuple[Path, ...]
     quarantine_root: Path
     watches: tuple[WatchFolderConfig, ...]
@@ -126,6 +127,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
     poll_interval = _positive_float(document.get("poll_interval", 1.0), "poll_interval")
     retention_days = _positive_int(document.get("retention_days", 7), "retention_days")
     retention_interval = _positive_int(document.get("retention_interval", 3600), "retention_interval")
+    staging_cleanup_age = _positive_int(document.get("staging_cleanup_age", 3600), "staging_cleanup_age")
     log_level = document.get("log_level", "INFO")
     if not isinstance(log_level, str) or log_level.upper() not in {"DEBUG", "INFO", "WARN", "ERROR"}:
         raise ConfigError("log_level must be DEBUG, INFO, WARN, or ERROR")
@@ -206,6 +208,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
         log_level=log_level.upper(),
         retention_days=retention_days,
         retention_interval=retention_interval,
+        staging_cleanup_age=staging_cleanup_age,
         data_roots=tuple(data_roots),
         quarantine_root=quarantine_root,
         watches=tuple(watches),

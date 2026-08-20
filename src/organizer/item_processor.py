@@ -23,6 +23,7 @@ from typing import Any
 import yaml
 import py7zr
 from py7zr.exceptions import ArchiveError as _Py7zArchiveError
+from py7zr.exceptions import PasswordRequired as _Py7zPasswordRequired
 import rarfile  # type: ignore[import-untyped]
 
 from organizer.structured_log import LogEntry, LogLevel, LogResult, StructuredLogger
@@ -52,6 +53,7 @@ _ARCHIVE_ERRORS = (
     lzma.LZMAError,
     zlib.error,
     _Py7zArchiveError,
+    _Py7zPasswordRequired,
     rarfile.Error,
     rarfile.RarCannotExec,
 )
@@ -925,7 +927,7 @@ class ItemProcessor:
                     results.append(result)
                     self._emit(plan, result)
             except _ARCHIVE_ERRORS as error:
-                classification = "password-protected archive" if isinstance(error, (RuntimeError, rarfile.PasswordRequired)) else type(error).__name__
+                classification = "password-protected archive" if isinstance(error, (RuntimeError, rarfile.PasswordRequired, _Py7zPasswordRequired)) else type(error).__name__
                 detail = f"{classification}: {error}"
                 result = ActionResult(plan.actions[len(results)].kind, plan.actions[len(results)].target, "FAILED", detail, source=source)
                 results.append(result)
@@ -1083,12 +1085,16 @@ class ItemProcessor:
 
     def _copy_to_staging(self, source: Path, target: Path) -> Path:
         staging = target.parent / f".organizer-staging-{uuid.uuid4()}"
-        if source.is_dir():
-            shutil.copytree(source, staging)
-        else:
-            staging.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, staging)
-        return staging
+        try:
+            if source.is_dir():
+                shutil.copytree(source, staging)
+            else:
+                staging.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, staging)
+            return staging
+        except Exception:
+            self._remove_tree(staging)
+            raise
 
     @staticmethod
     def _metadata_warnings() -> tuple[str, ...]:
@@ -1099,36 +1105,40 @@ class ItemProcessor:
     def _archive_to_staging(self, source: Path, target: Path) -> Path:
         staging = target.parent / f".organizer-staging-{uuid.uuid4()}{target.suffix.lower()}"
         staging.parent.mkdir(parents=True, exist_ok=True)
-        if target.suffix.lower() == ".7z":
-            with py7zr.SevenZipFile(staging, "w") as archive:
+        try:
+            if target.suffix.lower() == ".7z":
+                with py7zr.SevenZipFile(staging, "w") as archive:
+                    if source.is_dir():
+                        archive.writeall(source, arcname=source.name)
+                    else:
+                        archive.write(source, arcname=source.name)
+                return staging
+            with zipfile.ZipFile(staging, "x", compression=zipfile.ZIP_DEFLATED) as archive:
                 if source.is_dir():
-                    archive.writeall(source, arcname=source.name)
+                    for child in sorted(source.rglob("*")):
+                        relative = child.relative_to(source)
+                        if child.is_dir():
+                            if not any(child.iterdir()):
+                                archive.writestr(f"{relative}/", "")
+                        elif child.is_symlink():
+                            info = zipfile.ZipInfo(str(relative))
+                            info.create_system = 3
+                            info.external_attr = (0o120777 << 16) | 0o777
+                            archive.writestr(info, os.readlink(child))
+                        elif child.is_file():
+                            archive.write(child, relative)
                 else:
-                    archive.write(source, arcname=source.name)
-            return staging
-        with zipfile.ZipFile(staging, "x", compression=zipfile.ZIP_DEFLATED) as archive:
-            if source.is_dir():
-                for child in sorted(source.rglob("*")):
-                    relative = child.relative_to(source)
-                    if child.is_dir():
-                        if not any(child.iterdir()):
-                            archive.writestr(f"{relative}/", "")
-                    elif child.is_symlink():
-                        info = zipfile.ZipInfo(str(relative))
+                    if source.is_symlink():
+                        info = zipfile.ZipInfo(source.name)
                         info.create_system = 3
                         info.external_attr = (0o120777 << 16) | 0o777
-                        archive.writestr(info, os.readlink(child))
-                    elif child.is_file():
-                        archive.write(child, relative)
-            else:
-                if source.is_symlink():
-                    info = zipfile.ZipInfo(source.name)
-                    info.create_system = 3
-                    info.external_attr = (0o120777 << 16) | 0o777
-                    archive.writestr(info, os.readlink(source))
-                else:
-                    archive.write(source, source.name)
-        return staging
+                        archive.writestr(info, os.readlink(source))
+                    else:
+                        archive.write(source, source.name)
+            return staging
+        except Exception:
+            self._remove_tree(staging)
+            raise
 
     def preview(self, plan: Plan) -> ArchivePreview | None:
         action = next((action for action in plan.actions if action.kind == "unarchive"), None)
@@ -1173,7 +1183,7 @@ class ItemProcessor:
             if max_depth > 0:
                 self._extract_nested_archives(staging, limits, max_depth, 1)
             return staging
-        except _ARCHIVE_ERRORS:
+        except Exception:
             self._remove_tree(staging)
             raise
 

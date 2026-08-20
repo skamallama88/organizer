@@ -63,6 +63,14 @@ completion, it prevents files from being moved mid-copy; inotify-backed watch
 roots keep the immediate write-complete fast path. Set to `0` to disable. See
 `docs/design/architecture.md` for details.
 
+`staging_cleanup_age` (seconds, default `3600`) is how old a leftover
+`.organizer-staging-*` artifact must be before the periodic retention sweep
+removes it. Staging directories are normally pruned when an archive/copy/
+unarchive attempt finishes; this sweep reclaims artifacts left behind by
+attempts that never terminate (for example a hung or password-protected
+archive). An artifact is only removed once nothing in its subtree has been
+modified for this long, so an actively-writing extraction is never deleted.
+
 After editing configuration, restart the service:
 
 ```sh

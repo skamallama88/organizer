@@ -85,6 +85,18 @@ def test_run_creates_shared_components_from_config(
     assert config.log_path is not None
 
 
+def test_create_daemon_wires_staging_cleanup_into_retention(
+    runtime_setup: tuple[OrganizerConfig, MemoryLogSink, ItemProcessor, OperationalHealth],
+) -> None:
+    config, log_sink, processor, health_checker = runtime_setup
+    daemon = create_daemon(config, processor, retention_days=config.retention_days)
+
+    assert daemon.retention is not None
+    retention = daemon.retention._retention
+    assert tuple(retention._data_roots) == tuple(config.data_roots)
+    assert retention._staging_cleanup_age == config.staging_cleanup_age
+
+
 def test_web_app_receives_same_shared_components(
     runtime_setup: tuple[OrganizerConfig, MemoryLogSink, ItemProcessor, OperationalHealth],
 ) -> None:

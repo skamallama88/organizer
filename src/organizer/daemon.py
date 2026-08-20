@@ -841,7 +841,12 @@ def create_daemon(
     retention_service: RetentionService | None = None
     if retention_days is not None and retention_days > 0:
         retention_service = RetentionService(
-            Retention(processor._attempts_path, logger=processor._logger),
+            Retention(
+                processor._attempts_path,
+                logger=processor._logger,
+                data_roots=tuple(config.data_roots),
+                staging_cleanup_age=int(config.staging_cleanup_age),
+            ),
             retention_days=retention_days,
             interval_seconds=retention_interval or 3600,
         )

@@ -241,6 +241,55 @@ watches:
     assert config.poll_interval == 5.0
 
 
+def test_load_config_parses_staging_cleanup_age(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+staging_cleanup_age: 600
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules.yaml
+"""
+    )
+
+    config = load_config(config_path)
+
+    assert config.staging_cleanup_age == 600
+
+
+def test_load_config_defaults_staging_cleanup_age(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules.yaml
+"""
+    )
+
+    config = load_config(config_path)
+
+    assert config.staging_cleanup_age == 3600
+
+
+def test_load_config_rejects_invalid_staging_cleanup_age(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+staging_cleanup_age: 0
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules.yaml
+"""
+    )
+
+    with pytest.raises(ConfigError, match="staging_cleanup_age must be a positive"):
+        load_config(config_path)
+
+
 def test_load_config_accepts_float_poll_interval(tmp_path: Path) -> None:
     config_path = tmp_path / "organizer.yaml"
     config_path.write_text(

@@ -1990,6 +1990,32 @@ def test_unarchive_7z_corrupt_lzma_fails_per_item_and_suppresses(tmp_path: Path)
     assert processor.has_suppressed_attempt("downloads", archive, processor._fingerprint(archive)) is True
 
 
+def test_unarchive_password_protected_7z_fails_and_cleans_staging(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    source = watch_root / "src.txt"
+    source.write_text("secret content")
+    archive = watch_root / "bundle.7z"
+    with py7zr.SevenZipFile(archive, "w", password="hunter2") as z:
+        z.write(source, "folder/file.txt")
+    source.unlink()
+    rules = write_unarchive_rules(watch_root / "rules.yaml")
+    rules.write_text(rules.read_text().replace("\\.zip$", "\\.(zip|7z)$"))
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, archive, rules)))
+
+    assert report.status == "failed"
+    assert "password-protected" in report.actions[-1].detail
+    assert archive.exists()
+    assert not list(watch_root.glob(".organizer-staging-*"))
+    assert processor.has_suppressed_attempt("downloads", archive, processor._fingerprint(archive)) is True
+    assert all(
+        attempt["status"] != "started"
+        for attempt in processor.attempts()
+    )
+
+
 def test_process_batch_survives_corrupt_7z_and_processes_rest(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     watch_root.mkdir()

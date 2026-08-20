@@ -307,6 +307,77 @@ def test_retention_staging_handles_missing_staging_dir(tmp_path: Path) -> None:
     assert cleaned == 0
 
 
+def test_retention_sweeps_stale_staging_in_data_roots(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    data_root = tmp_path / "data"
+    destination = data_root / "processed" / "unarchived"
+    destination.mkdir(parents=True)
+    now = 1000000.0
+
+    stale = _create_staging_dir(destination, ".organizer-staging-hung-uuid", now - 86400)
+    recent = _create_staging_dir(destination, ".organizer-staging-fresh-uuid", now - 100)
+
+    retention = Retention(db_path, data_roots=(data_root,))
+    cleaned = retention.clean_staging_artifacts(older_than=now - 3600)
+
+    assert cleaned == 1
+    assert not stale.exists()
+    assert recent.exists()
+
+
+def test_retention_sweep_preserves_still_active_staging_subtree(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    now = 1000000.0
+
+    staging = _create_staging_dir(data_root, ".organizer-staging-active-uuid", now - 86400)
+    child = staging / "deep" / "partial.bin"
+    child.parent.mkdir(parents=True)
+    child.write_text("partial")
+    os.utime(child, (now - 10, now - 10))
+
+    retention = Retention(db_path, data_roots=(data_root,))
+    cleaned = retention.clean_staging_artifacts(older_than=now - 3600)
+
+    assert cleaned == 0
+    assert staging.exists()
+
+
+def test_retention_sweep_skips_organizer_managed_dirs(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    now = 1000000.0
+
+    quarantine = data_root / ".organizer-quarantine"
+    quarantine.mkdir()
+    nested_staging = _create_staging_dir(quarantine, ".organizer-staging-nested", now - 86400)
+
+    retention = Retention(db_path, data_roots=(data_root,))
+    cleaned = retention.clean_staging_artifacts(older_than=now - 3600)
+
+    assert cleaned == 0
+    assert nested_staging.exists()
+
+
+def test_retention_run_uses_staging_cleanup_age_for_data_roots(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    now = 1000000.0
+
+    stale = _create_staging_dir(data_root, ".organizer-staging-hung-uuid", now - 7200)
+    fresh = _create_staging_dir(data_root, ".organizer-staging-fresh-uuid", now - 60)
+
+    retention = Retention(db_path, data_roots=(data_root,), staging_cleanup_age=3600)
+    result = retention.retention_run(retention_days=7, now=now)
+
+    assert result["staging"] == 1
+    assert not stale.exists()
+    assert fresh.exists()
+
+
 def test_retention_run_retention_returns_summary(tmp_path: Path) -> None:
     db_path = tmp_path / "attempts.db"
     staging_root = tmp_path / "staging"

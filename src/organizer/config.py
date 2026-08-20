@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,19 @@ class ConfigError(ValueError):
     """Raised when organizer.yaml cannot define a safe runtime configuration."""
 
 
+class DiscoveryScope(StrEnum):
+    """The set of items a watch folder automatically discovers for a batch.
+
+    ``RECURSIVE`` discovers every item at every depth (the historical
+    behaviour). ``TOP_LEVEL`` discovers only the immediate children of the watch
+    root, so a rule operates on a top-level folder as a unit without recursing
+    into and independently processing its contents.
+    """
+
+    RECURSIVE = "recursive"
+    TOP_LEVEL = "top_level"
+
+
 class WatchFolderConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
     watch_id: str
@@ -25,6 +39,7 @@ class WatchFolderConfig(BaseModel):
     boundary_policy: BoundaryPolicy = BoundaryPolicy()
     enabled: bool = True
     scan_interval: int | None = None
+    discovery: DiscoveryScope = DiscoveryScope.RECURSIVE
 
 
 class OrganizerConfig(BaseModel):
@@ -145,6 +160,15 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
             watch_scan_interval = _positive_int(
                 raw_scan_interval, f"watch {watch_id} scan_interval"
             )
+        raw_discovery = raw_watch.get("discovery", "recursive")
+        if not isinstance(raw_discovery, str):
+            raise ConfigError(f"watch {watch_id} discovery must be 'recursive' or 'top_level'")
+        try:
+            discovery = DiscoveryScope(raw_discovery.lower())
+        except ValueError:
+            raise ConfigError(
+                f"watch {watch_id} discovery must be 'recursive' or 'top_level'"
+            ) from None
         root = _required_path(raw_watch, "root", f"watch {watch_id}", config_path.parent)
         rules_value = raw_watch.get("rules", "rules.yaml")
         if not isinstance(rules_value, str) or not rules_value:
@@ -167,6 +191,7 @@ def load_config(path: Path = Path("/config/organizer.yaml")) -> OrganizerConfig:
                 boundary_policy=base_policy,
                 enabled=enabled,
                 scan_interval=watch_scan_interval,
+                discovery=discovery,
             )
         )
     rebuild_boundary_policy(watches)

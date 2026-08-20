@@ -14,7 +14,12 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
-from organizer.config import OrganizerConfig, WatchFolderConfig, rebuild_boundary_policy
+from organizer.config import (
+    DiscoveryScope,
+    OrganizerConfig,
+    WatchFolderConfig,
+    rebuild_boundary_policy,
+)
 from organizer.item_processor import (
     BatchProgress,
     DiscoveryBatch,
@@ -252,6 +257,8 @@ class WatcherService:
             return
         if not path.is_relative_to(watch.watch_root) or path.name.startswith(_ORGANIZER_PREFIX):
             return
+        if watch.discovery is DiscoveryScope.TOP_LEVEL and path.parent != watch.watch_root:
+            return
         with self._lock:
             self._pending[(watch_id, path)] = time.monotonic() + self._debounce_seconds
 
@@ -453,11 +460,14 @@ class PeriodicScanner:
 
         try:
             if watch.watch_root.is_dir():
-                items = [
-                    path
-                    for path in watch.watch_root.rglob("*")
-                    if not path.name.startswith(_ORGANIZER_PREFIX)
-                ]
+                if watch.discovery is DiscoveryScope.TOP_LEVEL:
+                    items = [path for path in watch.watch_root.iterdir()]
+                else:
+                    items = [
+                        path
+                        for path in watch.watch_root.rglob("*")
+                        if not path.name.startswith(_ORGANIZER_PREFIX)
+                    ]
                 await asyncio.to_thread(
                     self._processor.process_batch, watch, items, progress=report
                 )

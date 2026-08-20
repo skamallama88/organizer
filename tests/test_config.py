@@ -6,6 +6,7 @@ import pytest
 
 from organizer.config import (
     ConfigError,
+    DiscoveryScope,
     load_config,
     validate_watch_id,
     validate_watch_root,
@@ -150,6 +151,76 @@ watches:
     )
 
     with pytest.raises(ConfigError, match="scan_interval must be a positive"):
+        load_config(config_path)
+
+
+def test_load_config_defaults_discovery_to_recursive(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules.yaml
+"""
+    )
+
+    config = load_config(config_path)
+
+    assert config.watches[0].discovery is DiscoveryScope.RECURSIVE
+
+
+def test_load_config_parses_discovery_per_watch(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+watches:
+  - id: recursive
+    root: /data/recursive
+    rules: rules/recursive.yaml
+    discovery: recursive
+  - id: top
+    root: /data/top
+    rules: rules/top.yaml
+    discovery: top_level
+"""
+    )
+
+    config = load_config(config_path)
+
+    assert config.watches[0].discovery is DiscoveryScope.RECURSIVE
+    assert config.watches[1].discovery is DiscoveryScope.TOP_LEVEL
+
+
+def test_load_config_rejects_invalid_discovery(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules.yaml
+    discovery: shallow
+"""
+    )
+
+    with pytest.raises(ConfigError, match="discovery must be 'recursive' or 'top_level'"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_non_string_discovery(tmp_path: Path) -> None:
+    config_path = tmp_path / "organizer.yaml"
+    config_path.write_text(
+        """data_roots: [/data]
+watches:
+  - id: downloads
+    root: /data/downloads
+    rules: rules.yaml
+    discovery: 5
+"""
+    )
+
+    with pytest.raises(ConfigError, match="discovery must be 'recursive' or 'top_level'"):
         load_config(config_path)
 
 

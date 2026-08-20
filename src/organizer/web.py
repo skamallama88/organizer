@@ -29,6 +29,7 @@ from organizer.attempt_review import (
 )
 from organizer.config import (
     ConfigError,
+    DiscoveryScope,
     WatchFolderConfig,
     rebuild_boundary_policy,
     validate_watch_id,
@@ -458,6 +459,7 @@ def create_app(
                     "rule_count": _rule_count(config.rules_path),
                     "recent_activity": entries[-1] if entries else None,
                     "enabled": config.enabled,
+                    "discovery": config.discovery.value,
                     "scan_interval_minutes": (
                         _scan_minutes(config.scan_interval)
                         if config.scan_interval is not None
@@ -530,6 +532,7 @@ def create_app(
             if watch.get("id") != watch_id:
                 continue
             watch["enabled"] = updated.enabled
+            watch["discovery"] = updated.discovery.value
             if updated.scan_interval is None:
                 watch.pop("scan_interval", None)
             else:
@@ -1687,6 +1690,22 @@ def create_app(
                     request, "enabled must be true or false"
                 )
             updates["enabled"] = enabled
+        if "discovery" in payload:
+            raw_discovery = payload["discovery"]
+            if isinstance(raw_discovery, str) and raw_discovery.strip():
+                try:
+                    discovery = DiscoveryScope(raw_discovery.strip().lower())
+                except ValueError:
+                    return _watch_patch_error(
+                        request,
+                        "discovery must be 'recursive' or 'top_level'",
+                    )
+            else:
+                return _watch_patch_error(
+                    request,
+                    "discovery must be 'recursive' or 'top_level'",
+                )
+            updates["discovery"] = discovery
         if "scan_interval" in payload:
             raw_interval = payload["scan_interval"]
             if isinstance(raw_interval, str) and not raw_interval.strip():
@@ -1749,6 +1768,7 @@ def create_app(
         return {
             "id": watch_id,
             "enabled": updated.enabled,
+            "discovery": updated.discovery.value,
             "scan_interval": updated.scan_interval,
         }
 

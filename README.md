@@ -93,6 +93,29 @@ file.
 The default rules file contains no rules, so Organizer starts safely without
 modifying files. Add rules through the web UI or edit the configured YAML file.
 
+### Discovery scope
+
+By default a watch folder is discovered recursively: every file and folder at
+every depth is an independently considered item. Set a watch's `discovery` to
+`top_level` to operate on only the immediate children of the watch root. A rule
+then acts on a top-level folder as a unit — for example a `rename` renames the
+folder but never individually touches anything inside it — so you can sort top
+level folder names without recursing into and re-processing their contents.
+
+```yaml
+watches:
+  - id: unsorted
+    root: /data/Unsorted
+    rules: /config/rules-unsorted.yaml
+    discovery: top_level
+```
+
+The scope applies to both the periodic scanner and the filesystem-event watcher.
+Manual and forced operations (a "Scan now" request, `organizer check`, or an
+explicit reprocess/retry command) operate on the single named item regardless of
+scope. The value is `recursive` when omitted, and can also be changed per watch
+from the dashboard's Schedule controls.
+
 ## Rules YAML
 
 Each watch folder has a rules file with a top-level `rules` list. Rules are

@@ -11,7 +11,7 @@ from collections.abc import Callable
 
 import pytest
 
-from organizer.config import WatchFolderConfig
+from organizer.config import DiscoveryScope, WatchFolderConfig
 from organizer.daemon import (
     DaemonHealthState,
     DaemonTask,
@@ -267,6 +267,108 @@ def test_watcher_resumes_disabled_watch_after_update(tmp_path: Path) -> None:
 
     assert service.flush() == 1
     assert processor.calls == [("incoming", path)]
+
+
+def test_watcher_top_level_ignores_nested_events(tmp_path: Path) -> None:
+    root = tmp_path / "watch"
+    root.mkdir()
+    configured = WatchFolderConfig(
+        watch_id="incoming",
+        watch_root=root,
+        rules_path=tmp_path / "rules.yaml",
+        boundary_policy=BoundaryPolicy(),
+        discovery=DiscoveryScope.TOP_LEVEL,
+    )
+    processor = RecordingProcessor()
+    service = WatcherService((configured,), processor, debounce_seconds=0)
+    nested = root / "sub" / "file.mkv"
+    nested.parent.mkdir()
+    nested.write_text("movie")
+
+    service.handle_event("incoming", nested, "created")
+
+    assert service.flush() == 0
+    assert processor.calls == []
+
+
+def test_watcher_top_level_accepts_direct_children(tmp_path: Path) -> None:
+    root = tmp_path / "watch"
+    root.mkdir()
+    configured = WatchFolderConfig(
+        watch_id="incoming",
+        watch_root=root,
+        rules_path=tmp_path / "rules.yaml",
+        boundary_policy=BoundaryPolicy(),
+        discovery=DiscoveryScope.TOP_LEVEL,
+    )
+    processor = RecordingProcessor()
+    service = WatcherService((configured,), processor, debounce_seconds=0)
+    direct = root / "folder.mkv"
+
+    service.handle_event("incoming", direct, "created")
+
+    assert service.flush() == 1
+    assert processor.calls == [("incoming", direct)]
+
+
+def test_scanner_top_level_discovers_only_immediate_children(tmp_path: Path) -> None:
+    root = tmp_path / "watch"
+    root.mkdir()
+    configured = WatchFolderConfig(
+        watch_id="incoming",
+        watch_root=root,
+        rules_path=tmp_path / "rules.yaml",
+        boundary_policy=BoundaryPolicy(),
+        discovery=DiscoveryScope.TOP_LEVEL,
+    )
+    top_file = root / "top.mkv"
+    top_dir = root / "sub"
+    top_dir.mkdir()
+    top_file.write_text("a")
+    nested = top_dir / "nested.mkv"
+    nested.write_text("b")
+    processor = RecordingProcessor()
+    scanner = PeriodicScanner((configured,), processor, interval_seconds=0.01)
+
+    async def run() -> None:
+        task = asyncio.create_task(scanner.run())
+        await asyncio.sleep(0.025)
+        scanner.stop()
+        await task
+
+    asyncio.run(run())
+
+    assert ("incoming", top_file) in processor.calls
+    assert ("incoming", top_dir) in processor.calls
+    assert ("incoming", nested) not in processor.calls
+
+
+def test_scanner_recursive_discovers_nested_items(tmp_path: Path) -> None:
+    root = tmp_path / "watch"
+    root.mkdir()
+    configured = WatchFolderConfig(
+        watch_id="incoming",
+        watch_root=root,
+        rules_path=tmp_path / "rules.yaml",
+        boundary_policy=BoundaryPolicy(),
+        discovery=DiscoveryScope.RECURSIVE,
+    )
+    top_dir = root / "sub"
+    top_dir.mkdir()
+    nested = top_dir / "nested.mkv"
+    nested.write_text("b")
+    processor = RecordingProcessor()
+    scanner = PeriodicScanner((configured,), processor, interval_seconds=0.01)
+
+    async def run() -> None:
+        task = asyncio.create_task(scanner.run())
+        await asyncio.sleep(0.025)
+        scanner.stop()
+        await task
+
+    asyncio.run(run())
+
+    assert ("incoming", nested) in processor.calls
 
 
 def test_daemon_mutator_cascades_and_rebuilds_boundary_policy(tmp_path: Path) -> None:

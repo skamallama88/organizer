@@ -19,6 +19,12 @@
         <form hx-patch="/watches/{{ watch.id }}" hx-target="#watch-list" hx-swap="outerHTML">
           <label class="check"><input type="hidden" name="enabled" value="false"><input type="checkbox" name="enabled" value="true"{% if watch.enabled %} checked{% endif %} onchange="this.form.requestSubmit()"> Enabled</label>
           <label class="interval">Scan every <input type="number" name="scan_interval"{% if watch.scan_interval_minutes %} value="{{ watch.scan_interval_minutes }}"{% endif %} min="1" step="1" placeholder="Default ({{ watch.scan_interval_default_minutes }} min)"> min</label>
+          <label class="discovery">Scope
+            <select name="discovery">
+              <option value="recursive"{% if watch.discovery == "recursive" %} selected{% endif %}>Recursive</option>
+              <option value="top_level"{% if watch.discovery == "top_level" %} selected{% endif %}>Top level only</option>
+            </select>
+          </label>
           <button type="submit">Save</button>
         </form>
         <button hx-post="/watches/{{ watch.id }}/scan" hx-target="#watch-feedback" hx-swap="innerHTML">Scan now</button>

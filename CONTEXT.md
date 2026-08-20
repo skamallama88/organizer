@@ -221,6 +221,10 @@ _Avoid_: Active watch, unpaused watch
 The per-watch period between automatic scan/operate cycles, overridable in minutes from the dashboard. It falls back to the global `scan_interval` when a watch does not define its own.
 _Avoid_: Rescan time, cron schedule
 
+**Discovery scope**:
+A per-watch choice of which items automatic discovery considers. `recursive` (default) considers every item at every depth; `top_level` considers only the immediate children of the watch root, so a rule operates on a top-level folder as a unit without independently processing its contents. The scope applies to the periodic scanner and the filesystem-event watcher; manual and forced commands operate on the named item regardless of scope.
+_Avoid_: Depth limit, recursion flag
+
 **Stable tree**:
 A folder and complete subtree whose tree fingerprint remains unchanged for the configured stability interval. Organizer may quarantine or directly delete a folder only after confirming a stable tree immediately before mutation.
 _Avoid_: Stable folder, recursive delete target

@@ -735,6 +735,56 @@ def test_patch_watch_rejects_invalid_enabled_value(tmp_path: Path) -> None:
     assert "enabled must be true or false" in response.json()["detail"]
 
 
+def test_patch_watch_sets_discovery_top_level(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    client, config_path = _make_client(tmp_path, mutator=mutator)
+
+    response = client.patch("/watches/downloads", data={"discovery": "top_level"})
+
+    assert response.status_code == 200
+    assert response.json()["discovery"] == "top_level"
+    assert len(mutator.updated) == 1
+    assert mutator.updated[0].discovery.value == "top_level"
+    import yaml
+    document = yaml.safe_load(config_path.read_text())
+    entry = [w for w in document["watches"] if w["id"] == "downloads"][0]
+    assert entry["discovery"] == "top_level"
+
+
+def test_patch_watch_sets_discovery_recursive(tmp_path: Path) -> None:
+    mutator = RecordingMutator()
+    client, config_path = _make_client(tmp_path, mutator=mutator)
+
+    response = client.patch("/watches/downloads", data={"discovery": "recursive"})
+
+    assert response.status_code == 200
+    assert response.json()["discovery"] == "recursive"
+    assert mutator.updated[0].discovery.value == "recursive"
+    import yaml
+    document = yaml.safe_load(config_path.read_text())
+    entry = [w for w in document["watches"] if w["id"] == "downloads"][0]
+    assert entry["discovery"] == "recursive"
+
+
+def test_patch_watch_rejects_invalid_discovery(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+
+    response = client.patch("/watches/downloads", data={"discovery": "shallow"})
+
+    assert response.status_code == 422
+    assert "discovery must be 'recursive' or 'top_level'" in response.json()["detail"]
+
+
+def test_patch_watch_without_discovery_leaves_scope_unchanged(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path)
+    client.patch("/watches/downloads", data={"discovery": "top_level"})
+
+    response = client.patch("/watches/downloads", data={"enabled": "false"})
+
+    assert response.status_code == 200
+    assert response.json()["discovery"] == "top_level"
+
+
 def test_patch_watch_returns_404_for_unknown(tmp_path: Path) -> None:
     client, _ = _make_client(tmp_path)
 
@@ -876,6 +926,7 @@ def test_dashboard_lists_enabled_and_scan_interval(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert 'name="enabled"' in response.text
     assert 'name="scan_interval"' in response.text
+    assert 'name="discovery"' in response.text
     assert 'hx-post="/watches/downloads/scan"' in response.text
 
 

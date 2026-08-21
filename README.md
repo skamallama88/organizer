@@ -166,6 +166,23 @@ rules:
           name: '\g<title>\g<extension>'
 ```
 
+Captured values can be case-normalized with a modifier on a named capture:
+append `:lower` or `:upper` inside the group reference (`\g<artist:lower>`).
+This is useful for sorting artist/folder names into a consistent case. The
+bare `\g<artist>` form is unchanged.
+
+```yaml
+rules:
+  - name: Sort artists lowercased
+    match:
+      name: artist
+      field: file_name
+      pattern: '^(?P<artist>.+)\.zip$'
+    actions:
+      - move:
+          destination: /data/Artists/\g<artist:lower>
+```
+
 For multiple independent conditions, use `conditions` instead of relying only
 on the default condition name `match`. Every condition must match for the rule
 to apply.

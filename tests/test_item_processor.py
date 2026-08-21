@@ -1226,6 +1226,84 @@ def test_rename_executes_named_capture_and_records_result_identity(tmp_path: Pat
     assert processor.attempts() == [{"status": "completed", "resulting_paths": [str(renamed)], "processing_lineage": ["downloads"]}]
 
 
+def test_rename_lowercases_capture_with_modifier(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    item = watch_root / "ANTE90 [cosplay].mkv"
+    item.write_text("movie")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: normalize
+    match:
+      name: title
+      field: file_name
+      pattern: '^(?P<title>.*) \\[cosplay\\](?P<extension>\\.mkv)$'
+    actions:
+      - rename:
+          name: '\\g<title:lower>\\g<extension>'
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    renamed = watch_root / "ante90.mkv"
+    assert report.status == "completed"
+    assert renamed.exists()
+    assert processor.attempts() == [{"status": "completed", "resulting_paths": [str(renamed)], "processing_lineage": ["downloads"]}]
+
+
+def test_move_lowercases_capture_in_destination(tmp_path: Path) -> None:
+    watch_root = tmp_path / "downloads"
+    destination = tmp_path / "processed"
+    watch_root.mkdir()
+    destination.mkdir()
+    item = watch_root / "Oo_Sebastian_oO.zip"
+    item.write_text("data")
+    rules = watch_root / "rules.yaml"
+    rules.write_text(
+        f"""rules:
+  - name: sort
+    match:
+      name: artist
+      field: file_name
+      pattern: '^(?P<artist>.+)\\.zip$'
+    actions:
+      - move:
+          destination: {destination}/\\g<artist:lower>
+"""
+    )
+    processor = ItemProcessor(tmp_path / "attempts.db")
+
+    report = processor.execute(processor.plan(make_request(watch_root, item, rules)))
+
+    moved = destination / "oo_sebastian_oo" / item.name
+    assert report.status == "completed"
+    assert moved.exists()
+    assert processor.attempts() == [{"status": "completed", "resulting_paths": [str(moved)], "processing_lineage": ["downloads"]}]
+
+
+def test_rename_rejects_unknown_case_modifier(tmp_path: Path) -> None:
+    rules = tmp_path / "rules.yaml"
+    rules.write_text(
+        """rules:
+  - name: normalize
+    match:
+      name: title
+      field: file_name
+      pattern: '^(?P<title>.*) \\[cosplay\\](?P<extension>\\.mkv)$'
+    actions:
+      - rename:
+          name: '\\g<title:shout>\\g<extension>'
+"""
+    )
+
+    diagnostics = ItemProcessor.validate_rules_document(rules)
+
+    assert any("unknown case modifier: shout" in diagnostic for diagnostic in diagnostics)
+
+
 def test_copy_stages_without_overwrite_and_preserves_provenance(tmp_path: Path) -> None:
     watch_root = tmp_path / "downloads"
     destination = tmp_path / "videos"

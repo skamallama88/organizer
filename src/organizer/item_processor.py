@@ -31,6 +31,11 @@ from organizer.operational_health import OperationalHealth
 
 _CAPTURE_SUPPORTED_KINDS = frozenset({"rename", "move", "copy", "archive", "unarchive"})
 
+_CASE_MODIFIERS: dict[str, Callable[[str], str]] = {
+    "lower": str.lower,
+    "upper": str.upper,
+}
+
 _DB_BUSY_TIMEOUT_MS = 30_000
 
 
@@ -1531,12 +1536,15 @@ class ItemProcessor:
                     compiled = condition_patterns.get(condition_name)
                     if compiled is None:
                         raise ValueError(f"condition '{condition_name}' not found for capture reference")
-                    if "g<" in capture:
-                        group_name = capture.split("g<", 1)[1].rstrip(">")
+                    token, modifier = ItemProcessor._parse_capture_token(capture)
+                    if modifier is not None and modifier not in _CASE_MODIFIERS:
+                        raise ValueError(f"unknown case modifier: {modifier}")
+                    if "g<" in token:
+                        group_name = token.split("g<", 1)[1].rstrip(">")
                         if group_name not in compiled.groupindex:
                             raise ValueError(f"invalid capture reference: group '{group_name}' does not exist in pattern")
                     else:
-                        group_num = int(capture.lstrip("\\"))
+                        group_num = int(token.lstrip("\\"))
                         if group_num < 1 or group_num > compiled.groups:
                             raise ValueError(f"invalid capture reference: group {group_num} does not exist in pattern")
 
@@ -1620,7 +1628,10 @@ class ItemProcessor:
                         condition_name, capture = ItemProcessor._split_capture_reference(reference)
                         if condition_name not in matches:
                             raise ValueError(f"condition '{condition_name}' not found for capture reference")
-                        matches[condition_name].expand(capture)
+                        token, modifier = ItemProcessor._parse_capture_token(capture)
+                        if modifier is not None and modifier not in _CASE_MODIFIERS:
+                            raise ValueError(f"unknown case modifier: {modifier}")
+                        matches[condition_name].expand(token)
                 except (IndexError, re.error, ValueError) as error:
                     raise ValueError(f"invalid capture reference: {error}") from error
 
@@ -1632,7 +1643,11 @@ class ItemProcessor:
     def _expand_captures(value: str, matches: dict[str, re.Match[str]]) -> str:
         def replace(reference: re.Match[str]) -> str:
             condition_name, capture = ItemProcessor._split_capture_reference(reference.group(0))
-            return matches[condition_name].expand(capture)
+            token, modifier = ItemProcessor._parse_capture_token(capture)
+            expanded = matches[condition_name].expand(token)
+            if modifier is not None:
+                expanded = _CASE_MODIFIERS[modifier](expanded)
+            return expanded
 
         return re.sub(r"(?:(?P<condition>[A-Za-z_][A-Za-z0-9_]*)\.)?\\(?:[1-9][0-9]*|g<[^>]+>)", replace, value)
 
@@ -1642,6 +1657,23 @@ class ItemProcessor:
             condition_name, capture = reference.split(".", 1)
             return condition_name, capture
         return "match", reference
+
+    @staticmethod
+    def _parse_capture_token(capture: str) -> tuple[str, str | None]:
+        """Split a capture token (e.g. ``\\g<artist:lower>`` or ``\\1``) into the
+        bare token used for expansion and an optional case modifier.
+
+        The modifier is parsed from a named capture's ``g<name:modifier>`` form
+        (for example ``\\g<artist:lower>``); numbered captures carry no
+        modifier. Returns the bare token (which ``Match.expand`` can consume)
+        and the modifier name, or ``None`` when there is none.
+        """
+        if capture.startswith("\\g<") and capture.endswith(">"):
+            inner = capture[3:-1]
+            if ":" in inner:
+                name, _, modifier = inner.partition(":")
+                return f"\\g<{name}>", modifier
+        return capture, None
 
     @staticmethod
     def _match_value(field: str, item: Path) -> str:
